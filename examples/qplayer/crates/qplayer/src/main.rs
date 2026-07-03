@@ -26,6 +26,9 @@ use winit::window::{Window, WindowId};
 
 use human_panic::Metadata;
 
+mod lighting_engine;
+use lighting_engine::LightingEngine;
+
 
 /// Decode-channel depth (frames). A small buffer absorbs decode jitter; the
 /// backpressure it provides paces decode to the display refresh.
@@ -211,6 +214,18 @@ struct App {
     midi_manager: Option<MidiManager>,
     last_discovery: Instant,
 
+    // ── lighting ──
+    lighting: LightingEngine,
+    /// Canvas downsampler for pixel-map segments (lazy; needs the device).
+    pixel_sampler: Option<qplayer_video::PixelSampler>,
+    last_pixel_sample: Instant,
+    /// Dedicated pixel-map texture fed by PixelMap cues (LED content
+    /// independent of the projector canvas). Sized to the playing media.
+    pixmap_texture: Option<qplayer_video::CanvasTexture>,
+    pixmap_yuv: Option<qplayer_video::YuvConverter>,
+    pixmap_frame_rx: Option<std::sync::mpsc::Receiver<VideoFrame>>,
+    pixmap_stop_flag: Arc<AtomicBool>,
+
     // ── trigger state ──
     wall_clock_fired: std::collections::HashMap<rust_decimal::Decimal, Instant>,
     timecode_fired: std::collections::HashSet<rust_decimal::Decimal>,
@@ -378,6 +393,13 @@ impl App {
             triggered_timecodes: Vec::new(),
             active_timecodes: Vec::new(),
             modifiers: winit::keyboard::ModifiersState::empty(),
+            lighting: LightingEngine::default(),
+            pixel_sampler: None,
+            last_pixel_sample: Instant::now(),
+            pixmap_texture: None,
+            pixmap_yuv: None,
+            pixmap_frame_rx: None,
+            pixmap_stop_flag: Arc::new(AtomicBool::new(false)),
             wall_clock_fired: std::collections::HashMap::new(),
             timecode_fired: std::collections::HashSet::new(),
         }
@@ -932,9 +954,102 @@ impl App {
                     state.selected_cue_id = Some(target);
                 }
             }
+            qplayer_core::Cue::PixelMap { path, .. } => {
+                log::info!("Go PixelMapCue Q{}: {}", qid, path);
+                self.play_pixmap(path, cue.base().loop_mode);
+            }
+            qplayer_core::Cue::Lighting { snapshot, fade_time, fade_type, .. } => {
+                log::info!(
+                    "Go LightingCue Q{} — {} fixture(s), fade {:.2}s",
+                    qid,
+                    snapshot.len(),
+                    fade_time
+                );
+                self.lighting.go(snapshot, *fade_time, *fade_type);
+            }
             other => {
                 log::info!("Go on unsupported cue type: {:?}", std::mem::discriminant(other));
             }
+        }
+    }
+
+    /// Play media into the dedicated pixel-map texture. Stills upload once;
+    /// videos get a self-paced decode thread (wall-clock PTS — no A/V sync or
+    /// vsync consumer here, LEDs don't need it).
+    fn play_pixmap(&mut self, path: &str, loop_mode: qplayer_core::LoopMode) {
+        // Replace any previous pixmap stream (per-thread flag, same reasoning
+        // as play_video).
+        self.pixmap_stop_flag.store(true, Ordering::Relaxed);
+        self.pixmap_stop_flag = Arc::new(AtomicBool::new(false));
+        self.pixmap_frame_rx = None;
+
+        let resolved = self.resolve_path(path).unwrap_or_else(|| path.to_string());
+
+        // Still image → single upload, no thread.
+        if let Ok(img) = image::open(&resolved) {
+            let img = img.to_rgba8();
+            let (w, h) = (img.width(), img.height());
+            self.ensure_pixmap_texture(w, h);
+            self.pixmap_texture.as_ref().unwrap().upload_frame(
+                &self.queue,
+                &VideoFrame::new(w, h, img.into_raw(), 0.0),
+                qplayer_core::CanvasFit::Stretch, // same dims → exact copy
+            );
+            return;
+        }
+
+        // Video → decode thread feeding a small bounded channel.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<VideoFrame>(3);
+        self.pixmap_frame_rx = Some(rx);
+        let stop = Arc::clone(&self.pixmap_stop_flag);
+        std::thread::Builder::new()
+            .name("pixmap-decode".into())
+            .spawn(move || pixmap_decode_thread(&resolved, loop_mode, stop, tx))
+            .expect("spawn pixmap decode thread");
+    }
+
+    /// Get the pixmap texture, (re)created at the given size.
+    fn ensure_pixmap_texture(&mut self, w: u32, h: u32) -> &qplayer_video::CanvasTexture {
+        let recreate = self
+            .pixmap_texture
+            .as_ref()
+            .is_none_or(|t| t.width != w || t.height != h);
+        if recreate {
+            self.pixmap_texture = Some(qplayer_video::CanvasTexture::new(&self.device, w, h));
+        }
+        self.pixmap_texture.as_ref().unwrap()
+    }
+
+    /// Drain pending pixmap frames and upload the newest to the pixmap texture.
+    fn upload_pixmap_frames(&mut self) {
+        let Some(rx) = &self.pixmap_frame_rx else { return };
+        let mut latest: Option<VideoFrame> = None;
+        while let Ok(f) = rx.try_recv() {
+            latest = Some(f);
+        }
+        let Some(frame) = latest else { return };
+        let (w, h) = (frame.width, frame.height);
+        if frame.rgba().is_some() {
+            self.ensure_pixmap_texture(w, h);
+            let tex = self.pixmap_texture.as_ref().unwrap();
+            tex.upload_frame(&self.queue, &frame, qplayer_core::CanvasFit::Stretch);
+        } else {
+            // YUV planes → GPU convert pass straight into the pixmap texture.
+            self.ensure_pixmap_texture(w, h);
+            if self.pixmap_yuv.is_none() {
+                self.pixmap_yuv = Some(qplayer_video::YuvConverter::new(
+                    &self.device,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                ));
+            }
+            let conv = self.pixmap_yuv.as_mut().unwrap();
+            conv.upload(&self.device, &self.queue, &frame, [w, h], qplayer_core::CanvasFit::Stretch);
+            let tex = self.pixmap_texture.as_ref().unwrap();
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pixmap-yuv") });
+            conv.encode(&mut encoder, &tex.render_view());
+            self.queue.submit(Some(encoder.finish()));
         }
     }
 
@@ -1515,6 +1630,10 @@ impl App {
 
     fn reset_for_project_change(&mut self) {
         self.stop_all();
+        self.lighting.shutdown();
+        self.pixmap_texture = None;
+        self.pixmap_yuv = None;
+        self.pixel_sampler = None;
         self.output_windows.clear();
         if let Some(ids) = self.window_ids.as_mut() {
             ids.video.clear();
@@ -1539,6 +1658,15 @@ impl App {
         self.active_timecodes.clear();
         self.timecode_fired.clear();
         self.paused = false;
+        // Halt any in-flight lighting fade; levels hold (blackout is a cue's job).
+        self.lighting.stop_fade();
+        // Stop the pixmap stream and blank its texture so pixel-mapped LEDs go dark.
+        self.pixmap_stop_flag.store(true, Ordering::Relaxed);
+        self.pixmap_frame_rx = None;
+        if let Some(tex) = self.pixmap_texture.as_ref() {
+            let (w, h) = (tex.width, tex.height);
+            tex.upload_rgba(&self.queue, &vec![0u8; (w * h * 4) as usize]);
+        }
         // Output is event-driven now — explicitly repaint so it clears to black.
         self.request_output_redraw();
     }
@@ -2812,6 +2940,52 @@ impl ApplicationHandler<AppEvent> for App {
         self.poll_wall_clock_triggers(event_loop);
         self.poll_timecode_triggers(event_loop);
 
+        // Lighting: sender lifecycle + fade advance + DMX submit (self-throttled).
+        {
+            let cfg = self.qplayer.state().lock_unpoisoned().show_file.lighting.clone();
+
+            // Pixel-map segments: downsample each segment's source texture →
+            // engine overlay. Throttled to the DMX rate.
+            if cfg.enabled && self.last_pixel_sample.elapsed().as_secs_f32() >= 1.0 / cfg.fps.max(1.0) {
+                self.upload_pixmap_frames();
+                // Raw (non-sRGB) views: bytes as stored, display-referred —
+                // the colour pipeline's gamma does the linearisation.
+                let canvas_view = self.canvas_texture.as_ref().map(|c| c.render_view());
+                let pixmap_view = self.pixmap_texture.as_ref().map(|t| t.render_view());
+                let batch: Vec<(&wgpu::TextureView, u32, [f32; 4], u32, u32)> = cfg
+                    .active_segments()
+                    .filter_map(|s| {
+                        let view = match s.source {
+                            qplayer_core::lighting::SegmentSource::Canvas => canvas_view.as_ref(),
+                            qplayer_core::lighting::SegmentSource::PixelMap => pixmap_view.as_ref(),
+                        }?;
+                        Some((view, s.id, s.region, s.cols, s.rows))
+                    })
+                    .collect();
+                if !batch.is_empty() {
+                    self.last_pixel_sample = Instant::now();
+                    let sampler = self
+                        .pixel_sampler
+                        .get_or_insert_with(|| qplayer_video::PixelSampler::new(&self.device));
+                    let ready = sampler.collect(&self.device);
+                    if !ready.is_empty() {
+                        // Publish to the GUI grid preview, then feed the engine.
+                        if let Ok(mut state) = self.qplayer.state().lock() {
+                            for (id, cols, rows, rgba) in &ready {
+                                state.lighting_preview.insert(*id, (*cols, *rows, rgba.clone()));
+                            }
+                        }
+                        for (id, cols, rows, rgba) in ready {
+                            self.lighting.set_segment_pixels(id, cols, rows, rgba);
+                        }
+                    }
+                    sampler.sample(&self.device, &self.queue, &batch);
+                }
+            }
+
+            self.lighting.tick(&cfg);
+        }
+
         // Publish the current monitors (for the projection-panel dropdown) and detect
         // hotplug / projector warm-up. Throttled — enumerating monitors hits the OS.
         if self.last_monitor_check.elapsed() >= std::time::Duration::from_millis(1000) {
@@ -3007,6 +3181,59 @@ fn video_decode_thread(
                 break;
             }
         }
+    }
+}
+
+/// Pixel-map decode thread: self-paced by wall-clock PTS (no vsync consumer),
+/// loops by reopening the source, blanks to black on a OneShot end.
+fn pixmap_decode_thread(
+    path: &str,
+    loop_mode: qplayer_core::LoopMode,
+    stop_flag: Arc<AtomicBool>,
+    frame_tx: std::sync::mpsc::SyncSender<VideoFrame>,
+) {
+    let looping = matches!(
+        loop_mode,
+        qplayer_core::LoopMode::Looped | qplayer_core::LoopMode::LoopedInfinite
+    );
+    let mut last_dims = (0u32, 0u32);
+    'outer: loop {
+        let mut source = match VideoSource::open(path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("PixelMap: failed to open {}: {e}", path);
+                return;
+            }
+        };
+        let start = Instant::now();
+        while !stop_flag.load(Ordering::Relaxed) {
+            let Some(frame) = source.read_frame() else {
+                if looping {
+                    continue 'outer; // reopen from the top
+                }
+                if loop_mode == qplayer_core::LoopMode::OneShot && last_dims.0 > 0 {
+                    // Blank to black so the LEDs go dark, mirroring video-cue end.
+                    let (w, h) = last_dims;
+                    let _ = frame_tx.send(VideoFrame::new(w, h, vec![0; (w * h * 4) as usize], 0.0));
+                }
+                return; // HoldLast: exit holding the last frame
+            };
+            last_dims = (frame.width, frame.height);
+            // Wall-clock pacing: sleep until this frame is due.
+            let due = start + Duration::from_secs_f64(frame.pts.max(0.0));
+            while Instant::now() < due {
+                if stop_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // Blocking send is fine: the consumer drains every lighting tick,
+            // and a dropped receiver ends the thread via the send error.
+            if frame_tx.send(frame).is_err() {
+                return;
+            }
+        }
+        return;
     }
 }
 

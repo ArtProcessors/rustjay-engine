@@ -339,6 +339,57 @@ pub enum Cue {
         #[serde(default)]
         target_qid: Decimal,
     },
+
+    #[serde(rename = "PixelMapCue")]
+    PixelMap {
+        #[serde(flatten)]
+        base: CueBase,
+        /// Video or still image played into the dedicated pixel-map texture.
+        /// Looping follows `base.loop_mode`; a OneShot end blanks to black.
+        #[serde(default)]
+        path: String,
+    },
+
+    #[serde(rename = "LightingCue")]
+    Lighting {
+        #[serde(flatten)]
+        base: CueBase,
+        /// Fixture id → target look. Fixtures absent from the snapshot keep
+        /// their current state (LTP tracking).
+        // `with`: JSON map keys are strings, and the `flatten` on `base`
+        // buffers this map through serde's Content type, which won't re-parse
+        // "1" → u32 on its own.
+        #[serde(default, with = "fixture_key_map")]
+        snapshot: std::collections::BTreeMap<crate::lighting::FixtureId, crate::lighting::FixtureLook>,
+        /// Crossfade duration in seconds from live state to the snapshot.
+        #[serde(default)]
+        fade_time: f32,
+        #[serde(default)]
+        fade_type: FadeType,
+    },
+}
+
+/// (De)serialize `BTreeMap<u32, V>` with string keys, surviving `flatten`
+/// buffering (see the field comment on `Cue::Lighting::snapshot`).
+mod fixture_key_map {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<V: Serialize, S: Serializer>(
+        map: &BTreeMap<u32, V>,
+        ser: S,
+    ) -> Result<S::Ok, S::Error> {
+        ser.collect_map(map.iter().map(|(k, v)| (k.to_string(), v)))
+    }
+
+    pub fn deserialize<'de, V: Deserialize<'de>, D: Deserializer<'de>>(
+        de: D,
+    ) -> Result<BTreeMap<u32, V>, D::Error> {
+        let raw = BTreeMap::<String, V>::deserialize(de)?;
+        raw.into_iter()
+            .map(|(k, v)| k.parse::<u32>().map(|k| (k, v)).map_err(serde::de::Error::custom))
+            .collect()
+    }
 }
 
 // Convenience type aliases for pattern matching ergonomics.
@@ -369,6 +420,8 @@ impl Cue {
             Cue::Text { base, .. } => base,
             Cue::Image { base, .. } => base,
             Cue::Goto { base, .. } => base,
+            Cue::PixelMap { base, .. } => base,
+            Cue::Lighting { base, .. } => base,
         }
     }
 
@@ -386,6 +439,8 @@ impl Cue {
             Cue::Text { base, .. } => base,
             Cue::Image { base, .. } => base,
             Cue::Goto { base, .. } => base,
+            Cue::PixelMap { base, .. } => base,
+            Cue::Lighting { base, .. } => base,
         }
     }
 
@@ -645,6 +700,43 @@ mod tests {
         assert_eq!(cue, de);
         let val = serde_json::to_value(&cue).unwrap();
         assert_eq!(val["$type"], "GotoCue");
+    }
+
+    #[test]
+    fn test_lighting_cue_serde() {
+        use crate::lighting::FixtureLook;
+        let mut snapshot = std::collections::BTreeMap::new();
+        snapshot.insert(
+            1u32,
+            FixtureLook { dimmer: 1.0, color: [1.0, 0.0, 0.0], ..Default::default() },
+        );
+        snapshot.insert(2u32, FixtureLook { pan: 0.25, tilt: 0.75, ..Default::default() });
+        let cue = Cue::Lighting {
+            base: CueBase {
+                qid: Decimal::from(20),
+                name: "Look 1".into(),
+                ..Default::default()
+            },
+            snapshot,
+            fade_time: 2.5,
+            fade_type: FadeType::SCurve,
+        };
+        let json = serde_json::to_string(&cue).unwrap();
+        let de: Cue = serde_json::from_str(&json).unwrap();
+        assert_eq!(cue, de);
+        let val = serde_json::to_value(&cue).unwrap();
+        assert_eq!(val["$type"], "LightingCue");
+        // Empty snapshot + missing fields must default (old files forward-compat).
+        let minimal: Cue =
+            serde_json::from_value(serde_json::json!({"$type": "LightingCue", "qid": 1.0}))
+                .unwrap();
+        match minimal {
+            Cue::Lighting { snapshot, fade_time, .. } => {
+                assert!(snapshot.is_empty());
+                assert_eq!(fade_time, 0.0);
+            }
+            other => panic!("expected LightingCue, got {:?}", other),
+        }
     }
 
     #[test]

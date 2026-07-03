@@ -11,11 +11,13 @@
 
 mod canvas_texture;
 mod frame;
+mod pixel_sampler;
 mod projection_renderer;
 mod video_source;
 mod yuv_converter;
 
 pub use canvas_texture::CanvasTexture;
+pub use pixel_sampler::PixelSampler;
 pub use frame::{BitDepth, ChromaSubsample, FramePixels, VideoFrame, YuvPlane};
 pub use projection_renderer::ProjectionRenderer;
 pub use video_source::VideoSource;

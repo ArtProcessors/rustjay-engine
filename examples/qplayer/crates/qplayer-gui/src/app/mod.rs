@@ -199,6 +199,10 @@ pub struct SharedState {
     pub show_video_window: bool,
     /// Whether the Projection Mapping window is open.
     pub show_projection_window: bool,
+    pub show_lighting_window: bool,
+    /// Latest pixel-map sample per segment: id → (cols, rows, RGBA bytes).
+    /// Published by the control binary; painted by the lighting panel preview.
+    pub lighting_preview: std::collections::HashMap<u32, (u32, u32, Vec<u8>)>,
     /// Set on window-close with unsaved changes / running cues — shows the in-app
     /// quit-confirm modal (a native modal deadlocks the loop).
     pub pending_close_confirm: bool,
@@ -256,6 +260,8 @@ impl Default for SharedState {
             waveform_window_scroll: 0.0,
             show_video_window: false,
             show_projection_window: false,
+            show_lighting_window: false,
+            lighting_preview: std::collections::HashMap::new(),
             pending_close_confirm: false,
             quit: false,
             progress_overlay: None,
@@ -350,6 +356,8 @@ pub enum CueType {
     Text,
     Image,
     Goto,
+    Lighting,
+    PixelMap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -773,6 +781,28 @@ impl QPlayerApp {
             state.show_projection_window = show_projection;
         }
 
+        // Lighting window (DMX output + fixture patch)
+        let mut show_lighting = if let Ok(state) = self.state.lock() {
+            state.show_lighting_window
+        } else {
+            false
+        };
+        if show_lighting {
+            egui::Window::new("Lighting")
+                .collapsible(false)
+                .resizable(true)
+                .default_size([560.0, 480.0])
+                .open(&mut show_lighting)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        crate::lighting_panel::show(ui, &self.state);
+                    });
+                });
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.show_lighting_window = show_lighting;
+        }
+
         // Quit-confirm modal (in-app; a native dialog deadlocks the winit loop).
         let pending_close = self.state.lock().map(|s| s.pending_close_confirm).unwrap_or(false);
         if pending_close {
@@ -985,6 +1015,16 @@ impl QPlayerApp {
                 if ui.checkbox(&mut show_projection, "Projection Mapping").clicked() {
                     if let Ok(mut state) = self.state.lock() {
                         state.show_projection_window = show_projection;
+                    }
+                    ui.close();
+                }
+                let mut show_lighting = {
+                    let Ok(state) = self.state.lock() else { return; };
+                    state.show_lighting_window
+                };
+                if ui.checkbox(&mut show_lighting, "Lighting").clicked() {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.show_lighting_window = show_lighting;
                     }
                     ui.close();
                 }
@@ -1275,6 +1315,16 @@ impl QPlayerApp {
                             CueType::Goto => qplayer_core::Cue::Goto {
                                 base,
                                 target_qid: Decimal::ZERO,
+                            },
+                            CueType::Lighting => qplayer_core::Cue::Lighting {
+                                base,
+                                snapshot: Default::default(),
+                                fade_time: 2.0,
+                                fade_type: qplayer_core::FadeType::Linear,
+                            },
+                            CueType::PixelMap => qplayer_core::Cue::PixelMap {
+                                base,
+                                path: String::new(),
                             },
                         };
                         state.show_file.cues.push(cue);

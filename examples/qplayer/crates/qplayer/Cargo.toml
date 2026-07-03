@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 qplayer-core = { workspace = true }
+rustjay-lighting = { workspace = true }
+image = { workspace = true }
 qplayer-audio = { workspace = true }
 qplayer-gui = { workspace = true }
 qplayer-video = { workspace = true }

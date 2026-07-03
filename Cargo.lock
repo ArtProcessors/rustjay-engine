@@ -5521,6 +5521,7 @@ dependencies = [
  "crossbeam",
  "log",
  "serde",
+ "serde_json",
  "socket2 0.5.10",
 ]
 

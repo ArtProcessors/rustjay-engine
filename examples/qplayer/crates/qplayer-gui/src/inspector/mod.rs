@@ -58,6 +58,15 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     };
     let (mut waveform_zoom, mut waveform_scroll) = (state.waveform_zoom, state.waveform_scroll);
 
+    // Pre-fetch the fixture patch for lighting cues (before the mutable cue borrow).
+    let patched_fixtures: Vec<(u32, String)> = state
+        .show_file
+        .lighting
+        .fixtures
+        .iter()
+        .map(|f| (f.id, format!("{} (U{} Ch{})", f.name, f.universe, f.address)))
+        .collect();
+
     // ponytail: one whole-state clone per inspector frame so every edit is undoable.
     // For very large show files this could be replaced with per-field snapshots.
     let pre_edit_snapshot = crate::app::Snapshot::from_state(&state).with_merge_key("inspector");
@@ -521,6 +530,97 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             });
             triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
         }
+        qplayer_core::Cue::PixelMap { base, path } => {
+            ui.label(RichText::new("Pixel Map Cue").monospace().size(12.0));
+            ui.horizontal(|ui| {
+                ui.label("File:");
+                let response = ui.text_edit_singleline(path);
+                changed |= response.changed();
+                if ui.button("Browse…").clicked() {
+                    if let Some(new_path) = rfd::FileDialog::new()
+                        .add_filter("Media", &["mp4", "mov", "mkv", "avi", "webm", "png", "jpg", "jpeg"])
+                        .pick_file()
+                    {
+                        *path = new_path.to_string_lossy().to_string();
+                        changed = true;
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Plays into the pixel-map texture (Window → Lighting → Pixel Map, source: PixelMap).",
+                )
+                .small()
+                .weak(),
+            );
+            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+        }
+        qplayer_core::Cue::Lighting { base, snapshot, fade_time, fade_type } => {
+            ui.label(RichText::new("Lighting Cue").monospace().size(12.0));
+            ui.horizontal(|ui| {
+                ui.label("Fade (s):");
+                let response = ui.add(egui::DragValue::new(fade_time).speed(0.1).range(0.0..=600.0));
+                changed |= response.changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Fade Type:");
+                egui::ComboBox::from_id_salt("lx_fade_type")
+                    .selected_text(format!("{:?}", fade_type))
+                    .show_ui(ui, |ui| {
+                        for variant in [qplayer_core::FadeType::Linear, qplayer_core::FadeType::SCurve, qplayer_core::FadeType::Square, qplayer_core::FadeType::InverseSquare] {
+                            if ui.selectable_value(fade_type, variant, format!("{:?}", variant)).clicked() {
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            ui.add_space(4.0);
+            if patched_fixtures.is_empty() {
+                ui.label(
+                    egui::RichText::new("No fixtures patched — see Window → Lighting.")
+                        .italics()
+                        .weak(),
+                );
+            }
+            // One row per patched fixture: include-in-cue checkbox + look editor.
+            for (id, label) in &patched_fixtures {
+                let mut included = snapshot.contains_key(id);
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut included, label.as_str()).changed() {
+                        if included {
+                            snapshot.insert(*id, Default::default());
+                        } else {
+                            snapshot.remove(id);
+                        }
+                        changed = true;
+                    }
+                });
+                if let Some(look) = snapshot.get_mut(id) {
+                    ui.indent(("lx_look", id), |ui| {
+                        changed |= look_editor(ui, *id, look);
+                    });
+                }
+            }
+            // Snapshot entries for fixtures no longer in the patch.
+            let orphans: Vec<u32> = snapshot
+                .keys()
+                .filter(|id| !patched_fixtures.iter().any(|(pid, _)| pid == *id))
+                .copied()
+                .collect();
+            for id in orphans {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 160, 60),
+                        format!("⚠ Fixture {id} not in patch"),
+                    );
+                    if ui.small_button("Remove").clicked() {
+                        snapshot.remove(&id);
+                        changed = true;
+                    }
+                });
+            }
+            triggers_editor(ui, &mut base.triggers, base.qid, &mut changed, &mut pending_commands);
+        }
     }
 
     if changed {
@@ -533,6 +633,50 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     state.waveform_scroll = waveform_scroll;
 
     state.command_queue.extend(pending_commands);
+}
+
+/// Per-fixture look editor for lighting cues. Returns true if anything changed.
+fn look_editor(ui: &mut egui::Ui, id: u32, look: &mut qplayer_core::FixtureLook) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Dimmer:");
+        changed |= ui.add(egui::Slider::new(&mut look.dimmer, 0.0..=1.0)).changed();
+    });
+    ui.horizontal(|ui| {
+        ui.label("Color:");
+        changed |= ui.color_edit_button_rgb(&mut look.color).changed();
+        ui.label("White:");
+        changed |= ui
+            .add(egui::DragValue::new(&mut look.white).speed(0.01).range(0.0..=1.0))
+            .changed();
+    });
+    ui.horizontal(|ui| {
+        ui.label("Pan:");
+        changed |= ui.add(egui::Slider::new(&mut look.pan, 0.0..=1.0)).changed();
+    });
+    ui.horizontal(|ui| {
+        ui.label("Tilt:");
+        changed |= ui.add(egui::Slider::new(&mut look.tilt, 0.0..=1.0)).changed();
+    });
+    egui::CollapsingHeader::new("Beam")
+        .id_salt(("lx_beam", id))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Zoom:");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut look.zoom).speed(0.01).range(0.0..=1.0))
+                    .changed();
+                ui.label("Strobe:");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut look.strobe).speed(0.01).range(0.0..=1.0))
+                    .changed();
+                ui.label("Gobo:");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut look.gobo).speed(1).range(0..=255))
+                    .changed();
+            });
+        });
+    changed
 }
 
 /// Text field for editing a Decimal QID (target/stop references).

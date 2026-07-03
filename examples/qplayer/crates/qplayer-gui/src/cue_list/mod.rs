@@ -54,6 +54,12 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             if ui.button("+ Goto").clicked() {
                 queue_cmd(state, AppCommand::AddCue { cue_type: CueType::Goto });
             }
+            if ui.button("+ Light").clicked() {
+                queue_cmd(state, AppCommand::AddCue { cue_type: CueType::Lighting });
+            }
+            if ui.button("+ PixMap").clicked() {
+                queue_cmd(state, AppCommand::AddCue { cue_type: CueType::PixelMap });
+            }
         });
         ui.separator();
     }
@@ -427,6 +433,8 @@ fn cue_type_label(cue: &Cue) -> &'static str {
         Cue::Text { .. } => "TXT",
         Cue::Image { .. } => "IMG",
         Cue::Goto { .. } => "GTO",
+        Cue::Lighting { .. } => "LX",
+        Cue::PixelMap { .. } => "PXM",
     }
 }
 
