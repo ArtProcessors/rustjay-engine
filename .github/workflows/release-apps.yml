@@ -81,7 +81,8 @@ jobs:
         if: runner.os == 'Windows' && matrix.ffmpeg
         shell: pwsh
         run: |
-          curl.exe -L -o ffmpeg.zip "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          # pinned to n8.1 — ffmpeg-next can't compile against master's moving API
+          curl.exe -L -o ffmpeg.zip "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
           Expand-Archive ffmpeg.zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg"
           $dir = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1
           "FFMPEG_DIR=$($dir.FullName)" >> $env:GITHUB_ENV
@@ -130,6 +131,15 @@ jobs:
               -e "s/__BIN__/${{ matrix.app }}/g" \
               -e "s/__VERSION__/$VERSION/g" \
               .github/packaging/Info.plist.tmpl > "$APP/Contents/Info.plist"
+          # Syphon.framework ships inside the syphon-core crate; the binary loads
+          # it via @rpath, so bundle it and make sure the Frameworks rpath exists.
+          FW=$(find ~/.cargo/registry/src -type d -path "*/syphon-core-*/frameworks/Syphon.framework" | head -1)
+          if [ -n "$FW" ]; then
+            mkdir -p "$APP/Contents/Frameworks"
+            cp -R "$FW" "$APP/Contents/Frameworks/"
+            install_name_tool -add_rpath @executable_path/../Frameworks \
+              "$APP/Contents/MacOS/${{ matrix.app }}" 2>/dev/null || true
+          fi
           if [ "${{ matrix.ffmpeg }}" = "true" ]; then
             # pull the brew FFmpeg dylib closure into the bundle and rewrite load paths
             dylibbundler -cd -od -b -x "$APP/Contents/MacOS/${{ matrix.app }}" \

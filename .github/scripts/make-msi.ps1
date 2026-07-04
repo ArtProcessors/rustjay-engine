@@ -11,7 +11,8 @@ param(
 $ErrorActionPreference = 'Stop'
 
 if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
-    dotnet tool install --global wix | Out-Null
+    # ponytail: pinned to v5 — WiX v6+ requires accepting the OSMF EULA (WIX7015)
+    dotnet tool install --global wix --version 5.0.2 | Out-Null
 }
 
 # Deterministic UpgradeCode per app so a newer MSI replaces the older install.
