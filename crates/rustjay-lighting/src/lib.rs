@@ -22,6 +22,7 @@
 pub mod artnet;
 pub mod color;
 pub mod e131;
+pub mod look;
 pub mod overlap;
 pub mod scan;
 
@@ -36,6 +37,7 @@ pub use color::{
     WhiteMode,
 };
 pub use dmx::{DmxFrame, Universe, DMX_UNIVERSE_SIZE};
+pub use look::{render_look, FixtureLook};
 pub use overlap::{find_overlaps, segment_spans, Overlap, PatchSpan};
 pub use patch::pack_fixtures;
 pub use scan::{demux_tile, Axis, Corner, ScanOrder};

@@ -28,6 +28,20 @@ pub enum ChannelRole {
     Uv,
     /// Master dimmer, driven by [`SegmentColor::master_dimmer`].
     Dimmer,
+    /// Pan coarse byte (high byte of 16-bit pan when paired with [`PanFine`](Self::PanFine)).
+    Pan,
+    /// Pan fine byte (low byte of 16-bit pan).
+    PanFine,
+    /// Tilt coarse byte.
+    Tilt,
+    /// Tilt fine byte.
+    TiltFine,
+    /// Beam zoom.
+    Zoom,
+    /// Strobe rate (0 = open / no strobe on most fixtures).
+    Strobe,
+    /// Gobo wheel — raw DMX byte (slot ranges are fixture-specific).
+    Gobo,
     /// Constant byte (e.g. shutter open, mode select).
     Static(u8),
 }
@@ -42,6 +56,13 @@ impl ChannelRole {
             ChannelRole::Amber => "A".into(),
             ChannelRole::Uv => "UV".into(),
             ChannelRole::Dimmer => "D".into(),
+            ChannelRole::Pan => "P".into(),
+            ChannelRole::PanFine => "Pf".into(),
+            ChannelRole::Tilt => "T".into(),
+            ChannelRole::TiltFine => "Tf".into(),
+            ChannelRole::Zoom => "Z".into(),
+            ChannelRole::Strobe => "St".into(),
+            ChannelRole::Gobo => "Go".into(),
             ChannelRole::Static(v) => format!("S({})", v),
         }
     }
@@ -169,6 +190,26 @@ pub fn builtin_profiles() -> Vec<FixtureProfile> {
                 ChannelRole::Blue,
             ],
         },
+        FixtureProfile {
+            id: "dimmer".into(),
+            name: "Dimmer".into(),
+            channels: vec![ChannelRole::Dimmer],
+        },
+        FixtureProfile {
+            id: "moving_head_16bit".into(),
+            name: "Moving Head 16-bit (P/T/D/RGB/St)".into(),
+            channels: vec![
+                ChannelRole::Pan,
+                ChannelRole::PanFine,
+                ChannelRole::Tilt,
+                ChannelRole::TiltFine,
+                ChannelRole::Dimmer,
+                ChannelRole::Red,
+                ChannelRole::Green,
+                ChannelRole::Blue,
+                ChannelRole::Strobe,
+            ],
+        },
     ]
 }
 
@@ -223,6 +264,15 @@ pub fn color_pipeline(
             ChannelRole::Amber => to_byte((r + g) * 0.5), // warm white approx
             ChannelRole::Uv => to_byte(b * 0.8),
             ChannelRole::Dimmer => dimmer,
+            // Movement/beam roles are cue-look concepts (see `look` module);
+            // pixel mapping leaves them at rest.
+            ChannelRole::Pan
+            | ChannelRole::PanFine
+            | ChannelRole::Tilt
+            | ChannelRole::TiltFine
+            | ChannelRole::Zoom
+            | ChannelRole::Strobe
+            | ChannelRole::Gobo => 0,
             ChannelRole::Static(v) => *v,
         })
         .collect()

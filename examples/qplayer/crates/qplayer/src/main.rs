@@ -26,13 +26,48 @@ use winit::window::{Window, WindowId};
 
 use human_panic::Metadata;
 
+mod lighting_engine;
+use lighting_engine::LightingEngine;
+
+
+/// Decode-channel depth (frames). A small buffer absorbs decode jitter; the
+/// backpressure it provides paces decode to the display refresh.
+const VIDEO_QUEUE_CAP: usize = 3;
+
+/// Max squared position distance (px²) for recalling an output to a saved monitor.
+/// Positions are fixed for an installed wall, so this just allows minor slop while
+/// keeping projectors 1920 px apart unambiguous, and leaves an output windowed if
+/// its monitor isn't present (rather than grabbing the wrong one).
+const MONITOR_MATCH_DIST_SQ: i64 = 200 * 200;
+
+/// Distinct colours for the Identify overlay (one per output window, by order).
+const IDENTIFY_COLORS: [wgpu::Color; 6] = [
+    wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }, // red
+    wgpu::Color { r: 0.0, g: 1.0, b: 0.0, a: 1.0 }, // green
+    wgpu::Color { r: 0.0, g: 0.2, b: 1.0, a: 1.0 }, // blue
+    wgpu::Color { r: 1.0, g: 1.0, b: 0.0, a: 1.0 }, // yellow
+    wgpu::Color { r: 1.0, g: 0.0, b: 1.0, a: 1.0 }, // magenta
+    wgpu::Color { r: 0.0, g: 1.0, b: 1.0, a: 1.0 }, // cyan
+];
+const IDENTIFY_COLOR_NAMES: [&str; 6] = ["RED", "GREEN", "BLUE", "YELLOW", "MAGENTA", "CYAN"];
+
+/// Build a stable-ish descriptor from a winit monitor (name + resolution + position).
+fn monitor_descriptor(m: &winit::monitor::MonitorHandle) -> qplayer_core::MonitorId {
+    let pos = m.position();
+    let size = m.size();
+    qplayer_core::MonitorId {
+        name: m.name().unwrap_or_default(),
+        width: size.width,
+        height: size.height,
+        pos_x: pos.x,
+        pos_y: pos.y,
+    }
+}
 
 /// User events sent to the main event loop from background threads.
 #[derive(Debug)]
 enum AppEvent {
-    /// A decoded video frame ready for display.
-    VideoFrame(VideoFrame),
-    /// Video stream reached EOF.
+    /// Video stream reached EOF. (Frames travel on a bounded channel, not here.)
     VideoEof,
 }
 
@@ -101,6 +136,11 @@ struct App {
 
     // ── projection output windows ──
     canvas_texture: Option<qplayer_video::CanvasTexture>,
+    /// GPU YUV420→RGB converter (lazily built; planes uploaded + matrix in-shader).
+    yuv_converter: Option<qplayer_video::YuvConverter>,
+    /// A new YUV frame's planes are uploaded and awaiting the convert pass, which
+    /// is folded into the first output's encoder (no separate submit).
+    pending_yuv_convert: bool,
     output_windows: Vec<OutputWindow>,
 
     // ── egui ──
@@ -125,13 +165,22 @@ struct App {
 
     // ── video playback ──
     event_loop_proxy: winit::event_loop::EventLoopProxy<AppEvent>,
-    /// Decoded frames awaiting display, drained one per present so every frame is
-    /// shown once. A single overwriting slot dropped frames because winit delivers
-    /// VideoFrame events in bursts — several land between presents and only the last
-    /// survived (the "overwrite-dropped" the diagnostics showed).
-    frame_queue: std::collections::VecDeque<VideoFrame>,
+    /// Receiver for decoded frames. The decode thread is a bounded producer (its
+    /// send blocks when the channel is full); the render loop selects the frame
+    /// whose PTS is due against `video_clock`. Backpressure keeps decode a few
+    /// frames ahead so the due frame is ready when the clock reaches it.
+    video_frame_rx: Option<std::sync::mpsc::Receiver<VideoFrame>>,
     /// Whether a frame has been uploaded to the canvas (drives `has_video`).
     canvas_has_frame: bool,
+    /// Monotonic playback clock for the current video. A wall clock = real time,
+    /// which the audio also runs on, so PTS-matching against it keeps A/V in sync
+    /// and plays correct-speed on any display refresh. Frames late vs the clock are
+    /// dropped to catch up; when ahead, the current frame is held.
+    video_clock: Option<std::time::Instant>,
+    /// Set while paused, to freeze `video_clock` across the pause.
+    video_pause_started: Option<std::time::Instant>,
+    /// Next decoded frame, peeked from the channel but not yet due for display.
+    video_peek: Option<VideoFrame>,
     video_stop_flag: Arc<AtomicBool>,
     video_pause_flag: Arc<AtomicBool>,
     /// QID of the cue whose video is currently playing (for loop sync).
@@ -141,6 +190,20 @@ struct App {
     last_project_generation: u64,
     /// When the control window was last asked to repaint (throttles its ~60 Hz redraw).
     last_control_redraw: std::time::Instant,
+    /// Last seen set of physical monitors, to detect hotplug / projector warm-up and
+    /// re-apply the output→monitor assignment.
+    last_monitor_set: Vec<qplayer_core::MonitorId>,
+    /// Throttle for the (OS-querying) monitor enumeration.
+    last_monitor_check: std::time::Instant,
+    /// While Some and unexpired, each output window flashes a distinct colour so the
+    /// operator can see which window is on which projector.
+    identify_until: Option<std::time::Instant>,
+    /// Frame-pacing diagnostics, printed once/sec when QPLAYER_FPS_DEBUG is set.
+    fps_debug: bool,
+    dbg_starved: u32,
+    dbg_presented: u32,
+    dbg_present_time: std::time::Duration,
+    dbg_last_log: std::time::Instant,
 
     // ── protocols ──
     osc_manager: Option<OscManager>,
@@ -150,6 +213,18 @@ struct App {
     msc_rx: Option<std::sync::mpsc::Receiver<MscEvent>>,
     midi_manager: Option<MidiManager>,
     last_discovery: Instant,
+
+    // ── lighting ──
+    lighting: LightingEngine,
+    /// Canvas downsampler for pixel-map segments (lazy; needs the device).
+    pixel_sampler: Option<qplayer_video::PixelSampler>,
+    last_pixel_sample: Instant,
+    /// Dedicated pixel-map texture fed by PixelMap cues (LED content
+    /// independent of the projector canvas). Sized to the playing media.
+    pixmap_texture: Option<qplayer_video::CanvasTexture>,
+    pixmap_yuv: Option<qplayer_video::YuvConverter>,
+    pixmap_frame_rx: Option<std::sync::mpsc::Receiver<VideoFrame>>,
+    pixmap_stop_flag: Arc<AtomicBool>,
 
     // ── trigger state ──
     wall_clock_fired: std::collections::HashMap<rust_decimal::Decimal, Instant>,
@@ -281,14 +356,27 @@ impl App {
             audio_engine,
             event_loop_proxy: proxy,
             canvas_texture: None,
+            yuv_converter: None,
+            pending_yuv_convert: false,
             output_windows: Vec::new(),
-            frame_queue: std::collections::VecDeque::new(),
+            video_frame_rx: None,
             canvas_has_frame: false,
+            video_clock: None,
+            video_pause_started: None,
+            video_peek: None,
             video_stop_flag: Arc::new(AtomicBool::new(false)),
             video_pause_flag: Arc::new(AtomicBool::new(false)),
             current_video_qid: None,
             last_project_generation: 0,
             last_control_redraw: std::time::Instant::now(),
+            last_monitor_set: Vec::new(),
+            last_monitor_check: std::time::Instant::now(),
+            identify_until: None,
+            fps_debug: std::env::var("QPLAYER_FPS_DEBUG").is_ok(),
+            dbg_starved: 0,
+            dbg_presented: 0,
+            dbg_present_time: std::time::Duration::ZERO,
+            dbg_last_log: std::time::Instant::now(),
             osc_manager,
             osc_rx,
             msc_manager,
@@ -305,6 +393,13 @@ impl App {
             triggered_timecodes: Vec::new(),
             active_timecodes: Vec::new(),
             modifiers: winit::keyboard::ModifiersState::empty(),
+            lighting: LightingEngine::default(),
+            pixel_sampler: None,
+            last_pixel_sample: Instant::now(),
+            pixmap_texture: None,
+            pixmap_yuv: None,
+            pixmap_frame_rx: None,
+            pixmap_stop_flag: Arc::new(AtomicBool::new(false)),
             wall_clock_fired: std::collections::HashMap::new(),
             timecode_fired: std::collections::HashSet::new(),
         }
@@ -412,14 +507,33 @@ impl App {
 
         let monitors: Vec<_> = event_loop.available_monitors().collect();
 
-        // Windowed (non-fullscreen) outputs are tiled side-by-side at a preview
-        // size that fits across the screen, so a multi-projector layout is
-        // visible on a single display. Fullscreen-assigned outputs ignore this.
-        let windowed_count = outputs
-            .iter()
-            .filter(|o| o.fullscreen_monitor.is_none())
-            .count()
-            .max(1);
+        // Resolve each output to a physical monitor by saved position descriptor
+        // (survives reboots / projector warm-up reorder), falling back to the legacy
+        // index for old projects. `assigned[i]` = Some(monitor index) or None (windowed).
+        let mon_descs: Vec<qplayer_core::MonitorId> =
+            monitors.iter().map(monitor_descriptor).collect();
+        let wanted: Vec<Option<qplayer_core::MonitorId>> =
+            outputs.iter().map(|o| o.monitor_id.clone()).collect();
+        let mut assigned =
+            qplayer_core::resolve_monitor_assignment(&wanted, &mon_descs, MONITOR_MATCH_DIST_SQ);
+        let mut used = vec![false; monitors.len()];
+        for a in assigned.iter().flatten() {
+            used[*a] = true;
+        }
+        for (o, a) in outputs.iter().zip(assigned.iter_mut()) {
+            if a.is_none() {
+                if let Some(idx) = o.fullscreen_monitor {
+                    if idx < monitors.len() && !used[idx] {
+                        used[idx] = true;
+                        *a = Some(idx);
+                    }
+                }
+            }
+        }
+
+        // Windowed (un-assigned) outputs are tiled side-by-side at a preview size
+        // that fits across the screen; assigned outputs go borderless-fullscreen.
+        let windowed_count = assigned.iter().filter(|a| a.is_none()).count().max(1);
         let (screen_w, screen_h) = event_loop
             .primary_monitor()
             .or_else(|| monitors.first().cloned())
@@ -435,13 +549,13 @@ impl App {
             .max(160.0);
         let mut windowed_idx = 0usize;
 
-        for output in outputs.iter() {
+        for (out_idx, output) in outputs.iter().enumerate() {
             let mut attrs = winit::window::WindowAttributes::default()
                 .with_title(format!("QPlayer Output {}", output.name))
                 .with_visible(true);
 
-            if let Some(idx) = output.fullscreen_monitor {
-                if let Some(monitor) = monitors.get(idx) {
+            if let Some(mon_idx) = assigned[out_idx] {
+                if let Some(monitor) = monitors.get(mon_idx) {
                     attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(
                         monitor.clone(),
                     ))));
@@ -470,20 +584,46 @@ impl App {
             let mut config = surface
                 .get_default_config(&self.adapter, size.width, size.height)
                 .expect("output surface config");
+            let caps = surface.get_capabilities(&self.adapter);
             // The edge-blend brightness ramp is a linear-light multiply; it's only
             // correct if the GPU re-encodes to sRGB on write. Windows backends
             // default to a non-sRGB surface, so the blend band crushes to black.
             // Force an sRGB surface format when the surface offers one.
-            if let Some(srgb) = surface
-                .get_capabilities(&self.adapter)
-                .formats
-                .iter()
-                .copied()
-                .find(|f| f.is_srgb())
-            {
+            if let Some(srgb) = caps.formats.iter().copied().find(|f| f.is_srgb()) {
                 config.format = srgb;
             }
+            // Present mode: Fifo (vsync, no tearing) by default. Override with
+            // QPLAYER_PRESENT_MODE=fifo|fifo_relaxed|mailbox|immediate to test on
+            // hardware where vsync still tears (Windows multi-monitor mixed-refresh).
+            // Falls back to Fifo if the surface lacks the requested mode.
+            let want = match std::env::var("QPLAYER_PRESENT_MODE").as_deref() {
+                Ok("mailbox") => wgpu::PresentMode::Mailbox,
+                Ok("immediate") => wgpu::PresentMode::Immediate,
+                Ok("fifo_relaxed") => wgpu::PresentMode::FifoRelaxed,
+                _ => wgpu::PresentMode::Fifo,
+            };
+            config.present_mode = if caps.present_modes.contains(&want) {
+                want
+            } else {
+                wgpu::PresentMode::Fifo
+            };
             surface.configure(&self.device, &config);
+
+            if std::env::var("QPLAYER_FPS_DEBUG").is_ok() {
+                let refresh = window
+                    .current_monitor()
+                    .and_then(|m| m.refresh_rate_millihertz())
+                    .map(|mhz| format!("{:.2} Hz", mhz as f64 / 1000.0))
+                    .unwrap_or_else(|| "?".into());
+                eprintln!(
+                    "OUTPUT '{}': present_mode={:?} format={:?} refresh={} fullscreen={}",
+                    output.name,
+                    config.present_mode,
+                    config.format,
+                    refresh,
+                    window.fullscreen().is_some(),
+                );
+            }
 
             let pixel_perfect =
                 output.output_width == output.source_width && output.output_height == output.source_height;
@@ -769,6 +909,11 @@ impl App {
                     let rgba = self.rasterize_text_to_canvas(text, *font_size, *font_colour, canvas.width, canvas.height);
                     canvas.upload_rgba(&self.queue, &rgba);
                 }
+                // A still replaces video output: clear video playback state so the
+                // render loop doesn't try to PTS-match against stale frames.
+                self.video_clock = None;
+                self.video_frame_rx = None;
+                self.video_peek = None;
                 self.current_video_qid = Some(qid);
                 self.request_output_redraw();
             }
@@ -781,6 +926,11 @@ impl App {
                         log::error!("Image cue Q{} failed: {e}", qid);
                     }
                 }
+                // A still replaces video output: clear video playback state so the
+                // render loop doesn't try to PTS-match against stale frames.
+                self.video_clock = None;
+                self.video_frame_rx = None;
+                self.video_peek = None;
                 self.current_video_qid = Some(qid);
                 self.request_output_redraw();
             }
@@ -804,9 +954,102 @@ impl App {
                     state.selected_cue_id = Some(target);
                 }
             }
+            qplayer_core::Cue::PixelMap { path, .. } => {
+                log::info!("Go PixelMapCue Q{}: {}", qid, path);
+                self.play_pixmap(path, cue.base().loop_mode);
+            }
+            qplayer_core::Cue::Lighting { snapshot, fade_time, fade_type, .. } => {
+                log::info!(
+                    "Go LightingCue Q{} — {} fixture(s), fade {:.2}s",
+                    qid,
+                    snapshot.len(),
+                    fade_time
+                );
+                self.lighting.go(snapshot, *fade_time, *fade_type);
+            }
             other => {
                 log::info!("Go on unsupported cue type: {:?}", std::mem::discriminant(other));
             }
+        }
+    }
+
+    /// Play media into the dedicated pixel-map texture. Stills upload once;
+    /// videos get a self-paced decode thread (wall-clock PTS — no A/V sync or
+    /// vsync consumer here, LEDs don't need it).
+    fn play_pixmap(&mut self, path: &str, loop_mode: qplayer_core::LoopMode) {
+        // Replace any previous pixmap stream (per-thread flag, same reasoning
+        // as play_video).
+        self.pixmap_stop_flag.store(true, Ordering::Relaxed);
+        self.pixmap_stop_flag = Arc::new(AtomicBool::new(false));
+        self.pixmap_frame_rx = None;
+
+        let resolved = self.resolve_path(path).unwrap_or_else(|| path.to_string());
+
+        // Still image → single upload, no thread.
+        if let Ok(img) = image::open(&resolved) {
+            let img = img.to_rgba8();
+            let (w, h) = (img.width(), img.height());
+            self.ensure_pixmap_texture(w, h);
+            self.pixmap_texture.as_ref().unwrap().upload_frame(
+                &self.queue,
+                &VideoFrame::new(w, h, img.into_raw(), 0.0),
+                qplayer_core::CanvasFit::Stretch, // same dims → exact copy
+            );
+            return;
+        }
+
+        // Video → decode thread feeding a small bounded channel.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<VideoFrame>(3);
+        self.pixmap_frame_rx = Some(rx);
+        let stop = Arc::clone(&self.pixmap_stop_flag);
+        std::thread::Builder::new()
+            .name("pixmap-decode".into())
+            .spawn(move || pixmap_decode_thread(&resolved, loop_mode, stop, tx))
+            .expect("spawn pixmap decode thread");
+    }
+
+    /// Get the pixmap texture, (re)created at the given size.
+    fn ensure_pixmap_texture(&mut self, w: u32, h: u32) -> &qplayer_video::CanvasTexture {
+        let recreate = self
+            .pixmap_texture
+            .as_ref()
+            .is_none_or(|t| t.width != w || t.height != h);
+        if recreate {
+            self.pixmap_texture = Some(qplayer_video::CanvasTexture::new(&self.device, w, h));
+        }
+        self.pixmap_texture.as_ref().unwrap()
+    }
+
+    /// Drain pending pixmap frames and upload the newest to the pixmap texture.
+    fn upload_pixmap_frames(&mut self) {
+        let Some(rx) = &self.pixmap_frame_rx else { return };
+        let mut latest: Option<VideoFrame> = None;
+        while let Ok(f) = rx.try_recv() {
+            latest = Some(f);
+        }
+        let Some(frame) = latest else { return };
+        let (w, h) = (frame.width, frame.height);
+        if frame.rgba().is_some() {
+            self.ensure_pixmap_texture(w, h);
+            let tex = self.pixmap_texture.as_ref().unwrap();
+            tex.upload_frame(&self.queue, &frame, qplayer_core::CanvasFit::Stretch);
+        } else {
+            // YUV planes → GPU convert pass straight into the pixmap texture.
+            self.ensure_pixmap_texture(w, h);
+            if self.pixmap_yuv.is_none() {
+                self.pixmap_yuv = Some(qplayer_video::YuvConverter::new(
+                    &self.device,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                ));
+            }
+            let conv = self.pixmap_yuv.as_mut().unwrap();
+            conv.upload(&self.device, &self.queue, &frame, [w, h], qplayer_core::CanvasFit::Stretch);
+            let tex = self.pixmap_texture.as_ref().unwrap();
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pixmap-yuv") });
+            conv.encode(&mut encoder, &tex.render_view());
+            self.queue.submit(Some(encoder.finish()));
         }
     }
 
@@ -1318,8 +1561,13 @@ impl App {
         // A newly-started video should always play, even if the system was paused.
         self.video_pause_flag.store(false, Ordering::Relaxed);
         self.current_video_qid = Some(qid);
-        self.frame_queue.clear();
         self.canvas_has_frame = false;
+        // Start the playback clock now; PTS are matched against it (and frames late
+        // vs the clock are skipped, so video catches up to audio even if decode
+        // open / first-frame took a while).
+        self.video_clock = Some(std::time::Instant::now());
+        self.video_pause_started = None;
+        self.video_peek = None;
 
         // Create/resize the shared projection canvas.
         let projection = {
@@ -1340,16 +1588,13 @@ impl App {
         // (same as play_audio) so a packed project's "Media/<file>" relative path
         // opens instead of failing — audio resolved but video didn't.
         let path = self.resolve_path(path).unwrap_or_else(|| path.to_string());
-        // Pace video off a monotonic wall clock captured here, NOT the audio master
-        // clock. The audio clock freezes if the output device sleeps or is swapped
-        // (display sleep takes HDMI audio with it), stalling video on a held frame —
-        // fatal for an unattended loop. A wall clock can't freeze. Trade-off: A/V sync
-        // is best-effort rather than sample-locked to the audio device.
-        let clock = {
-            let origin = std::time::Instant::now();
-            Arc::new(move || origin.elapsed()) as Arc<dyn Fn() -> Duration + Send + Sync>
-        };
-        let start = Duration::ZERO;
+        // Bounded channel = backpressure: the decode thread can't outrun the consumer
+        // (the vsync-paced render loop), so decode runs at the display refresh rate
+        // — no free-running wall clock to drift against vsync. The small buffer absorbs
+        // decode jitter. Pacing is the display, not the audio clock, so it can't freeze
+        // if the audio device sleeps.
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<VideoFrame>(VIDEO_QUEUE_CAP);
+        self.video_frame_rx = Some(frame_rx);
         let stop_flag = Arc::clone(&self.video_stop_flag);
         let pause_flag = Arc::clone(&self.video_pause_flag);
         let proxy = self.event_loop_proxy.clone();
@@ -1357,7 +1602,7 @@ impl App {
         std::thread::Builder::new()
             .name("video-decode".into())
             .spawn(move || {
-                video_decode_thread(&path, clock, start, stop_flag, pause_flag, proxy);
+                video_decode_thread(&path, stop_flag, pause_flag, frame_tx, proxy);
             })
             .expect("spawn video decode thread");
     }
@@ -1385,6 +1630,10 @@ impl App {
 
     fn reset_for_project_change(&mut self) {
         self.stop_all();
+        self.lighting.shutdown();
+        self.pixmap_texture = None;
+        self.pixmap_yuv = None;
+        self.pixel_sampler = None;
         self.output_windows.clear();
         if let Some(ids) = self.window_ids.as_mut() {
             ids.video.clear();
@@ -1396,7 +1645,11 @@ impl App {
     fn stop_all(&mut self) {
         self.video_stop_flag.store(true, Ordering::Relaxed);
         self.video_pause_flag.store(false, Ordering::Relaxed);
-        self.frame_queue.clear();
+        // Drop the receiver: the decode thread's send will fail with
+        // Disconnected and exit, and we stop presenting new frames.
+        self.video_frame_rx = None;
+        self.video_clock = None;
+        self.video_peek = None;
         self.canvas_has_frame = false;
         self.current_video_qid = None;
         self.audio_engine.stop_all();
@@ -1405,6 +1658,15 @@ impl App {
         self.active_timecodes.clear();
         self.timecode_fired.clear();
         self.paused = false;
+        // Halt any in-flight lighting fade; levels hold (blackout is a cue's job).
+        self.lighting.stop_fade();
+        // Stop the pixmap stream and blank its texture so pixel-mapped LEDs go dark.
+        self.pixmap_stop_flag.store(true, Ordering::Relaxed);
+        self.pixmap_frame_rx = None;
+        if let Some(tex) = self.pixmap_texture.as_ref() {
+            let (w, h) = (tex.width, tex.height);
+            tex.upload_rgba(&self.queue, &vec![0u8; (w * h * 4) as usize]);
+        }
         // Output is event-driven now — explicitly repaint so it clears to black.
         self.request_output_redraw();
     }
@@ -1433,6 +1695,7 @@ impl App {
         }
         self.video_pause_flag.store(true, Ordering::Relaxed);
         self.paused = true;
+        self.video_pause_started = Some(std::time::Instant::now());
         log::info!("Paused {} cue(s)", self.active_cues.len());
     }
 
@@ -1445,6 +1708,13 @@ impl App {
         }
         self.video_pause_flag.store(false, Ordering::Relaxed);
         self.paused = false;
+        // Advance the playback clock past the paused interval so video resumes where
+        // it left off instead of jumping forward.
+        if let Some(t) = self.video_pause_started.take() {
+            if let Some(c) = self.video_clock.as_mut() {
+                *c += t.elapsed();
+            }
+        }
         log::info!("Resumed {} cue(s)", self.active_cues.len());
     }
 
@@ -2108,7 +2378,10 @@ impl App {
         let raw_input = egui_state.take_egui_input(window);
         // Sync active cue state into the GUI shared state
         {
-            let gui_active: Vec<qplayer_gui::ActiveCueInfo> = self.active_cues.iter().map(|ac| {
+            let sr = (self.audio_engine.sample_rate() as f64).max(1.0);
+            // Interleaved stereo samples → seconds.
+            let secs = |samples: usize| (samples as f64 / 2.0 / sr) as f32;
+            let mut gui_active: Vec<qplayer_gui::ActiveCueInfo> = self.active_cues.iter().map(|ac| {
                 // For looping cues with explicit loop boundaries, show loop-relative
                 // position so the progress bar resets to 0 on each loop iteration.
                 let loop_length_frames = ac.loop_end_frame.saturating_sub(ac.loop_start_frame) as usize;
@@ -2124,12 +2397,42 @@ impl App {
                     name: ac.name.clone(),
                     volume: ac.input.volume(),
                     paused: !ac.input.is_active(),
-                    position,
-                    length,
+                    position_secs: secs(position),
+                    length_secs: length.map(secs),
                     state: ac.state,
                 }
             }).collect();
             if let Ok(mut state) = self.qplayer.state().lock() {
+                // A video with no audio track (or whose audio failed to open) has
+                // no mixer input and thus no ActiveCue — but it is on screen.
+                // Synthesize a panel entry from the video clock so it still shows
+                // as active. Position comes from `video_clock` (frozen across
+                // pause); length from the cue's duration field when set.
+                if let Some(vqid) = self.current_video_qid {
+                    if !gui_active.iter().any(|c| c.qid == vqid) {
+                        if let Some(cue) = state.show_file.cues.iter().find(|c| c.base().qid == vqid) {
+                            let paused = self.video_pause_started.is_some();
+                            let position_secs = match (self.video_clock, self.video_pause_started) {
+                                (Some(clock), Some(paused_at)) => paused_at.duration_since(clock).as_secs_f32(),
+                                (Some(clock), None) => clock.elapsed().as_secs_f32(),
+                                _ => 0.0,
+                            };
+                            let dur = match cue {
+                                qplayer_core::Cue::Video { duration, .. } => duration.as_secs_f64() as f32,
+                                _ => 0.0,
+                            };
+                            gui_active.push(qplayer_gui::ActiveCueInfo {
+                                qid: vqid,
+                                name: cue.base().name.clone(),
+                                volume: 0.0,
+                                paused,
+                                position_secs,
+                                length_secs: (dur > 0.0).then_some(dur),
+                                state: if paused { CueState::Paused } else { CueState::Playing },
+                            });
+                        }
+                    }
+                }
                 state.active_cues = gui_active;
             }
         }
@@ -2213,19 +2516,71 @@ impl App {
             state.show_file.projection.clone()
         };
 
-        // Take one frame off the queue per present (vsync-paced) so frames are shown
-        // in order, one per refresh — no overwrite drops.
-        if let Some(frame) = self.frame_queue.pop_front() {
-            if let Some(canvas) = self.canvas_texture.as_ref() {
-                canvas.upload_frame(&self.queue, &frame, projection.fit);
+        // Show the frame whose PTS is due at the current playback time. `video_clock`
+        // is a wall clock = real time (the audio runs on the same real time), so this
+        // keeps A/V in sync and plays correct-speed on any display refresh. Frames
+        // late vs the clock are dropped to catch up; when ahead, the last frame is
+        // held and re-presented at vsync.
+        if !self.paused {
+            if let Some(target) = self.video_clock.map(|c| c.elapsed()) {
+                let mut newest_due: Option<VideoFrame> = None;
+                loop {
+                    if self.video_peek.is_none() {
+                        self.video_peek =
+                            self.video_frame_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+                    }
+                    match self.video_peek.as_ref() {
+                        Some(f) if Duration::from_secs_f64(f.pts.max(0.0)) <= target => {
+                            newest_due = self.video_peek.take();
+                        }
+                        _ => break, // next frame not due yet, or channel empty
+                    }
+                }
+                if let Some(frame) = newest_due {
+                    match frame.pixels {
+                        qplayer_video::FramePixels::Rgba(_) => {
+                            if let Some(canvas) = self.canvas_texture.as_ref() {
+                                canvas.upload_frame(&self.queue, &frame, projection.fit);
+                            }
+                        }
+                        _ => {
+                            // GPU path: upload decoded planes now; the convert pass is
+                            // recorded into the first output's encoder below (no CPU
+                            // swscale, no 23 MB RGBA copy, no separate submit).
+                            if self.yuv_converter.is_none() {
+                                self.yuv_converter = Some(qplayer_video::YuvConverter::new(
+                                    &self.device,
+                                    wgpu::TextureFormat::Rgba8Unorm,
+                                ));
+                            }
+                            if let (Some(canvas), Some(conv)) =
+                                (self.canvas_texture.as_ref(), self.yuv_converter.as_mut())
+                            {
+                                conv.upload(
+                                    &self.device,
+                                    &self.queue,
+                                    &frame,
+                                    [canvas.width, canvas.height],
+                                    projection.fit,
+                                );
+                                self.pending_yuv_convert = true;
+                            }
+                        }
+                    }
+                    self.canvas_has_frame = true;
+                } else if self.fps_debug && self.video_peek.is_none() {
+                    self.dbg_starved += 1;
+                }
             }
-            self.canvas_has_frame = true;
         }
 
         let canvas_view = self.canvas_texture.as_ref().map(|c| c.view());
+        let canvas_render_view = self.canvas_texture.as_ref().map(|c| c.render_view());
         let has_video = self.current_video_qid.is_some() || self.canvas_has_frame;
 
-        for out in &mut self.output_windows {
+        let identify = self.identify_until.is_some_and(|t| std::time::Instant::now() < t);
+        let present_start = std::time::Instant::now();
+        for (out_i, out) in self.output_windows.iter_mut().enumerate() {
             let size = out.window.inner_size();
             if size.width == 0 || size.height == 0 {
                 continue;
@@ -2266,8 +2621,37 @@ impl App {
                 label: Some("output-encoder"),
             });
 
-            if has_video {
+            if identify {
+                let color = IDENTIFY_COLORS[out_i % IDENTIFY_COLORS.len()];
+                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("identify-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(color),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+            } else if has_video {
                 if let Some(canvas_view) = canvas_view.as_ref() {
+                    // Fold the pending YUV→RGB pass into this output's encoder so it
+                    // runs once (before the first output samples the canvas) without
+                    // its own submit. Subsequent outputs read the converted canvas.
+                    if self.pending_yuv_convert {
+                        if let (Some(rv), Some(conv)) =
+                            (canvas_render_view.as_ref(), self.yuv_converter.as_ref())
+                        {
+                            conv.encode(&mut encoder, rv);
+                        }
+                        self.pending_yuv_convert = false;
+                    }
                     out.renderer.render(
                         &self.device,
                         &self.queue,
@@ -2318,14 +2702,14 @@ impl App {
             surface_texture.present();
         }
 
-        // Frames still queued (a burst of events landed between presents) — schedule
-        // another present so the queue drains at the display refresh rather than
-        // stalling until the next decoded frame arrives.
-        if !self.frame_queue.is_empty() {
-            for out in &self.output_windows {
-                out.window.request_redraw();
-            }
+        if self.fps_debug && !self.output_windows.is_empty() {
+            self.dbg_presented += 1;
+            self.dbg_present_time += present_start.elapsed();
         }
+
+        // Vsync pacing: the Fifo present itself is the throttle. We rely on the
+        // swapchain backpressure plus a continuous redraw request in about_to_wait
+        // to keep the loop running at exactly the display refresh.
     }
 }
 
@@ -2338,25 +2722,6 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::VideoFrame(frame) => {
-                // Drop stragglers from a decode thread we already stopped (Stop, or
-                // switching projects): an in-flight frame queued on the event proxy
-                // before stop_all() would otherwise re-populate the output and the
-                // window would never go black. current_video_qid is set before the
-                // thread spawns, so genuine frames always have it set.
-                if self.current_video_qid.is_some() {
-                    // Bounded: if the consumer fell behind, drop the oldest frame
-                    // rather than let the queue grow without limit.
-                    const MAX_QUEUED: usize = 6;
-                    if self.frame_queue.len() >= MAX_QUEUED {
-                        self.frame_queue.pop_front();
-                    }
-                    self.frame_queue.push_back(frame);
-                    for out in &self.output_windows {
-                        out.window.request_redraw();
-                    }
-                }
-            }
             AppEvent::VideoEof => {
                 log::info!("Video EOF");
                 // What the output window shows after a clip ends:
@@ -2392,7 +2757,9 @@ impl ApplicationHandler<AppEvent> for App {
                         _ => {
                             // OneShot (or cue gone): blank the output to black.
                             self.current_video_qid = None;
-                            self.frame_queue.clear();
+                            self.video_frame_rx = None;
+                            self.video_clock = None;
+                            self.video_peek = None;
                             self.canvas_has_frame = false;
                             for out in &self.output_windows {
                                 out.window.request_redraw();
@@ -2577,9 +2944,9 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
                 WindowEvent::RedrawRequested => {
-                    // Output windows present on demand (new decoded frame, stop, or a
-                    // still cue) — not continuously — so each frame gets exactly one
-                    // vsync present instead of being coalesced and dropped.
+                    // Output windows render continuously while a video is playing.
+                    // The bounded channel and Fifo swapchain backpressure keep this
+                    // loop locked to the display refresh, one frame per vsync.
                     self.render_video();
                 }
                 _ => {}
@@ -2606,9 +2973,133 @@ impl ApplicationHandler<AppEvent> for App {
         self.poll_wall_clock_triggers(event_loop);
         self.poll_timecode_triggers(event_loop);
 
-        // Output windows are redrawn on demand (new frame / stop / still cue), not
-        // here — see request_output_redraw. The control window redraws on a ~60 Hz
-        // throttle so its (non-vsync) UI stays live without busy-spinning the GPU.
+        // Lighting: sender lifecycle + fade advance + DMX submit (self-throttled).
+        {
+            let cfg = self.qplayer.state().lock_unpoisoned().show_file.lighting.clone();
+
+            // Pixel-map segments: downsample each segment's source texture →
+            // engine overlay. Throttled to the DMX rate.
+            if cfg.enabled && self.last_pixel_sample.elapsed().as_secs_f32() >= 1.0 / cfg.fps.max(1.0) {
+                self.upload_pixmap_frames();
+                // Raw (non-sRGB) views: bytes as stored, display-referred —
+                // the colour pipeline's gamma does the linearisation.
+                let canvas_view = self.canvas_texture.as_ref().map(|c| c.render_view());
+                let pixmap_view = self.pixmap_texture.as_ref().map(|t| t.render_view());
+                let batch: Vec<(&wgpu::TextureView, u32, [f32; 4], u32, u32)> = cfg
+                    .active_segments()
+                    .filter_map(|s| {
+                        let view = match s.source {
+                            qplayer_core::lighting::SegmentSource::Canvas => canvas_view.as_ref(),
+                            qplayer_core::lighting::SegmentSource::PixelMap => pixmap_view.as_ref(),
+                        }?;
+                        Some((view, s.id, s.region, s.cols, s.rows))
+                    })
+                    .collect();
+                if !batch.is_empty() {
+                    self.last_pixel_sample = Instant::now();
+                    let sampler = self
+                        .pixel_sampler
+                        .get_or_insert_with(|| qplayer_video::PixelSampler::new(&self.device));
+                    let ready = sampler.collect(&self.device);
+                    if !ready.is_empty() {
+                        // Publish to the GUI grid preview, then feed the engine.
+                        if let Ok(mut state) = self.qplayer.state().lock() {
+                            for (id, cols, rows, rgba) in &ready {
+                                state.lighting_preview.insert(*id, (*cols, *rows, rgba.clone()));
+                            }
+                        }
+                        for (id, cols, rows, rgba) in ready {
+                            self.lighting.set_segment_pixels(id, cols, rows, rgba);
+                        }
+                    }
+                    sampler.sample(&self.device, &self.queue, &batch);
+                }
+            }
+
+            self.lighting.tick(&cfg);
+        }
+
+        // Publish the current monitors (for the projection-panel dropdown) and detect
+        // hotplug / projector warm-up. Throttled — enumerating monitors hits the OS.
+        if self.last_monitor_check.elapsed() >= std::time::Duration::from_millis(1000) {
+            self.last_monitor_check = std::time::Instant::now();
+            let current: Vec<qplayer_core::MonitorId> = event_loop
+                .available_monitors()
+                .map(|m| monitor_descriptor(&m))
+                .collect();
+            if current != self.last_monitor_set {
+                self.last_monitor_set = current.clone();
+                if let Ok(mut s) = self.qplayer.state().lock() {
+                    s.available_monitors = current;
+                }
+                // Re-apply output→monitor assignment (a projector finished warming up
+                // after boot, or was power-cycled) so the wall self-heals.
+                if !self.output_windows.is_empty() {
+                    log::info!("Monitor set changed — rebuilding output windows");
+                    self.create_output_windows(event_loop);
+                }
+            }
+        }
+
+        // Identify: flash each output a distinct colour so the operator can map
+        // windows to physical projectors.
+        let identify_req = self
+            .qplayer
+            .state()
+            .lock()
+            .map(|mut s| std::mem::take(&mut s.identify_outputs))
+            .unwrap_or(false);
+        if identify_req {
+            self.identify_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(8));
+            for (i, out) in self.output_windows.iter().enumerate() {
+                log::warn!(
+                    "Identify: '{}' = {}",
+                    out.output_config.name,
+                    IDENTIFY_COLOR_NAMES[i % IDENTIFY_COLOR_NAMES.len()]
+                );
+            }
+        }
+        if self.identify_until.is_some_and(|t| std::time::Instant::now() < t) {
+            self.request_output_redraw(); // keep flashing even with no video playing
+        } else if self.identify_until.take().is_some() {
+            self.request_output_redraw(); // just expired — repaint once to restore
+        }
+
+        if self.fps_debug && self.dbg_last_log.elapsed() >= std::time::Duration::from_secs(1) {
+            let secs = self.dbg_last_log.elapsed().as_secs_f64();
+            let avg_cycle_ms = if self.dbg_presented > 0 {
+                self.dbg_present_time.as_secs_f64() * 1000.0 / self.dbg_presented as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "VIDEO DIAG: {} window(s) | starved {:.0}/s | presented {:.0}/s | avg present-cycle {:.1} ms",
+                self.output_windows.len(),
+                self.dbg_starved as f64 / secs,
+                self.dbg_presented as f64 / secs,
+                avg_cycle_ms,
+            );
+            self.dbg_starved = 0;
+            self.dbg_presented = 0;
+            self.dbg_present_time = std::time::Duration::ZERO;
+            self.dbg_last_log = std::time::Instant::now();
+        }
+
+        // Video output: continuous redraw so the Fifo swapchain backpressure paces
+        // us to the display refresh. When paused we stop requesting, so the last
+        // held frame stays on screen and decode blocks on the full channel.
+        if self.current_video_qid.is_some()
+            && !self.paused
+            && !self.output_windows.is_empty()
+        {
+            for out in &self.output_windows {
+                out.window.request_redraw();
+            }
+        }
+
+        // The control window redraws on a ~60 Hz throttle so its (non-vsync) UI
+        // stays live without busy-spinning the GPU.
         if self.last_control_redraw.elapsed() >= std::time::Duration::from_millis(16) {
             self.last_control_redraw = std::time::Instant::now();
             if let Some(window) = self.control_window.as_ref() {
@@ -2672,12 +3163,12 @@ fn resolve_goto_target(
 /// Video decode thread: sleeps until each frame's PTS, then sends it to the main loop.
 fn video_decode_thread(
     path: &str,
-    clock: Arc<dyn Fn() -> Duration + Send + Sync>,
-    start_clock: Duration,
     stop_flag: Arc<AtomicBool>,
     pause_flag: Arc<AtomicBool>,
+    frame_tx: std::sync::mpsc::SyncSender<VideoFrame>,
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
 ) {
+    use std::sync::mpsc::TrySendError;
     let mut source = match VideoSource::open(path) {
         Ok(s) => s,
         Err(e) => {
@@ -2686,44 +3177,36 @@ fn video_decode_thread(
         }
     };
 
-    let mut paused_at: Option<Duration> = None;
-    let mut total_pause = Duration::ZERO;
-
     while !stop_flag.load(Ordering::Relaxed) {
-        // When paused, sleep without decoding so we don't read ahead.
+        // Paused: stop decoding (the consumer also stops pulling, so the channel
+        // stays full and we'd block anyway).
         if pause_flag.load(Ordering::Relaxed) {
-            if paused_at.is_none() {
-                paused_at = Some(clock());
-            }
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
 
-        // Just resumed — accumulate the pause duration so we don't fast-forward.
-        if let Some(start) = paused_at.take() {
-            total_pause += clock().saturating_sub(start);
-        }
-
         match source.read_frame() {
             Some(frame) => {
-                let elapsed = clock().saturating_sub(start_clock).saturating_sub(total_pause);
-                let frame_due = Duration::from_secs_f64(frame.pts.max(0.0));
-
-                if frame_due > elapsed {
-                    let sleep_for = frame_due - elapsed;
-                    // Cap sleep to avoid missing stop signals for too long
-                    std::thread::sleep(sleep_for.min(Duration::from_millis(50)));
-                }
-
-                if stop_flag.load(Ordering::Relaxed) {
-                    break;
-                }
-                if pause_flag.load(Ordering::Relaxed) {
-                    continue;
-                }
-
-                if proxy.send_event(AppEvent::VideoFrame(frame)).is_err() {
-                    break;
+                // Backpressure: wait until the vsync-paced consumer takes a frame.
+                // This is what paces decode to the display refresh. We poll with a
+                // short sleep so we stay responsive to stop/pause signals; the channel
+                // still caps the decode rate to exactly what the display consumes.
+                let mut frame = frame;
+                loop {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if pause_flag.load(Ordering::Relaxed) {
+                        break; // drop this frame; the outer loop handles the pause
+                    }
+                    match frame_tx.try_send(frame) {
+                        Ok(()) => break,
+                        Err(TrySendError::Full(f)) => {
+                            frame = f;
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(TrySendError::Disconnected(_)) => return,
+                    }
                 }
             }
             None => {
@@ -2731,6 +3214,59 @@ fn video_decode_thread(
                 break;
             }
         }
+    }
+}
+
+/// Pixel-map decode thread: self-paced by wall-clock PTS (no vsync consumer),
+/// loops by reopening the source, blanks to black on a OneShot end.
+fn pixmap_decode_thread(
+    path: &str,
+    loop_mode: qplayer_core::LoopMode,
+    stop_flag: Arc<AtomicBool>,
+    frame_tx: std::sync::mpsc::SyncSender<VideoFrame>,
+) {
+    let looping = matches!(
+        loop_mode,
+        qplayer_core::LoopMode::Looped | qplayer_core::LoopMode::LoopedInfinite
+    );
+    let mut last_dims = (0u32, 0u32);
+    'outer: loop {
+        let mut source = match VideoSource::open(path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("PixelMap: failed to open {}: {e}", path);
+                return;
+            }
+        };
+        let start = Instant::now();
+        while !stop_flag.load(Ordering::Relaxed) {
+            let Some(frame) = source.read_frame() else {
+                if looping {
+                    continue 'outer; // reopen from the top
+                }
+                if loop_mode == qplayer_core::LoopMode::OneShot && last_dims.0 > 0 {
+                    // Blank to black so the LEDs go dark, mirroring video-cue end.
+                    let (w, h) = last_dims;
+                    let _ = frame_tx.send(VideoFrame::new(w, h, vec![0; (w * h * 4) as usize], 0.0));
+                }
+                return; // HoldLast: exit holding the last frame
+            };
+            last_dims = (frame.width, frame.height);
+            // Wall-clock pacing: sleep until this frame is due.
+            let due = start + Duration::from_secs_f64(frame.pts.max(0.0));
+            while Instant::now() < due {
+                if stop_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // Blocking send is fine: the consumer drains every lighting tick,
+            // and a dropped receiver ends the thread via the send error.
+            if frame_tx.send(frame).is_err() {
+                return;
+            }
+        }
+        return;
     }
 }
 
@@ -2924,7 +3460,8 @@ fn main() -> anyhow::Result<()> {
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("qplayer-device"),
-            required_features: wgpu::Features::empty(),
+            // Required for the 10-bit planar (p10le) GPU path.
+            required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
             required_limits: wgpu::Limits::default(),
             ..Default::default()
         },

@@ -137,10 +137,10 @@ pub struct ActiveCueInfo {
     pub volume: f32,
     /// True if the cue is currently paused.
     pub paused: bool,
-    /// Current playback position in samples.
-    pub position: usize,
-    /// Total length in samples, if known.
-    pub length: Option<usize>,
+    /// Current playback position in seconds.
+    pub position_secs: f32,
+    /// Total length in seconds, if known.
+    pub length_secs: Option<f32>,
     /// Runtime state.
     pub state: CueState,
 }
@@ -199,6 +199,10 @@ pub struct SharedState {
     pub show_video_window: bool,
     /// Whether the Projection Mapping window is open.
     pub show_projection_window: bool,
+    pub show_lighting_window: bool,
+    /// Latest pixel-map sample per segment: id → (cols, rows, RGBA bytes).
+    /// Published by the control binary; painted by the lighting panel preview.
+    pub lighting_preview: std::collections::HashMap<u32, (u32, u32, Vec<u8>)>,
     /// Set on window-close with unsaved changes / running cues — shows the in-app
     /// quit-confirm modal (a native modal deadlocks the loop).
     pub pending_close_confirm: bool,
@@ -214,6 +218,12 @@ pub struct SharedState {
     /// rebuilds its output/projection windows from the new projection settings —
     /// without it, the windows keep the previous project's mapping on a switch.
     pub project_generation: u64,
+    /// Current physical monitors, published by the control binary so the projection
+    /// panel can offer a real monitor dropdown (not a blind index).
+    pub available_monitors: Vec<qplayer_core::MonitorId>,
+    /// When set, the control binary flashes each output a distinct colour so the
+    /// operator can see which window is on which projector. Cleared after a timeout.
+    pub identify_outputs: bool,
 }
 
 /// State for the progress overlay modal.
@@ -250,12 +260,16 @@ impl Default for SharedState {
             waveform_window_scroll: 0.0,
             show_video_window: false,
             show_projection_window: false,
+            show_lighting_window: false,
+            lighting_preview: std::collections::HashMap::new(),
             pending_close_confirm: false,
             quit: false,
             progress_overlay: None,
             pending_midi_learn: None,
             pending_timecode_capture: None,
             project_generation: 0,
+            available_monitors: Vec::new(),
+            identify_outputs: false,
         }
     }
 }
@@ -342,6 +356,8 @@ pub enum CueType {
     Text,
     Image,
     Goto,
+    Lighting,
+    PixelMap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -765,6 +781,28 @@ impl QPlayerApp {
             state.show_projection_window = show_projection;
         }
 
+        // Lighting window (DMX output + fixture patch)
+        let mut show_lighting = if let Ok(state) = self.state.lock() {
+            state.show_lighting_window
+        } else {
+            false
+        };
+        if show_lighting {
+            egui::Window::new("Lighting")
+                .collapsible(false)
+                .resizable(true)
+                .default_size([560.0, 480.0])
+                .open(&mut show_lighting)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        crate::lighting_panel::show(ui, &self.state);
+                    });
+                });
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.show_lighting_window = show_lighting;
+        }
+
         // Quit-confirm modal (in-app; a native dialog deadlocks the winit loop).
         let pending_close = self.state.lock().map(|s| s.pending_close_confirm).unwrap_or(false);
         if pending_close {
@@ -977,6 +1015,16 @@ impl QPlayerApp {
                 if ui.checkbox(&mut show_projection, "Projection Mapping").clicked() {
                     if let Ok(mut state) = self.state.lock() {
                         state.show_projection_window = show_projection;
+                    }
+                    ui.close();
+                }
+                let mut show_lighting = {
+                    let Ok(state) = self.state.lock() else { return; };
+                    state.show_lighting_window
+                };
+                if ui.checkbox(&mut show_lighting, "Lighting").clicked() {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.show_lighting_window = show_lighting;
                     }
                     ui.close();
                 }
@@ -1268,6 +1316,16 @@ impl QPlayerApp {
                                 base,
                                 target_qid: Decimal::ZERO,
                             },
+                            CueType::Lighting => qplayer_core::Cue::Lighting {
+                                base,
+                                snapshot: Default::default(),
+                                fade_time: 2.0,
+                                fade_type: qplayer_core::FadeType::Linear,
+                            },
+                            CueType::PixelMap => qplayer_core::Cue::PixelMap {
+                                base,
+                                path: String::new(),
+                            },
                         };
                         state.show_file.cues.push(cue);
                         state.dirty = true;
@@ -1362,12 +1420,32 @@ impl QPlayerApp {
                 }
                 AppCommand::UpdateCueQid { qid, new_qid } => {
                     if let Ok(mut state) = self.state.lock() {
+                        // Qid is the cue's identity — refuse duplicates.
+                        if state.show_file.cues.iter().any(|c| c.base().qid == new_qid) {
+                            log::warn!("Cue {} already exists — keeping {}", new_qid, qid);
+                            continue;
+                        }
                         let idx = state.show_file.cues.iter().position(|c| c.base().qid == qid);
                         if let Some(i) = idx {
                             let snapshot = Snapshot::from_state(&state)
                                 .with_merge_key(format!("cue:{}:qid", qid));
                             state.undo_redo.push(snapshot);
                             state.show_file.cues[i].base_mut().qid = new_qid;
+                            // Follow the rename everywhere the old qid is referenced.
+                            for c in &mut state.show_file.cues {
+                                if c.base().parent == Some(qid) {
+                                    c.base_mut().parent = Some(new_qid);
+                                }
+                                match c {
+                                    qplayer_core::Cue::Stop { stop_qid, .. } if *stop_qid == qid => *stop_qid = new_qid,
+                                    qplayer_core::Cue::Volume { sound_qid, .. } if *sound_qid == qid => *sound_qid = new_qid,
+                                    qplayer_core::Cue::Goto { target_qid, .. } if *target_qid == qid => *target_qid = new_qid,
+                                    _ => {}
+                                }
+                            }
+                            if state.selected_cue_id == Some(qid) {
+                                state.selected_cue_id = Some(new_qid);
+                            }
                             state.dirty = true;
                         }
                     }

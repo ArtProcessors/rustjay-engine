@@ -8,8 +8,8 @@ use rust_decimal::Decimal;
 pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     let (cues, selected_id, show_mode, active_positions) = {
         let Ok(state) = state.lock() else { return };
-        let active_positions: std::collections::HashMap<rust_decimal::Decimal, (usize, Option<usize>)> =
-            state.active_cues.iter().map(|ac| (ac.qid, (ac.position, ac.length))).collect();
+        let active_positions: std::collections::HashMap<rust_decimal::Decimal, (f32, Option<f32>)> =
+            state.active_cues.iter().map(|ac| (ac.qid, (ac.position_secs, ac.length_secs))).collect();
         (
             state.show_file.cues.clone(),
             state.selected_cue_id,
@@ -54,6 +54,12 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
             if ui.button("+ Goto").clicked() {
                 queue_cmd(state, AppCommand::AddCue { cue_type: CueType::Goto });
             }
+            if ui.button("+ Light").clicked() {
+                queue_cmd(state, AppCommand::AddCue { cue_type: CueType::Lighting });
+            }
+            if ui.button("+ PixMap").clicked() {
+                queue_cmd(state, AppCommand::AddCue { cue_type: CueType::PixelMap });
+            }
         });
         ui.separator();
     }
@@ -67,8 +73,14 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     const COL_LOOP: f32 = 24.0;
     const COL_TYPE: f32 = 40.0;
     const COL_COLOUR: f32 = 16.0;
+    // Group members indent inside the row (not via frame margin) so every
+    // column after Name stays aligned with the header and top-level rows.
+    const GROUP_INDENT: f32 = 22.0;
+    // Row frames have a 4px left inner margin; match it so headers line up.
+    const ROW_MARGIN: f32 = 4.0;
 
     ui.horizontal(|ui| {
+        ui.add_space(ROW_MARGIN);
         if show_mode == crate::app::ShowMode::Edit {
             ui.add_sized([COL_DRAG, 18.0], egui::Label::new(""));
         }
@@ -108,16 +120,18 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 ui.visuals().panel_fill
             };
 
-            let frame = egui::Frame::new().fill(bg).inner_margin(egui::Margin {
-                left: if in_group { 26 } else { 4 },
-                right: 4,
-                top: 4,
-                bottom: 4,
-            });
+            let frame = egui::Frame::new()
+                .fill(bg)
+                .inner_margin(egui::Margin::symmetric(ROW_MARGIN as i8, 4));
 
             let (drop_response, dropped_payload) = ui.dnd_drop_zone::<usize, ()>(frame, |ui| {
                 ui.horizontal(|ui| {
                     ui.set_min_height(20.0);
+                    if in_group {
+                        ui.add_space(GROUP_INDENT);
+                    }
+                    // Absorb the indent in the Name column so later columns align.
+                    let name_w = if in_group { COL_NAME - GROUP_INDENT } else { COL_NAME };
 
                     // Drag handle (only in edit mode)
                     if show_mode == crate::app::ShowMode::Edit {
@@ -129,21 +143,32 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         });
                     }
 
-                    // Q# column
+                    // Q# column. The TextEdit buffer is rebuilt from the model every
+                    // frame, so in-progress typing must live in egui temp memory and
+                    // only commit (parse) once focus leaves the field.
                     if show_mode == crate::app::ShowMode::Edit {
-                        let mut qid_str = qid.to_string();
+                        let edit_id = egui::Id::new(("qid", qid));
+                        let mut qid_str = ui
+                            .data_mut(|d| d.get_temp::<String>(edit_id))
+                            .unwrap_or_else(|| qid.to_string());
                         let response = ui.add_sized(
                             [COL_QID, 18.0],
                             egui::TextEdit::singleline(&mut qid_str)
-                                .id_salt(egui::Id::new(("qid", qid)))
+                                .id_salt(edit_id)
                                 .font(egui::TextStyle::Monospace),
                         );
                         if response.lost_focus() {
-                            if let Ok(new_qid) = qid_str.parse::<rust_decimal::Decimal>() {
-                                if new_qid != qid {
-                                    queue_cmd(state, AppCommand::UpdateCueQid { qid, new_qid });
+                            ui.data_mut(|d| d.remove_temp::<String>(edit_id));
+                            let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            if !cancelled {
+                                if let Ok(new_qid) = qid_str.parse::<rust_decimal::Decimal>() {
+                                    if new_qid != qid {
+                                        queue_cmd(state, AppCommand::UpdateCueQid { qid, new_qid });
+                                    }
                                 }
                             }
+                        } else if response.has_focus() {
+                            ui.data_mut(|d| d.insert_temp(edit_id, qid_str.clone()));
                         }
                         if response.clicked() {
                             queue_select(state, qid);
@@ -158,23 +183,26 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         }
                     }
 
-                    // Name column
+                    // Name column. Commit on every keystroke — the model feeds the
+                    // buffer next frame, and per-key undo snapshots merge via the
+                    // merge key. (Committing only on lost_focus never fired, since
+                    // changed() and lost_focus() happen on different frames.)
                     if show_mode == crate::app::ShowMode::Edit {
                         let mut name_str = name.clone();
                         let response = ui.add_sized(
-                            [COL_NAME, 18.0],
+                            [name_w, 18.0],
                             egui::TextEdit::singleline(&mut name_str)
                                 .id_salt(egui::Id::new(("name", qid)))
                                 .font(egui::TextStyle::Body),
                         );
-                        if response.changed() && response.lost_focus() {
+                        if response.changed() {
                             queue_cmd(state, AppCommand::UpdateCueName { qid, name: name_str });
                         }
                         if response.clicked() {
                             queue_select(state, qid);
                         }
                     } else {
-                        let response = ui.add_sized([COL_NAME, 18.0], |ui: &mut egui::Ui| {
+                        let response = ui.add_sized([name_w, 18.0], |ui: &mut egui::Ui| {
                             ui.selectable_label(is_selected, name.as_str())
                         });
                         if response.clicked() {
@@ -229,8 +257,8 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                     ui.add_sized([COL_DURATION, 18.0], |ui: &mut egui::Ui| {
                         if let Some((pos, len)) = active_positions.get(&qid) {
                             if let Some(len) = len {
-                                if *len > 0 {
-                                    let progress = (*pos as f32 / *len as f32).clamp(0.0, 1.0);
+                                if *len > 0.0 {
+                                    let progress = (pos / len).clamp(0.0, 1.0);
                                     let bar_width = COL_DURATION - 4.0;
                                     let bar_height = 6.0;
                                     let (rect, _response) = ui.allocate_exact_size(
@@ -292,13 +320,11 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                 if over_row && (primary || secondary) {
                     queue_select(state, qid);
                 }
-                let menu_open = if over_row && secondary {
-                    Some(egui::SetOpenCommand::Bool(true))
-                } else if primary {
-                    Some(egui::SetOpenCommand::Bool(false))
-                } else {
-                    None
-                };
+                // Open on right-click only; the menu's own close-on-click handles
+                // the rest. (Force-closing on any primary click closed the popup
+                // before its buttons could see the click, so Delete etc. never
+                // fired.)
+                let menu_open = (over_row && secondary).then_some(egui::SetOpenCommand::Bool(true));
                 egui::Popup::menu(&drop_response.response)
                     .id(ui.make_persistent_id(("row_menu", qid)))
                     .at_pointer_fixed()
@@ -427,6 +453,8 @@ fn cue_type_label(cue: &Cue) -> &'static str {
         Cue::Text { .. } => "TXT",
         Cue::Image { .. } => "IMG",
         Cue::Goto { .. } => "GTO",
+        Cue::Lighting { .. } => "LX",
+        Cue::PixelMap { .. } => "PXM",
     }
 }
 
