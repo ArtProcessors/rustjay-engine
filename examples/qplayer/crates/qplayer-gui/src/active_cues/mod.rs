@@ -3,6 +3,13 @@
 use crate::app::SharedStateHandle;
 use egui::{Color32, RichText};
 
+/// `m:ss.t` (minutes, seconds, tenths). Rounds to tenths first so 59.97s
+/// renders as 1:00.0, not 0:60.0.
+fn fmt_time(secs: f32) -> String {
+    let tenths = (secs.max(0.0) * 10.0).round() as u64;
+    format!("{}:{:04.1}", tenths / 600, (tenths % 600) as f64 / 10.0)
+}
+
 pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     let active_cues = {
         let Ok(state) = state.lock() else { return };
@@ -87,24 +94,30 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                             });
                         });
 
-                        // Playback progress bar
-                        if let Some(length) = cue.length {
-                            if length > 0 {
-                                let progress = (cue.position as f32 / length as f32).clamp(0.0, 1.0);
-                                let bar_rect = ui.available_rect_before_wrap();
-                                let bar_height = 4.0;
-                                let bar_rect = egui::Rect::from_min_size(
-                                    bar_rect.min,
-                                    egui::vec2(bar_rect.width(), bar_height),
-                                );
-                                ui.painter().rect_filled(bar_rect, 2.0, Color32::from_rgb(40, 40, 40));
-                                let fill_rect = egui::Rect::from_min_size(
-                                    bar_rect.min,
-                                    egui::vec2(bar_rect.width() * progress, bar_height),
-                                );
-                                ui.painter().rect_filled(fill_rect, 2.0, Color32::from_rgb(100, 180, 100));
-                                ui.add_space(bar_height + 2.0);
-                            }
+                        // Playback progress bar: elapsed / total, remaining on the right.
+                        if let Some(length) = cue.length_secs.filter(|l| *l > 0.0) {
+                            let progress = (cue.position_secs / length).clamp(0.0, 1.0);
+                            let remaining = (length - cue.position_secs).max(0.0);
+                            let fill = if cue.paused {
+                                Color32::from_rgb(200, 170, 50)
+                            } else {
+                                Color32::from_rgb(100, 180, 100)
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(progress)
+                                    .desired_height(14.0)
+                                    .fill(fill)
+                                    .text(
+                                        RichText::new(format!(
+                                            "{} / {}  −{}",
+                                            fmt_time(cue.position_secs),
+                                            fmt_time(length),
+                                            fmt_time(remaining),
+                                        ))
+                                        .monospace()
+                                        .size(10.0),
+                                    ),
+                            );
                         }
                     });
                 });

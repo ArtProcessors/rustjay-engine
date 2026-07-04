@@ -137,10 +137,10 @@ pub struct ActiveCueInfo {
     pub volume: f32,
     /// True if the cue is currently paused.
     pub paused: bool,
-    /// Current playback position in samples.
-    pub position: usize,
-    /// Total length in samples, if known.
-    pub length: Option<usize>,
+    /// Current playback position in seconds.
+    pub position_secs: f32,
+    /// Total length in seconds, if known.
+    pub length_secs: Option<f32>,
     /// Runtime state.
     pub state: CueState,
 }
@@ -1420,12 +1420,32 @@ impl QPlayerApp {
                 }
                 AppCommand::UpdateCueQid { qid, new_qid } => {
                     if let Ok(mut state) = self.state.lock() {
+                        // Qid is the cue's identity — refuse duplicates.
+                        if state.show_file.cues.iter().any(|c| c.base().qid == new_qid) {
+                            log::warn!("Cue {} already exists — keeping {}", new_qid, qid);
+                            continue;
+                        }
                         let idx = state.show_file.cues.iter().position(|c| c.base().qid == qid);
                         if let Some(i) = idx {
                             let snapshot = Snapshot::from_state(&state)
                                 .with_merge_key(format!("cue:{}:qid", qid));
                             state.undo_redo.push(snapshot);
                             state.show_file.cues[i].base_mut().qid = new_qid;
+                            // Follow the rename everywhere the old qid is referenced.
+                            for c in &mut state.show_file.cues {
+                                if c.base().parent == Some(qid) {
+                                    c.base_mut().parent = Some(new_qid);
+                                }
+                                match c {
+                                    qplayer_core::Cue::Stop { stop_qid, .. } if *stop_qid == qid => *stop_qid = new_qid,
+                                    qplayer_core::Cue::Volume { sound_qid, .. } if *sound_qid == qid => *sound_qid = new_qid,
+                                    qplayer_core::Cue::Goto { target_qid, .. } if *target_qid == qid => *target_qid = new_qid,
+                                    _ => {}
+                                }
+                            }
+                            if state.selected_cue_id == Some(qid) {
+                                state.selected_cue_id = Some(new_qid);
+                            }
                             state.dirty = true;
                         }
                     }

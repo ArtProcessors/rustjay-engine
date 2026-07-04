@@ -2378,7 +2378,10 @@ impl App {
         let raw_input = egui_state.take_egui_input(window);
         // Sync active cue state into the GUI shared state
         {
-            let gui_active: Vec<qplayer_gui::ActiveCueInfo> = self.active_cues.iter().map(|ac| {
+            let sr = (self.audio_engine.sample_rate() as f64).max(1.0);
+            // Interleaved stereo samples → seconds.
+            let secs = |samples: usize| (samples as f64 / 2.0 / sr) as f32;
+            let mut gui_active: Vec<qplayer_gui::ActiveCueInfo> = self.active_cues.iter().map(|ac| {
                 // For looping cues with explicit loop boundaries, show loop-relative
                 // position so the progress bar resets to 0 on each loop iteration.
                 let loop_length_frames = ac.loop_end_frame.saturating_sub(ac.loop_start_frame) as usize;
@@ -2394,12 +2397,42 @@ impl App {
                     name: ac.name.clone(),
                     volume: ac.input.volume(),
                     paused: !ac.input.is_active(),
-                    position,
-                    length,
+                    position_secs: secs(position),
+                    length_secs: length.map(secs),
                     state: ac.state,
                 }
             }).collect();
             if let Ok(mut state) = self.qplayer.state().lock() {
+                // A video with no audio track (or whose audio failed to open) has
+                // no mixer input and thus no ActiveCue — but it is on screen.
+                // Synthesize a panel entry from the video clock so it still shows
+                // as active. Position comes from `video_clock` (frozen across
+                // pause); length from the cue's duration field when set.
+                if let Some(vqid) = self.current_video_qid {
+                    if !gui_active.iter().any(|c| c.qid == vqid) {
+                        if let Some(cue) = state.show_file.cues.iter().find(|c| c.base().qid == vqid) {
+                            let paused = self.video_pause_started.is_some();
+                            let position_secs = match (self.video_clock, self.video_pause_started) {
+                                (Some(clock), Some(paused_at)) => paused_at.duration_since(clock).as_secs_f32(),
+                                (Some(clock), None) => clock.elapsed().as_secs_f32(),
+                                _ => 0.0,
+                            };
+                            let dur = match cue {
+                                qplayer_core::Cue::Video { duration, .. } => duration.as_secs_f64() as f32,
+                                _ => 0.0,
+                            };
+                            gui_active.push(qplayer_gui::ActiveCueInfo {
+                                qid: vqid,
+                                name: cue.base().name.clone(),
+                                volume: 0.0,
+                                paused,
+                                position_secs,
+                                length_secs: (dur > 0.0).then_some(dur),
+                                state: if paused { CueState::Paused } else { CueState::Playing },
+                            });
+                        }
+                    }
+                }
                 state.active_cues = gui_active;
             }
         }
