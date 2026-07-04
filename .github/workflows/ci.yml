@@ -12,7 +12,7 @@ jobs:
     name: Rust (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # NDI is intentionally opt-in (it needs a proprietary SDK), so CI builds the
       # default feature set (webcam, no ndi). These deps cover alsa (cpal) and the
       # v4l/udev webcam path (nokhwa). mesa-vulkan-drivers gives wgpu a software
@@ -41,7 +41,7 @@ jobs:
     name: Rust (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -52,7 +52,7 @@ jobs:
       # picks it up via the two env vars below.
       - name: Cache vcpkg pthreads
         id: vcpkg-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # Literal path: C:\vcpkg is the GitHub-hosted runner's vcpkg root
           # (== VCPKG_INSTALLATION_ROOT), which the ${{ env }} context doesn't expose.

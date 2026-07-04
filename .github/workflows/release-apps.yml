@@ -56,7 +56,7 @@ jobs:
           - os: ubuntu-latest
             app: cuepool
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -66,6 +66,16 @@ jobs:
           workspaces: |
             .
             examples/cuepool
+
+      # The engine's macOS build scripts hunt for Syphon.framework (the
+      # published syphon-core crate ships it flattened, which the linker can't
+      # use). The syphon-rs repo commits the real framework — clone it and
+      # point SYPHON_FRAMEWORK_DIR at it; packaging bundles it from here too.
+      - name: Get Syphon.framework (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          git clone --depth 1 https://github.com/BlueJayLouche/syphon-rs "$RUNNER_TEMP/syphon-rs"
+          echo "SYPHON_FRAMEWORK_DIR=$RUNNER_TEMP/syphon-rs/syphon-lib" >> "$GITHUB_ENV"
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -92,7 +102,7 @@ jobs:
       - name: Cache vcpkg pthreads
         if: runner.os == 'Windows' && matrix.app == 'videowall'
         id: vcpkg-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: C:\vcpkg\installed
           key: vcpkg-pthreads-x64-windows-static-md-v1
@@ -131,12 +141,10 @@ jobs:
               -e "s/__BIN__/${{ matrix.app }}/g" \
               -e "s/__VERSION__/$VERSION/g" \
               .github/packaging/Info.plist.tmpl > "$APP/Contents/Info.plist"
-          # Syphon.framework ships inside the syphon-core crate; the binary loads
-          # it via @rpath, so bundle it and make sure the Frameworks rpath exists.
-          FW=$(find ~/.cargo/registry/src -type d -path "*/syphon-core-*/frameworks/Syphon.framework" | head -1)
-          if [ -n "$FW" ]; then
+          # Bundle Syphon.framework for binaries that link it (loaded via @rpath).
+          if otool -L "$APP/Contents/MacOS/${{ matrix.app }}" | grep -q Syphon.framework; then
             mkdir -p "$APP/Contents/Frameworks"
-            cp -R "$FW" "$APP/Contents/Frameworks/"
+            cp -R "$SYPHON_FRAMEWORK_DIR/Syphon.framework" "$APP/Contents/Frameworks/"
             install_name_tool -add_rpath @executable_path/../Frameworks \
               "$APP/Contents/MacOS/${{ matrix.app }}" 2>/dev/null || true
           fi
@@ -176,7 +184,7 @@ jobs:
             -Out "out\$app-windows-x86_64.msi"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.app }}-${{ matrix.os }}
           path: out/*
@@ -188,7 +196,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
