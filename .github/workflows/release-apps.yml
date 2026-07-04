@@ -113,12 +113,21 @@ jobs:
 
       - name: Install NDI SDK (Windows)
         if: runner.os == 'Windows' && matrix.ndi
+        timeout-minutes: 10
         shell: pwsh
         run: |
           curl.exe -L -o "$env:RUNNER_TEMP\ndi_sdk.exe" "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
-          Start-Process -Wait "$env:RUNNER_TEMP\ndi_sdk.exe" -ArgumentList '/VERYSILENT','/NORESTART','/SP-'
+          # NSIS silent flag; bounded wait so a GUI prompt can't hang the job
+          $p = Start-Process "$env:RUNNER_TEMP\ndi_sdk.exe" -ArgumentList '/S' -PassThru
+          if (-not $p.WaitForExit(300000)) { $p.Kill() }
           $sdk = "C:\Program Files\NDI\NDI 6 SDK"
-          if (-not (Test-Path "$sdk\Include")) { throw "NDI SDK install failed or landed elsewhere" }
+          if (-not (Test-Path "$sdk\Include")) {
+            # Fallback: unpack the NSIS installer payload directly
+            7z x "$env:RUNNER_TEMP\ndi_sdk.exe" -o"$env:RUNNER_TEMP\ndi-sdk" -y | Out-Null
+            $inc = Get-ChildItem "$env:RUNNER_TEMP\ndi-sdk" -Recurse -Directory -Filter Include | Select-Object -First 1
+            if (-not $inc) { throw "NDI SDK: silent install and 7z extraction both failed" }
+            $sdk = $inc.Parent.FullName
+          }
           "NDI_SDK_DIR=$sdk" >> $env:GITHUB_ENV
 
       - name: Install FFmpeg (macOS)
@@ -179,12 +188,11 @@ jobs:
               -e "s/__BIN__/${{ matrix.app }}/g" \
               -e "s/__VERSION__/$VERSION/g" \
               .github/packaging/Info.plist.tmpl > "$APP/Contents/Info.plist"
+          BIN="$APP/Contents/MacOS/${{ matrix.app }}"
           # Bundle Syphon.framework for binaries that link it (loaded via @rpath).
-          if otool -L "$APP/Contents/MacOS/${{ matrix.app }}" | grep -q Syphon.framework; then
+          if otool -L "$BIN" | grep -q Syphon.framework; then
             mkdir -p "$APP/Contents/Frameworks"
             cp -R "$SYPHON_FRAMEWORK_DIR/Syphon.framework" "$APP/Contents/Frameworks/"
-            install_name_tool -add_rpath @executable_path/../Frameworks \
-              "$APP/Contents/MacOS/${{ matrix.app }}" 2>/dev/null || true
           fi
           # Bundle the NDI runtime (install name @rpath/libndi.dylib).
           if [ "${{ matrix.ndi }}" = "true" ]; then
@@ -193,9 +201,17 @@ jobs:
           fi
           if [ "${{ matrix.ffmpeg }}" = "true" ]; then
             # pull the brew FFmpeg dylib closure into the bundle and rewrite load paths
-            dylibbundler -cd -od -b -x "$APP/Contents/MacOS/${{ matrix.app }}" \
+            dylibbundler -cd -od -b -x "$BIN" \
               -d "$APP/Contents/libs/" -p @executable_path/../libs/
           fi
+          # Normalize rpaths: dylibbundler rewrites every existing rpath to its
+          # -p value (leaving duplicates that macOS 26+ dyld refuses to load),
+          # and shipped apps shouldn't carry build-machine paths anyway.
+          # Strip everything, then add the one rpath the bundle needs.
+          otool -l "$BIN" | awk '/LC_RPATH/{getline; getline; print $2}' | while read -r rp; do
+            install_name_tool -delete_rpath "$rp" "$BIN" 2>/dev/null || true
+          done
+          install_name_tool -add_rpath @executable_path/../Frameworks "$BIN"
           codesign --force --deep -s - "$APP"
           hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$APP" -ov -format UDZO \
             "out/${{ matrix.app }}-macos-arm64.dmg"
@@ -259,4 +275,8 @@ jobs:
             Apps are built with all features (NDI, Ableton Link, Pro DJ Link, HAP, REST API, …).
             The NDI runtime is bundled. NDI® is a registered trademark of Vizrt NDI AB.
             Linux builds link the distro's FFmpeg (`libavcodec`/`libavformat`/`libswscale`) — install via your package manager.
+
+            **macOS**: apps are ad-hoc signed, not notarized. On first launch macOS will block them:
+            right-click → Open, or approve under System Settings → Privacy & Security, or
+            `xattr -dr com.apple.quarantine "/Applications/<App>.app"`.
           files: artifacts/**/*
