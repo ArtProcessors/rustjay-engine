@@ -1,0 +1,189 @@
+name: Release Apps
+
+# Builds + packages the flagship example apps and attaches them to a GitHub release.
+#   macOS  -> .app bundle in a .dmg (ad-hoc signed)
+#   Windows -> portable .zip + .msi installer (WiX, Start-menu shortcut)
+#   Linux  -> .tar.gz
+#
+# Trigger: push a tag like `apps-v0.1.0`, or run manually (workflow_dispatch) for a
+# dry run that only produces artifacts (no release).
+#
+# Per-app icon slots — dropped-in files are picked up automatically:
+#   examples/<app>/packaging/AppIcon.icns  -> macOS bundle icon
+#   examples/<app>/packaging/icon.ico      -> Windows Start-menu shortcut icon
+# (Embedding the .ico into the .exe itself needs a winresource build.rs per app —
+#  not done yet.)
+#
+# Adding an app = one entry in matrix.app + optionally one include entry for
+# metadata (display name, extra features, nested manifest, ffmpeg).
+
+on:
+  push:
+    tags: ["apps-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.app }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+        app: [cuepool, vjarda, vp404, shaderglass, videowall]
+        include:
+          - app: cuepool
+            display: CuePool
+            manifest: --manifest-path examples/cuepool/Cargo.toml
+            target_dir: examples/cuepool/target
+            ffmpeg: true
+          - app: vjarda
+            features: --features projection
+          - app: vp404
+            display: VP-404
+          - app: shaderglass
+            display: ShaderGlass
+          - app: videowall
+            display: VideoWall
+        exclude:
+          # cuepool's FFmpeg build/runtime closure is untested on Linux
+          - os: ubuntu-latest
+            app: cuepool
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.app }}
+          workspaces: |
+            .
+            examples/cuepool
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config clang ninja-build
+
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS' && matrix.ffmpeg
+        run: brew install ffmpeg dylibbundler
+
+      - name: Install FFmpeg SDK (Windows)
+        if: runner.os == 'Windows' && matrix.ffmpeg
+        shell: pwsh
+        run: |
+          curl.exe -L -o ffmpeg.zip "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          Expand-Archive ffmpeg.zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg"
+          $dir = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1
+          "FFMPEG_DIR=$($dir.FullName)" >> $env:GITHUB_ENV
+
+      # apriltag (videowall feature) is pthread-only; MSVC needs the vcpkg
+      # pthreads shim. Same dance as ci.yml's rust-windows job.
+      - name: Cache vcpkg pthreads
+        if: runner.os == 'Windows' && matrix.app == 'videowall'
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-pthreads-x64-windows-static-md-v1
+      - name: Install pthreads shim for apriltag
+        if: runner.os == 'Windows' && matrix.app == 'videowall' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        run: vcpkg install pthreads:x64-windows-static-md
+      - name: Point apriltag-sys at the pthread shim
+        if: runner.os == 'Windows' && matrix.app == 'videowall'
+        shell: pwsh
+        run: |
+          $vcpkg = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
+          "APRILTAG_SYS_WINDOWS_PTHREAD_INCLUDE_DIR=$vcpkg\include"           >> $env:GITHUB_ENV
+          "APRILTAG_SYS_WINDOWS_PTHREAD_STATIC_LIB=$vcpkg\lib\pthreadVC3.lib" >> $env:GITHUB_ENV
+
+      - name: Version from tag
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#apps-v}"
+          [[ "$GITHUB_REF_NAME" == apps-v* ]] || v=0.0.0
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release ${{ matrix.manifest }} -p ${{ matrix.app }} ${{ matrix.features }}
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          DISPLAY_NAME="${{ matrix.display || matrix.app }}"
+          TD="${{ matrix.target_dir || 'target' }}"
+          APP="dist/$DISPLAY_NAME.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" out
+          cp "$TD/release/${{ matrix.app }}" "$APP/Contents/MacOS/"
+          ICNS="examples/${{ matrix.app }}/packaging/AppIcon.icns"
+          [ -f "$ICNS" ] && cp "$ICNS" "$APP/Contents/Resources/"
+          sed -e "s/__NAME__/$DISPLAY_NAME/g" \
+              -e "s/__BIN__/${{ matrix.app }}/g" \
+              -e "s/__VERSION__/$VERSION/g" \
+              .github/packaging/Info.plist.tmpl > "$APP/Contents/Info.plist"
+          if [ "${{ matrix.ffmpeg }}" = "true" ]; then
+            # pull the brew FFmpeg dylib closure into the bundle and rewrite load paths
+            dylibbundler -cd -od -b -x "$APP/Contents/MacOS/${{ matrix.app }}" \
+              -d "$APP/Contents/libs/" -p @executable_path/../libs/
+          fi
+          codesign --force --deep -s - "$APP"
+          hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$APP" -ov -format UDZO \
+            "out/${{ matrix.app }}-macos-arm64.dmg"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          TD="${{ matrix.target_dir || 'target' }}"
+          mkdir -p out
+          tar -C "$TD/release" -czf "out/${{ matrix.app }}-linux-x86_64.tar.gz" "${{ matrix.app }}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $app = '${{ matrix.app }}'
+          $display = '${{ matrix.display || matrix.app }}'
+          $td = '${{ matrix.target_dir || 'target' }}'
+          $dist = "dist\$app"
+          New-Item -ItemType Directory -Force $dist, out | Out-Null
+          Copy-Item "$td\release\$app.exe" $dist
+          if ('${{ matrix.ffmpeg }}' -eq 'true') {
+            Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $dist
+          }
+          Compress-Archive -Path "$dist\*" -DestinationPath "out\$app-windows-x86_64.zip"
+          .github\scripts\make-msi.ps1 -Name $display -Version $env:VERSION `
+            -SourceDir $dist -Exe "$app.exe" `
+            -Icon "examples\$app\packaging\icon.ico" `
+            -Out "out\$app-windows-x86_64.msi"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app }}-${{ matrix.os }}
+          path: out/*
+
+  release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/apps-v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/**/*
