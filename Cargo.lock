@@ -5948,9 +5948,9 @@ dependencies = [
 
 [[package]]
 name = "syphon-core"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "540d69b7141afb8ebc5dae776ef0caa53a6033827be9913ba604efe9b5b1e344"
+checksum = "ff47e4ed2ae950533b0b1f02bc2859b015abce61d356bb964daab17233f819f2"
 dependencies = [
  "block",
  "cocoa 0.26.1",
