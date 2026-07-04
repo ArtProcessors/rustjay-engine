@@ -1,35 +1,30 @@
+// macOS: Syphon *linking* (framework search path + link-lib) is fully handled
+// by the syphon-core crate, which reassembles its bundled Syphon.framework in
+// its OUT_DIR — nothing here is needed to build. But `-rpath` link-args do NOT
+// propagate across crates, so every leaf binary (and every lib whose own test
+// binaries link Syphon) re-emits the runtime search paths: a locally available
+// framework for `cargo run`/`cargo test`, /Library/Frameworks for system-wide
+// installs, and bundle-relative rpaths for packaged .apps (release packaging
+// copies Syphon.framework into <app>.app/Contents/Frameworks).
 fn main() {
     #[cfg(target_os = "macos")]
     {
-        // ===== Syphon Framework =====
-        let syphon_framework_dir = find_syphon_framework().expect(
-            "Syphon.framework not found. Either:\n  \
-                 - Set SYPHON_FRAMEWORK_DIR to the directory containing Syphon.framework\n  \
-                 - Clone https://github.com/BlueJayLouche/syphon-rs next to this repo\n  \
-                 - Run `cargo fetch` to populate the git dep cache",
-        );
+        // Dev-run rpath (optional): a local Syphon.framework, if one is around.
+        if let Some(dir) = local_syphon_framework() {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+        }
+        // System-wide install (official Syphon installer).
+        println!("cargo:rustc-link-arg=-Wl,-rpath,/Library/Frameworks");
 
-        let syphon_dir = syphon_framework_dir.to_string_lossy().into_owned();
-
-        // Framework search + link + rpath
-        // Use rustc-link-search and rustc-link-lib so the linker correctly
-        // associates the framework search path with the framework link.
-        // These propagate to downstream crates; rustc-link-arg does not.
-        println!("cargo:rustc-link-search=framework={}", syphon_dir);
-        println!("cargo:rustc-link-lib=framework=Syphon");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", syphon_dir);
-
-        // ===== NDI Library =====
-        // NDI rpath: always add if installed (propagates to downstream test binaries)
+        // NDI rpath: always add if installed (for binaries built with `ndi`)
         let ndi_lib_paths = ["/usr/local/lib", "/Library/NDI SDK for Apple/lib/macOS"];
-
         for path in &ndi_lib_paths {
             if std::path::Path::new(path).exists() {
                 println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path);
             }
         }
 
-        // ===== AVFoundation (camera authorization) =====
+        // AVFoundation (camera authorization)
         println!("cargo:rustc-link-lib=framework=AVFoundation");
 
         // Bundle-friendly rpaths
@@ -40,13 +35,14 @@ fn main() {
 
         println!("cargo:rerun-if-changed=build.rs");
         println!("cargo:rerun-if-env-changed=SYPHON_FRAMEWORK_DIR");
-        println!("cargo:rerun-if-env-changed=CARGO_HOME");
     }
 }
 
+/// A Syphon.framework for dev runs, if available. Never required: without it,
+/// dyld falls back to /Library/Frameworks or a bundled copy in the .app.
 #[cfg(target_os = "macos")]
-fn find_syphon_framework() -> Option<std::path::PathBuf> {
-    // 1. User override
+fn local_syphon_framework() -> Option<std::path::PathBuf> {
+    // 1. Explicit override
     if let Ok(dir) = std::env::var("SYPHON_FRAMEWORK_DIR") {
         let p = std::path::PathBuf::from(dir);
         if p.join("Syphon.framework").exists() {
@@ -54,42 +50,12 @@ fn find_syphon_framework() -> Option<std::path::PathBuf> {
         }
     }
 
-    // 2. Local dev checkout: <workspace>/../syphon-rs/syphon-lib/
+    // 2. syphon-rs checkout next to this repo
+    //    (crate dirs are two levels below the repo root)
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Some(parent) = manifest.parent() {
-        let candidate = parent.join("syphon-rs/syphon-lib");
-        if candidate.join("Syphon.framework").exists() {
-            return Some(candidate);
-        }
-    }
-
-    // 3. Cargo git dep cache: $CARGO_HOME/git/checkouts/syphon-rs-*/*/syphon-lib/
-    let cargo_home = std::env::var("CARGO_HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| std::path::PathBuf::from(h).join(".cargo"))
-        });
-
-    if let Some(cargo_home) = cargo_home {
-        let checkouts = cargo_home.join("git/checkouts");
-        if let Ok(entries) = std::fs::read_dir(&checkouts) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with("syphon-rs")
-                    && let Ok(revs) = std::fs::read_dir(entry.path()) {
-                        for rev in revs.flatten() {
-                            let candidate = rev.path().join("syphon-lib");
-                            if candidate.join("Syphon.framework").exists() {
-                                return Some(candidate);
-                            }
-                        }
-                    }
-            }
-        }
+    let candidate = manifest.ancestors().nth(3)?.join("syphon-rs/syphon-lib");
+    if candidate.join("Syphon.framework").exists() {
+        return Some(candidate);
     }
 
     None
