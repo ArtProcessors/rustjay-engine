@@ -1,0 +1,10 @@
+[advisories]
+ignore = [
+    # quick-xml 0.39 DoS vulns (2026-06-29). Fixed in quick-xml 0.41, but no
+    # release of zbus_xml (>5.1.1) or wayland-scanner (>0.31.10) accepts it yet.
+    # Both are Linux-only, low-exposure uses: wayland-scanner is build-time
+    # codegen; zbus_xml parses local session-bus introspection XML.
+    # Drop these once `cargo update quick-xml` reaches >=0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
