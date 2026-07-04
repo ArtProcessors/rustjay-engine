@@ -14,8 +14,10 @@ name: Release Apps
 # (Embedding the .ico into the .exe itself needs a winresource build.rs per app —
 #  not done yet.)
 #
+# Apps build with --all-features (NDI, Link, Pro DJ Link, HAP, API, ffmpeg…);
+# the NDI SDK is fetched per-OS and its runtime lib ships inside the packages.
 # Adding an app = one entry in matrix.app + optionally one include entry for
-# metadata (display name, extra features, nested manifest, ffmpeg).
+# metadata (display name, nested manifest, ffmpeg/ndi bundling flags).
 
 on:
   push:
@@ -44,13 +46,17 @@ jobs:
             target_dir: examples/cuepool/target
             ffmpeg: true
           - app: vjarda
-            features: --features projection
+            ffmpeg: true   # --all-features enables vjarda's ffmpeg feature
+            ndi: true
           - app: vp404
             display: VP-404
+            ndi: true
           - app: shaderglass
             display: ShaderGlass
+            ndi: true
           - app: videowall
             display: VideoWall
+            ndi: true
         exclude:
           # cuepool's FFmpeg build/runtime closure is untested on Linux
           - os: ubuntu-latest
@@ -81,7 +87,39 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libudev-dev pkg-config clang ninja-build
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config clang ninja-build \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+          # $ORIGIN rpath so bundled shared libs (libndi) load from next to the binary
+          echo 'RUSTFLAGS=-C link-arg=-Wl,-rpath,$ORIGIN' >> "$GITHUB_ENV"
+
+      # NDI SDK: proprietary, fetched from NDI's public download URLs; the
+      # runtime library is redistributed inside the packages (attribution in
+      # the release notes, per the NDI SDK license).
+      - name: Install NDI SDK (macOS)
+        if: runner.os == 'macOS' && matrix.ndi
+        run: |
+          curl -L -o "$RUNNER_TEMP/ndi.pkg" "https://downloads.ndi.tv/SDK/NDI_SDK_Mac/Install_NDI_SDK_v6_Apple.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/ndi.pkg" -target /
+          echo "NDI_SDK_DIR=/Library/NDI SDK for Apple" >> "$GITHUB_ENV"
+
+      - name: Install NDI SDK (Linux)
+        if: runner.os == 'Linux' && matrix.ndi
+        run: |
+          curl -L -o "$RUNNER_TEMP/ndi.tar.gz" "https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.tar.gz"
+          tar -xzf "$RUNNER_TEMP/ndi.tar.gz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"
+          yes | PAGER=cat sh Install_NDI_SDK_v6_Linux.sh > /dev/null
+          echo "NDI_SDK_DIR=$RUNNER_TEMP/NDI SDK for Linux" >> "$GITHUB_ENV"
+
+      - name: Install NDI SDK (Windows)
+        if: runner.os == 'Windows' && matrix.ndi
+        shell: pwsh
+        run: |
+          curl.exe -L -o "$env:RUNNER_TEMP\ndi_sdk.exe" "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+          Start-Process -Wait "$env:RUNNER_TEMP\ndi_sdk.exe" -ArgumentList '/VERYSILENT','/NORESTART','/SP-'
+          $sdk = "C:\Program Files\NDI\NDI 6 SDK"
+          if (-not (Test-Path "$sdk\Include")) { throw "NDI SDK install failed or landed elsewhere" }
+          "NDI_SDK_DIR=$sdk" >> $env:GITHUB_ENV
 
       - name: Install FFmpeg (macOS)
         if: runner.os == 'macOS' && matrix.ffmpeg
@@ -125,7 +163,7 @@ jobs:
           echo "VERSION=$v" >> "$GITHUB_ENV"
 
       - name: Build
-        run: cargo build --release ${{ matrix.manifest }} -p ${{ matrix.app }} ${{ matrix.features }}
+        run: cargo build --release ${{ matrix.manifest }} -p ${{ matrix.app }} --all-features
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
@@ -148,6 +186,11 @@ jobs:
             install_name_tool -add_rpath @executable_path/../Frameworks \
               "$APP/Contents/MacOS/${{ matrix.app }}" 2>/dev/null || true
           fi
+          # Bundle the NDI runtime (install name @rpath/libndi.dylib).
+          if [ "${{ matrix.ndi }}" = "true" ]; then
+            mkdir -p "$APP/Contents/Frameworks"
+            cp "$NDI_SDK_DIR/lib/macOS/libndi.dylib" "$APP/Contents/Frameworks/"
+          fi
           if [ "${{ matrix.ffmpeg }}" = "true" ]; then
             # pull the brew FFmpeg dylib closure into the bundle and rewrite load paths
             dylibbundler -cd -od -b -x "$APP/Contents/MacOS/${{ matrix.app }}" \
@@ -161,8 +204,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           TD="${{ matrix.target_dir || 'target' }}"
-          mkdir -p out
-          tar -C "$TD/release" -czf "out/${{ matrix.app }}-linux-x86_64.tar.gz" "${{ matrix.app }}"
+          mkdir -p out stage
+          cp "$TD/release/${{ matrix.app }}" stage/
+          if [ "${{ matrix.ndi }}" = "true" ]; then
+            # ship the NDI runtime next to the binary ($ORIGIN rpath)
+            cp -P "$NDI_SDK_DIR"/lib/x86_64-linux-gnu/libndi.so* stage/
+          fi
+          tar -C stage -czf "out/${{ matrix.app }}-linux-x86_64.tar.gz" .
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -176,6 +224,9 @@ jobs:
           Copy-Item "$td\release\$app.exe" $dist
           if ('${{ matrix.ffmpeg }}' -eq 'true') {
             Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $dist
+          }
+          if ('${{ matrix.ndi }}' -eq 'true') {
+            Copy-Item "$env:NDI_SDK_DIR\Bin\x64\Processing.NDI.Lib.x64.dll" $dist
           }
           Compress-Archive -Path "$dist\*" -DestinationPath "out\$app-windows-x86_64.zip"
           .github\scripts\make-msi.ps1 -Name $display -Version $env:VERSION `
@@ -204,4 +255,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          body: |
+            Apps are built with all features (NDI, Ableton Link, Pro DJ Link, HAP, REST API, …).
+            The NDI runtime is bundled. NDI® is a registered trademark of Vizrt NDI AB.
+            Linux builds link the distro's FFmpeg (`libavcodec`/`libavformat`/`libswscale`) — install via your package manager.
           files: artifacts/**/*
