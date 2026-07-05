@@ -62,6 +62,7 @@ order, serpentine, …).
 | Profile / U / Ch | Fixture profile, universe, and 1-based start address of the first cell. |
 | Scan | Cell-to-address walking order. |
 | Brightness / Gamma / White | Colour pipeline: output gamma (default 2.2) maps the display-referred canvas to LED-linear intensity; the white mode controls RGBW derivation (use **Off** for plain RGB). |
+| Derive A/UV | Off by default: profiles with Amber/UV channels emit 0 on them. Tick to approximate Amber ((R+G)/2) and UV (0.8·B) from the sampled colour. |
 
 While a segment has content it streams continuously, and its channels
 **override lighting-cue looks** on the same addresses.

@@ -122,6 +122,11 @@ pub struct SegmentColor {
     pub master_dimmer: f32,
     #[serde(default)]
     pub white: WhiteMode,
+    /// Derive Amber/UV from the sampled colour (warm-white / blue
+    /// approximations). Off (default) emits 0 on those channels — real amber
+    /// shifts hue and real UV fluoresces, so opt in per segment.
+    #[serde(default)]
+    pub derive_amber_uv: bool,
 }
 
 impl Default for SegmentColor {
@@ -131,6 +136,7 @@ impl Default for SegmentColor {
             gain: [1.0; 3],
             master_dimmer: 1.0,
             white: WhiteMode::default(),
+            derive_amber_uv: false,
         }
     }
 }
@@ -261,8 +267,9 @@ pub fn color_pipeline(
             ChannelRole::Green => to_byte(g),
             ChannelRole::Blue => to_byte(b),
             ChannelRole::White => to_byte(w),
-            ChannelRole::Amber => to_byte((r + g) * 0.5), // warm white approx
-            ChannelRole::Uv => to_byte(b * 0.8),
+            ChannelRole::Amber if color.derive_amber_uv => to_byte((r + g) * 0.5), // warm white approx
+            ChannelRole::Uv if color.derive_amber_uv => to_byte(b * 0.8),
+            ChannelRole::Amber | ChannelRole::Uv => 0,
             ChannelRole::Dimmer => dimmer,
             // Movement/beam roles are cue-look concepts (see `look` module);
             // pixel mapping leaves them at rest.
@@ -426,6 +433,35 @@ mod tests {
             &profile,
         );
         assert!(half[0] < full[0]);
+    }
+
+    #[test]
+    fn amber_uv_zero_unless_derived() {
+        let profile = FixtureProfile {
+            id: "rgbwau".into(),
+            name: "RGBWAU".into(),
+            channels: vec![
+                ChannelRole::Red,
+                ChannelRole::Green,
+                ChannelRole::Blue,
+                ChannelRole::White,
+                ChannelRole::Amber,
+                ChannelRole::Uv,
+            ],
+        };
+        // BGRA white pixel; white extraction Off so RGB survive to the
+        // derivation step (default MinSubtract would zero them first).
+        let px = [255, 255, 255, 255];
+        let base = SegmentColor { white: WhiteMode::Off, ..Default::default() };
+        let off = color_pipeline(px, 2.2, &base, &profile);
+        assert_eq!((off[4], off[5]), (0, 0), "A/UV stay dark by default");
+        let on = color_pipeline(
+            px,
+            2.2,
+            &SegmentColor { derive_amber_uv: true, ..base },
+            &profile,
+        );
+        assert!(on[4] > 200 && on[5] > 150, "derived A/UV follow the colour");
     }
 
     #[test]
