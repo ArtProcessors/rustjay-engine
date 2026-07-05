@@ -43,40 +43,57 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The whole matrix (app list + per-app include metadata + excludes) is built
+  # here so a single-app dispatch can filter ALL of it: a plain fromJSON filter
+  # on matrix.app alone would orphan the static include entries into os-less
+  # jobs, and job-level `if` can't see the matrix context.
+  plan:
+    name: Plan matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        env:
+          APP: ${{ inputs.app || 'all' }}
+        run: |
+          cat > matrix.json <<'JSON'
+          {
+            "os": ["macos-latest", "ubuntu-latest", "windows-latest"],
+            "app": ["cuepool", "vjarda", "vp404", "shaderglass", "videowall"],
+            "include": [
+              {"app": "cuepool", "display": "CuePool",
+               "manifest": "--manifest-path examples/cuepool/Cargo.toml",
+               "target_dir": "examples/cuepool/target", "ffmpeg": true},
+              {"app": "vjarda", "ffmpeg": true, "ndi": true},
+              {"app": "vp404", "display": "VP-404", "ndi": true},
+              {"app": "shaderglass", "display": "ShaderGlass", "ndi": true},
+              {"app": "videowall", "display": "VideoWall", "ndi": true}
+            ],
+            "exclude": [
+              {"os": "ubuntu-latest", "app": "cuepool"}
+            ]
+          }
+          JSON
+          # Notes carried over from the old inline matrix:
+          #  - vjarda: --all-features enables its ffmpeg feature
+          #  - exclude: cuepool's FFmpeg closure is untested on Linux
+          if [ "$APP" != "all" ]; then
+            jq -c --arg app "$APP" \
+              '.app = [$app]
+               | .include = [.include[] | select(.app == $app)]
+               | .exclude = [.exclude[] | select(.app == $app)]' \
+              matrix.json > filtered.json && mv filtered.json matrix.json
+          fi
+          echo "matrix=$(jq -c . matrix.json)" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.app }} / ${{ matrix.os }}
-    # Single-app dispatch: skip the other matrix legs. (A matrix filter via
-    # fromJSON would orphan the static `include:` metadata entries into
-    # os-less jobs, so filter with `if` instead.)
-    if: github.event_name == 'push' || inputs.app == 'all' || inputs.app == matrix.app
+    needs: plan
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
-        app: [cuepool, vjarda, vp404, shaderglass, videowall]
-        include:
-          - app: cuepool
-            display: CuePool
-            manifest: --manifest-path examples/cuepool/Cargo.toml
-            target_dir: examples/cuepool/target
-            ffmpeg: true
-          - app: vjarda
-            ffmpeg: true   # --all-features enables vjarda's ffmpeg feature
-            ndi: true
-          - app: vp404
-            display: VP-404
-            ndi: true
-          - app: shaderglass
-            display: ShaderGlass
-            ndi: true
-          - app: videowall
-            display: VideoWall
-            ndi: true
-        exclude:
-          # cuepool's FFmpeg build/runtime closure is untested on Linux
-          - os: ubuntu-latest
-            app: cuepool
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v6
 
