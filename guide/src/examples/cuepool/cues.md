@@ -78,13 +78,14 @@ start time and duration.
 ### Lighting
 
 Crossfades patched DMX fixtures to a saved look. Fixtures not included in
-the cue's snapshot keep their current state (LTP tracking). See
+the cue's snapshot keep their current state (LTP tracking). Tick **🔴 Live**
+in the inspector to see edits on the rig as you program. See
 [Lighting](lighting.md#lighting-cues).
 
 ### PixelMap
 
 Plays a video or still into the dedicated pixel-map texture that LED
-[segments](lighting.md#pixel-map-segments) can sample — LED content
+[segments](lighting.md#pixel-map-segments) sample by default — LED content
 independent of the projector picture. Looping follows the cue's Loop mode; a
 OneShot end blanks to black.
 

@@ -39,6 +39,13 @@ Fixtures **not** included in a cue keep whatever state the previous cue left
 them in (LTP tracking): build your show as a sequence of partial looks, and
 only the fixtures you touch change.
 
+### Live programming
+
+Tick **🔴 Live** at the top of a Lighting cue's inspector to stream every
+look edit straight to the fixtures while you program — what you see on
+stage is what the cue will play. The toggle is session-only (not saved) and
+follows LTP: fixtures not included in the cue hold their current levels.
+
 ## Pixel-map segments
 
 *Segments* stream video onto LED fixtures, vjarda-style. Each segment
@@ -49,7 +56,7 @@ order, serpentine, …).
 
 | Property | Meaning |
 |---|---|
-| Source | **Canvas** (what the projectors show) or **PixelMap** (a dedicated texture fed by PixelMap cues — LED content independent of the projector picture). |
+| Source | **PixelMap** (default — a dedicated texture fed by PixelMap cues, LED content independent of the projector picture) or **Canvas** (mirror what the projectors show). Projects saved before the default changed keep their explicit Canvas — flip the dropdown if you want PixelMap cues to drive those segments. |
 | Region | Normalized rectangle of the source to sample. |
 | Grid | `cols × rows` cells — one fixture per cell. |
 | Profile / U / Ch | Fixture profile, universe, and 1-based start address of the first cell. |
