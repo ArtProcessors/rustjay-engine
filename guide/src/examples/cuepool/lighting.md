@@ -13,8 +13,12 @@ Art-Net broadcast). The refresh rate defaults to 44 fps.
 ## Patching fixtures
 
 *Patch* lists your rig: each fixture is a **profile** at a universe +
-1-based DMX address (the channel footprint is shown next to it). Built-in
-profiles:
+1-based DMX address (the channel footprint is shown next to it). Each
+fixture can also set its own unicast **IP** — useful when several Art-Net
+or sACN nodes each expect their universes on their own address; leave it
+empty to use the panel-level destination. Overlap warnings are checked per
+destination, so the same universe on different nodes doesn't collide.
+Built-in profiles:
 
 | Profile | Channels |
 |---|---|
