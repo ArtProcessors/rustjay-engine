@@ -27,6 +27,34 @@ controller rigs):
 Outbound messages are sent by [OSC cues](cues.md#osc) — command format
 `/address,arg1,arg2,…`.
 
+### DMX recorder
+
+The [DMX Recorder](lighting.md#dmx-recorder) listens on the same OSC port:
+
+| Address | Arguments | Action |
+|---|---|---|
+| `/dmx/{universe}/{channel}` | float 0–1 (or int 0–255) | Set a DMX channel (1-based) — live bridge, recorded while a pass runs |
+| `/recorder/record` | — | Start a pass on the selected take; again = stop & keep |
+| `/recorder/stop` | — | Stop the pass (keep) — or stop preview when idle |
+| `/recorder/play` | — | Preview the selected take on the lighting output |
+| `/recorder/select` | take name/path | Choose the target take (`.dmxrec` appended if missing) |
+| `/recorder/discard` | — | Throw the in-flight pass away |
+| `/recorder/revert` | — | Swap the take with its previous version |
+
+Build a touchOSC layout of faders addressed `/dmx/1/1`, `/dmx/1/2`, … and
+you have a hand-held DMX console; values are held (latest wins) until
+**Clear** in the recorder panel. MIDI CC works the same way: enable
+**MIDI CC → universe** in the panel and CC# = channel. Status feedback
+(recording LEDs etc.) is not implemented yet.
+
+A ready-made layout ships at
+`examples/cuepool/assets/CuePool-DMX-Recorder.touchosc` — 16 faders
+(universe 1, ch 1–16, two pages) plus REC / STOP / PLAY / DISCARD / REVERT.
+It's the classic `.touchosc` format: open it directly in TouchOSC Mk1, or
+**File → Import** in current TouchOSC. Point the connection's *send* host
+at the CuePool machine on the OSC RX port from Settings. Buttons fire on
+press only — the release value of 0 is ignored.
+
 ## Per-cue triggers
 
 Every cue has an optional *Triggers* section in the Inspector, in addition

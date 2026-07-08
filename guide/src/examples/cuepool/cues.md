@@ -82,6 +82,12 @@ the cue's snapshot keep their current state (LTP tracking). Tick **🔴 Live**
 in the inspector to see edits on the rig as you program. See
 [Lighting](lighting.md#lighting-cues).
 
+### DMX Show
+
+Plays a recorded DMX stream (`.dmxrec`) to the lighting output, merged
+against Lighting-cue looks by sACN-style priority. See
+[DMX Show cues](lighting.md#dmx-show-cues).
+
 ### PixelMap
 
 Plays a video or still into the dedicated pixel-map texture that LED

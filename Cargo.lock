@@ -5354,6 +5354,7 @@ name = "rustjay-lighting"
 version = "0.1.0"
 dependencies = [
  "crossbeam",
+ "flate2",
  "log",
  "serde",
  "serde_json",
