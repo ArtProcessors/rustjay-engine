@@ -42,7 +42,6 @@ ffmpeg-next = { version = "8.1", optional = true, default-features = false, feat
 [target.'cfg(target_os = "macos")'.dependencies]
 syphon-core = { workspace = true }
 syphon-wgpu = { workspace = true }
-metal            = "0.33"
 cocoa            = "0.26"
 objc             = "0.2"
 core-foundation  = "0.10"

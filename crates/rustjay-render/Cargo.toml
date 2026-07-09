@@ -22,7 +22,6 @@ pollster     = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 syphon-core = { workspace = true }
 syphon-wgpu = { workspace = true }
-metal       = "0.33"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
