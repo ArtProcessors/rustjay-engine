@@ -32,6 +32,21 @@ Built-in profiles:
 pan/tilt coarse+fine, zoom, strobe, gobo, static values for fixed channels,
 …). User profiles override a built-in with the same id.
 
+## Profiles
+
+Profiles define a fixture's channel layout. In the profile editor, channel
+chips **drag to reorder** (the order *is* the DMX layout), **right-click to
+delete**, and hovering names the channel type. **Import GDTF…** loads a
+manufacturer `.gdtf` fixture file: pick a DMX mode and the channels map to
+CuePool roles automatically (dimmer, RGB+W/A/UV, 16-bit pan/tilt, zoom,
+strobe, gobo); anything unrecognized becomes a constant channel holding its
+GDTF default value, so footprints and mode bytes stay correct.
+
+**Export sheet…** (next to the patch) saves a CSV patch sheet: one summary
+row per fixture with per-channel detail rows underneath, plus pixel-map
+segment spans (one row per universe crossed), sorted by universe/address —
+with a `Notes` column flagging any address overlaps.
+
 ## Lighting cues
 
 A **Lighting** cue stores a *look* — dimmer, colour, white, pan/tilt, and

@@ -66,6 +66,27 @@ impl ChannelRole {
             ChannelRole::Static(v) => format!("S({})", v),
         }
     }
+
+    /// Full human-readable name (chip tooltips, patch sheets).
+    pub fn describe(&self) -> String {
+        match self {
+            ChannelRole::Red => "Red".into(),
+            ChannelRole::Green => "Green".into(),
+            ChannelRole::Blue => "Blue".into(),
+            ChannelRole::White => "White".into(),
+            ChannelRole::Amber => "Amber".into(),
+            ChannelRole::Uv => "UV".into(),
+            ChannelRole::Dimmer => "Dimmer".into(),
+            ChannelRole::Pan => "Pan".into(),
+            ChannelRole::PanFine => "Pan fine (16-bit low byte)".into(),
+            ChannelRole::Tilt => "Tilt".into(),
+            ChannelRole::TiltFine => "Tilt fine (16-bit low byte)".into(),
+            ChannelRole::Zoom => "Zoom".into(),
+            ChannelRole::Strobe => "Strobe".into(),
+            ChannelRole::Gobo => "Gobo wheel".into(),
+            ChannelRole::Static(v) => format!("Constant {v}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

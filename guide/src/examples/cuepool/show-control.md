@@ -55,6 +55,23 @@ It's the classic `.touchosc` format: open it directly in TouchOSC Mk1, or
 at the CuePool machine on the OSC RX port from Settings. Buttons fire on
 press only — the release value of 0 is ignored.
 
+## Show clock & timecode
+
+The transport bar shows the **show clock** — the clock
+[timecode triggers](#per-cue-triggers) fire against — as `HH:MM:SS.ff`
+(green = running, yellow = paused, `--:--:--.--` before the first GO).
+The frame part is display-only; set its rate under **Settings → Timecode**
+(triggers are stored in seconds). Next to it, the next armed trigger is
+shown as `next: Q12 @ 00:03:15.00`.
+
+**Pause freezes the show clock** and no timecode triggers fire while
+paused. While paused, **⏭ frame-step** advances the current video one frame
+at a time with the clock following in lockstep — creep up on the exact
+moment, then either hit **Capture** on a cue's timecode trigger or just add
+a new cue: **cues created while the clock is live are pre-filled with a
+timecode trigger at the current time.** Triggers stepped past while paused
+fire on resume.
+
 ## Per-cue triggers
 
 Every cue has an optional *Triggers* section in the Inspector, in addition
