@@ -1224,7 +1224,7 @@ dependencies = [
  "core-foundation-sys 0.7.0",
  "core-graphics 0.19.2",
  "libc",
- "metal 0.18.0",
+ "metal",
  "objc",
 ]
 
@@ -3468,21 +3468,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "metal"
-version = "0.33.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7047791b5bc903b8cd963014b355f71dc9864a9a0b727057676c1dcae5cbc15"
-dependencies = [
- "bitflags 2.11.1",
- "block",
- "core-graphics-types 0.2.0",
- "foreign-types 0.5.0",
- "log",
- "objc",
- "paste",
-]
-
-[[package]]
 name = "midir"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4207,8 +4192,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
 dependencies = [
  "bitflags 2.11.1",
+ "libc",
  "objc2 0.6.4",
  "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -4243,8 +4230,11 @@ checksum = "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794"
 dependencies = [
  "bitflags 2.11.1",
  "block2 0.6.2",
+ "dispatch2",
  "objc2 0.6.4",
+ "objc2-core-foundation",
  "objc2-foundation 0.3.2",
+ "objc2-io-surface",
 ]
 
 [[package]]
@@ -5947,9 +5937,9 @@ dependencies = [
 
 [[package]]
 name = "syphon-core"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff47e4ed2ae950533b0b1f02bc2859b015abce61d356bb964daab17233f819f2"
+checksum = "5ffbdba348d9b93fad9740aa44fcf168e16872e4f42d4ac172d7ab0f9d06ccc5"
 dependencies = [
  "block",
  "cocoa 0.26.1",
@@ -5960,24 +5950,23 @@ dependencies = [
  "log",
  "objc",
  "objc-foundation",
+ "objc2 0.6.4",
+ "objc2-io-surface",
  "objc_id",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "syphon-metal"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b39ca5cab1b1f9dc1e0a417aed39d1b0f507d0452c14dee2e66b5bda15b3683"
+checksum = "a566d7688f65c7f59fbea031539527a07e8b71a2494c28a8b6ce1b74ce0ea33d"
 dependencies = [
- "cocoa 0.26.1",
- "core-foundation 0.10.1",
- "core-graphics 0.25.0",
- "foreign-types-shared 0.3.1",
- "io-surface",
  "log",
- "metal 0.33.0",
- "objc",
+ "objc2 0.6.4",
+ "objc2-core-foundation",
+ "objc2-io-surface",
+ "objc2-metal 0.3.2",
  "syphon-core",
  "wgpu",
  "wgpu-hal",
@@ -5985,18 +5974,14 @@ dependencies = [
 
 [[package]]
 name = "syphon-wgpu"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04cdfd7db86a1f30b3f20292529a18b5171855c185bbf1cebc0dc6147ee5391b"
+checksum = "f945b3947a53651d6d3a57dbae1f8affb478582ec46bdc65f60252b556f1dc17"
 dependencies = [
  "bytemuck",
- "cocoa 0.26.1",
- "core-foundation 0.10.1",
- "io-surface",
  "log",
- "metal 0.33.0",
- "objc",
- "pollster",
+ "objc2 0.6.4",
+ "objc2-metal 0.3.2",
  "syphon-core",
  "syphon-metal",
  "wgpu",
