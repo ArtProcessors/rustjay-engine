@@ -64,6 +64,15 @@ The frame part is display-only; set its rate under **Settings → Timecode**
 (triggers are stored in seconds). Next to it, the next armed trigger is
 shown as `next: Q12 @ 00:03:15.00`.
 
+The readout is also the **playhead**: click it, type a time (`5:30`,
+`01:05:30.15`, or plain seconds) and press Enter to jump the clock there.
+Triggers before the new position are marked as skipped — jumping forward
+never fires the cues in between — and everything after is re-armed, so
+jumping back replays a section's triggers. Editing while stopped starts the
+clock *frozen* at that time (unpause to run), which makes trigger
+line-checks easy. Audio/video don't chase the seek; it moves the trigger
+clock only.
+
 **Pause freezes the show clock** and no timecode triggers fire while
 paused. While paused, **⏭ frame-step** advances the current video one frame
 at a time with the clock following in lockstep — creep up on the exact
