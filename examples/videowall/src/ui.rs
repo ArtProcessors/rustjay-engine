@@ -540,7 +540,7 @@ fn draw_preview(ui: &mut egui::Ui, preview: Option<egui::TextureId>, aspect: f32
             egui::vec2(s.width * rect.width(), s.height * rect.height()),
         );
         let color = egui::Color32::from_rgb(0, 220, 120);
-        painter.rect_stroke(r, egui::CornerRadius::ZERO, egui::Stroke::new(2.0, color), egui::StrokeKind::Inside);
+        painter.rect_stroke(r, egui::CornerRadius::ZERO, egui::Stroke::new(2.0_f32, color), egui::StrokeKind::Inside);
         let label = match m.display_id {
             Some(id) => format!("{i}·#{id}"),
             None => format!("{i}"),

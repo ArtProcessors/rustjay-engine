@@ -157,7 +157,7 @@ impl AnyEguiTab for PadGridTab {
                         .fill(fill)
                         .min_size(egui::vec2(56.0, 56.0));
                     if self.selected == i {
-                        btn = btn.stroke(egui::Stroke::new(2.0, egui::Color32::WHITE));
+                        btn = btn.stroke(egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
                     }
                     let resp = ui.add(btn);
                     if resp.clicked() || resp.is_pointer_button_down_on() {

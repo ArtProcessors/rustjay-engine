@@ -136,18 +136,18 @@ impl Channel {
     ) -> Self {
         let uuid = uuid.into();
         let name = name.into();
-        effect.set_param_prefix(&format!("ch_{}_", &uuid));
+        effect.set_param_prefix(&format!("ch_{}_", uuid));
         Self {
-            opacity_key: format!("ch_{}_opacity", &uuid),
-            blend_key: format!("ch_{}_blend", &uuid),
-            input_select_key: format!("ch_{}_input_select", &uuid),
-            key_mode_key: format!("ch_{}_key_mode", &uuid),
-            key_r_key: format!("ch_{}_key_r", &uuid),
-            key_g_key: format!("ch_{}_key_g", &uuid),
-            key_b_key: format!("ch_{}_key_b", &uuid),
-            key_threshold_key: format!("ch_{}_key_threshold", &uuid),
-            key_smoothness_key: format!("ch_{}_key_smoothness", &uuid),
-            key_luma_invert_key: format!("ch_{}_key_luma_invert", &uuid),
+            opacity_key: format!("ch_{}_opacity", uuid),
+            blend_key: format!("ch_{}_blend", uuid),
+            input_select_key: format!("ch_{}_input_select", uuid),
+            key_mode_key: format!("ch_{}_key_mode", uuid),
+            key_r_key: format!("ch_{}_key_r", uuid),
+            key_g_key: format!("ch_{}_key_g", uuid),
+            key_b_key: format!("ch_{}_key_b", uuid),
+            key_threshold_key: format!("ch_{}_key_threshold", uuid),
+            key_smoothness_key: format!("ch_{}_key_smoothness", uuid),
+            key_luma_invert_key: format!("ch_{}_key_luma_invert", uuid),
             uuid,
             name,
             effect,
@@ -179,7 +179,7 @@ impl Channel {
     pub fn add_effect(&mut self, effect: Box<dyn EffectInstance>) {
         self.chain.push(EffectSlot::new(effect));
         let slot = self.chain.last_mut().unwrap();
-        let prefix = format!("ch_{}_fx{}_", self.uuid, &slot.uuid);
+        let prefix = format!("ch_{}_fx{}_", self.uuid, slot.uuid);
         slot.effect.set_param_prefix(&prefix);
     }
 
@@ -386,7 +386,7 @@ impl Mixer {
     pub fn add_master_effect(&mut self, effect: Box<dyn EffectInstance>) {
         self.master.push(EffectSlot::new(effect));
         let slot = self.master.last_mut().unwrap();
-        let prefix = format!("master_fx{}_", &slot.uuid);
+        let prefix = format!("master_fx{}_", slot.uuid);
         slot.effect.set_param_prefix(&prefix);
     }
 

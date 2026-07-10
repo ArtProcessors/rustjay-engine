@@ -66,7 +66,7 @@ impl Deck {
         let name = name.into();
         // Bare default prefix; upgraded to include the channel component once the
         // deck is added to a channel (see `set_full_prefix`).
-        let full_prefix = format!("deck_{}_", &uuid);
+        let full_prefix = format!("deck_{}_", uuid);
         source.set_param_prefix(&full_prefix);
         Self {
             opacity_key: format!("{full_prefix}opacity"),
@@ -111,7 +111,7 @@ impl Deck {
     pub fn add_effect(&mut self, effect: Box<dyn EffectInstance>) {
         self.chain.push(EffectSlot::new(effect));
         let slot = self.chain.last_mut().unwrap();
-        let prefix = format!("{}fx{}_", self.full_prefix, &slot.uuid);
+        let prefix = format!("{}fx{}_", self.full_prefix, slot.uuid);
         slot.effect.set_param_prefix(&prefix);
     }
 

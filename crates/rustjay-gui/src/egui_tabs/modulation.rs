@@ -86,7 +86,7 @@ impl EguiControlGui {
 
             egui::Frame::group(ui.style())
                 .fill(BG_WIDGET)
-                .stroke(egui::Stroke::new(1.0, if is_expanded { ACCENT_CYAN } else { BORDER }))
+                .stroke(egui::Stroke::new(1.0_f32, if is_expanded { ACCENT_CYAN } else { BORDER }))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
 

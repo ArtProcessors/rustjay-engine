@@ -219,7 +219,7 @@ fn step_lane(
             painter.rect_stroke(
                 cell_rect,
                 2.0,
-                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
                 egui::StrokeKind::Inside,
             );
         }

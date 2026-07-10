@@ -354,7 +354,7 @@ impl EguiControlGui {
             .frame(
                 egui::Frame::NONE
                     .fill(SURFACE_2)
-                    .stroke(egui::Stroke::new(1.0, HAIR_2)),
+                    .stroke(egui::Stroke::new(1.0_f32, HAIR_2)),
             )
             .show(ctx, |ui| {
                 ui.add_space(6.0);
@@ -451,7 +451,7 @@ impl EguiControlGui {
                         p.rect_stroke(
                             rect,
                             0.0,
-                            egui::Stroke::new(1.0, HAIR_2),
+                            egui::Stroke::new(1.0_f32, HAIR_2),
                             egui::StrokeKind::Inside,
                         );
                         let fill_w = rect.width() * volume.clamp(0.0, 1.0);
@@ -471,7 +471,7 @@ impl EguiControlGui {
                                     egui::pos2(x, rect.bottom() - 2.0),
                                     egui::pos2(x, rect.bottom()),
                                 ],
-                                egui::Stroke::new(1.0, HAIR_3),
+                                egui::Stroke::new(1.0_f32, HAIR_3),
                             );
                         }
                     });
@@ -714,7 +714,7 @@ impl EguiControlGui {
             .frame(
                 egui::Frame::NONE
                     .fill(BG)
-                    .stroke(egui::Stroke::new(1.0, HAIR_2)),
+                    .stroke(egui::Stroke::new(1.0_f32, HAIR_2)),
             )
             .show(ctx, |ui| {
                 ui.add_space(10.0);
@@ -1551,7 +1551,7 @@ pub fn apply_param_map_overlay(
         ui.painter().rect_stroke(
             rect.expand(2.0),
             0.0,
-            egui::Stroke::new(2.0, color),
+            egui::Stroke::new(2.0_f32, color),
             egui::StrokeKind::Outside,
         );
         let click_id = ui.make_persistent_id(("midi_map_click", id));
@@ -1585,7 +1585,7 @@ pub fn apply_param_map_overlay(
     ui.painter().rect_stroke(
         rect.expand(2.0),
         0.0,
-        egui::Stroke::new(2.0, color),
+        egui::Stroke::new(2.0_f32, color),
         egui::StrokeKind::Outside,
     );
     let click_id = ui.make_persistent_id(("lfo_map_click", id));

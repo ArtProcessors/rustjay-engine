@@ -43,41 +43,41 @@ pub fn apply_professional_theme(ctx: &Context) {
     style.visuals.override_text_color = Some(ink);
     style.visuals.panel_fill = bg;
     style.visuals.window_fill = surface;
-    style.visuals.window_stroke = Stroke::new(1.0, hair_2);
+    style.visuals.window_stroke = Stroke::new(1.0_f32, hair_2);
 
     // Non-interactive (labels, group backgrounds)
     style.visuals.widgets.noninteractive.bg_fill = surface;
     style.visuals.widgets.noninteractive.weak_bg_fill = surface;
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, hair);
-    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, ink);
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, hair);
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, ink);
 
     // Inactive (buttons at rest, sliders track)
     style.visuals.widgets.inactive.bg_fill = surface_2;
     style.visuals.widgets.inactive.weak_bg_fill = surface_2;
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, hair_2);
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, ink_2);
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, hair_2);
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, ink_2);
 
     // Hovered
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x18, 0x1f, 0x27);
     style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x18, 0x1f, 0x27);
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, hair_3);
-    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, ink);
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, hair_3);
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, ink);
 
     // Active (pressed, dragged)
     style.visuals.widgets.active.bg_fill = Color32::from_rgb(0x22, 0x2c, 0x37);
     style.visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0x22, 0x2c, 0x37);
-    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, amber);
-    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, ink);
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, amber);
+    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, ink);
 
     // Open (combobox dropdown, etc.)
     style.visuals.widgets.open.bg_fill = Color32::from_rgb(0x18, 0x1f, 0x27);
     style.visuals.widgets.open.weak_bg_fill = Color32::from_rgb(0x18, 0x1f, 0x27);
-    style.visuals.widgets.open.bg_stroke = Stroke::new(1.0, amber_dim);
-    style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, ink);
+    style.visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, amber_dim);
+    style.visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, ink);
 
     // Selection (highlighted slider fill, selected list rows)
     style.visuals.selection.bg_fill = amber;
-    style.visuals.selection.stroke = Stroke::new(1.0, amber);
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, amber);
 
     style.visuals.hyperlink_color = amber;
     style.visuals.faint_bg_color = bg;

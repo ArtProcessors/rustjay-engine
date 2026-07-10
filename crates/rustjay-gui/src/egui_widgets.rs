@@ -25,7 +25,7 @@ use egui::{Color32, FontId, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
 pub fn corner_brackets(ui: &Ui, rect: Rect, color: Color32) {
     let p = ui.painter();
     let l = 10.0;
-    let s = Stroke::new(1.0, color);
+    let s = Stroke::new(1.0_f32, color);
     let r = rect;
     // top-left
     p.line_segment([r.left_top(), r.left_top() + Vec2::new(l, 0.0)], s);
@@ -51,7 +51,7 @@ pub fn hud_frame<R>(
 ) -> R {
     egui::Frame::NONE
         .fill(SURFACE_2)
-        .stroke(Stroke::new(1.0, HAIR_2))
+        .stroke(Stroke::new(1.0_f32, HAIR_2))
         .inner_margin(egui::Margin::same(pad as i8))
         .show(ui, |ui| {
             let r = add_contents(ui);
@@ -121,7 +121,7 @@ pub fn hud_section_header(ui: &mut Ui, title: &str, counter: Option<&str>) {
             let end = (x + dash).min(rule_right);
             painter.line_segment(
                 [Pos2::new(x, y), Pos2::new(end, y)],
-                Stroke::new(1.0, HAIR_2),
+                Stroke::new(1.0_f32, HAIR_2),
             );
             x = end + gap;
         }
@@ -206,7 +206,7 @@ pub fn hud_collapsible_section_header(
             let end = (x + dash).min(rule_right);
             painter.line_segment(
                 [Pos2::new(x, y), Pos2::new(end, y)],
-                Stroke::new(1.0, HAIR_2),
+                Stroke::new(1.0_f32, HAIR_2),
             );
             x = end + gap;
         }
@@ -262,7 +262,7 @@ pub fn segmented_select(
     painter.rect_stroke(
         rect,
         0.0,
-        Stroke::new(1.0, HAIR_2),
+        Stroke::new(1.0_f32, HAIR_2),
         egui::StrokeKind::Inside,
     );
     painter.rect_filled(rect, 0.0, Color32::from_rgba_premultiplied(2, 3, 4, 8));
@@ -291,7 +291,7 @@ pub fn segmented_select(
         if i > 0 {
             painter.line_segment(
                 [seg_rect.left_top(), seg_rect.left_bottom()],
-                Stroke::new(1.0, HAIR_2),
+                Stroke::new(1.0_f32, HAIR_2),
             );
         }
 
@@ -356,7 +356,7 @@ pub fn status_pill(ui: &mut Ui, label: &str, state: PillState) -> Response {
     painter.rect_stroke(
         rect,
         0.0,
-        Stroke::new(1.0, HAIR_2),
+        Stroke::new(1.0_f32, HAIR_2),
         egui::StrokeKind::Inside,
     );
 
@@ -419,7 +419,7 @@ pub fn parameter_card_f32(
 
     let frame = egui::Frame::NONE
         .fill(SURFACE)
-        .stroke(Stroke::new(1.0, HAIR))
+        .stroke(Stroke::new(1.0_f32, HAIR))
         .inner_margin(egui::Margin::symmetric(12, 10));
 
     let frame_resp = frame.show(ui, |ui| {
@@ -500,7 +500,7 @@ pub fn parameter_card_f32(
                     Pos2::new(x, tick_rect.top()),
                     Pos2::new(x, tick_rect.top() + h),
                 ],
-                Stroke::new(1.0, if major { HAIR_3 } else { HAIR_2 }),
+                Stroke::new(1.0_f32, if major { HAIR_3 } else { HAIR_2 }),
             );
         }
 
