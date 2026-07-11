@@ -76,6 +76,7 @@ impl<P: EffectPlugin> App<P> {
                     };
                     input.width = width;
                     input.height = height;
+                    input.frame_seq += 1;
                 }
             }
         } else {
@@ -99,6 +100,7 @@ impl<P: EffectPlugin> App<P> {
                 };
                 input.width = width;
                 input.height = height;
+                input.frame_seq += 1;
             }
         }
 
@@ -125,6 +127,7 @@ impl<P: EffectPlugin> App<P> {
                         };
                         input.width = width;
                         input.height = height;
+                        input.frame_seq += 1;
                     }
                     manager.clear_spout_frame();
                 }
@@ -149,6 +152,7 @@ impl<P: EffectPlugin> App<P> {
                 };
                 input.width = width;
                 input.height = height;
+                input.frame_seq += 1;
             }
         }
 
@@ -175,6 +179,7 @@ impl<P: EffectPlugin> App<P> {
                 };
                 input.width = width;
                 input.height = height;
+                input.frame_seq += 1;
             }
         }
     }

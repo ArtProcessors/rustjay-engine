@@ -336,6 +336,10 @@ pub struct InputState {
     pub height: u32,
     /// Capture frame rate (may be approximate).
     pub fps: f32,
+    /// Monotonic counter bumped once per new source frame uploaded to the
+    /// input texture. Consumers (e.g. samplers) compare across ticks to
+    /// detect new frames; the absolute value is meaningless.
+    pub frame_seq: u64,
     /// Numeric device index of the active webcam (None if not a webcam or not started).
     pub device_index: Option<usize>,
     /// Discovered video capture devices.

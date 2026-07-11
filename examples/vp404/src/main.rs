@@ -49,7 +49,7 @@ struct PadParamKeys {
 }
 
 struct Vp404 {
-    clip_path: PathBuf,
+    clip_path: Option<PathBuf>,
     bank: Arc<Mutex<Bank>>,
     handle: BankHandle,
     mixer: Arc<Mutex<Mixer>>,
@@ -77,7 +77,7 @@ struct Vp404 {
 }
 
 impl Vp404 {
-    fn new(clip_path: PathBuf, handle: BankHandle) -> Self {
+    fn new(clip_path: Option<PathBuf>, handle: BankHandle) -> Self {
         let bank = Arc::new(Mutex::new(Bank::new(PAD_COUNT)));
         let mut mixer = Mixer::new();
         let mut pad_param_keys = Vec::with_capacity(PAD_COUNT);
@@ -215,7 +215,9 @@ impl EffectPlugin for Vp404 {
         drop(mixer);
 
         // Seed pad 0 with the launch clip so something plays immediately.
-        match sample::Sample::open(&self.clip_path) {
+        // No clip given → start with empty pads.
+        if let Some(clip_path) = self.clip_path.clone() {
+        match sample::Sample::open(&clip_path) {
             Ok(s) => {
                 log::info!(
                     "VP-404 pad 0 ← '{}' {}x{}, {} frames @ {} fps, {:?}",
@@ -234,7 +236,8 @@ impl EffectPlugin for Vp404 {
                 pad.trigger();
                 bank.last_triggered = Some(0);
             }
-            Err(e) => log::error!("VP-404: cannot open {}: {e}", self.clip_path.display()),
+            Err(e) => log::error!("VP-404: cannot open {}: {e}", clip_path.display()),
+        }
         }
         self.last_tick = Instant::now();
     }
@@ -325,13 +328,7 @@ impl EffectPlugin for Vp404 {
                     PadCmd::StartSampling(i, frame_count) => {
                         if let Some(sampler) = self.live_sampler.as_mut() {
                             let sampler = sampler.get_mut().unwrap_or_else(|e| e.into_inner());
-                            if let Err(e) = sampler.start_recording(
-                                i,
-                                frame_count,
-                                engine.input.width,
-                                engine.input.height,
-                                engine.input.fps,
-                            ) {
+                            if let Err(e) = sampler.start_recording(i, frame_count) {
                                 log::error!("VP-404 start sampling: {e}");
                             }
                         }
@@ -371,8 +368,7 @@ impl EffectPlugin for Vp404 {
                                 if let Some(pad) = bank.pads.get_mut(pad_index) {
                                     pad.assign_sample(s);
                                     pad.loop_enabled = true;
-                                    pad.trigger();
-                                    bank.last_triggered = Some(pad_index);
+                                    // Don't auto-play — wait for a trigger.
                                 }
                             }
                             Err(e) => {
@@ -537,7 +533,7 @@ impl EffectPlugin for Vp404 {
             let sampler = sampler.get_mut().unwrap_or_else(|e| e.into_inner());
             if sampler.state() == live_sampler::SamplerState::Recording {
                 if let Some(texture) = ctx.input.as_ref().and_then(|i| i.texture) {
-                    sampler.submit_readback(texture);
+                    sampler.submit_readback(texture, ctx.engine_state.input.frame_seq);
                 }
             }
         }
@@ -583,19 +579,18 @@ fn main() -> anyhow::Result<()> {
         .filter_module("winit", log::LevelFilter::Warn)
         .init();
 
+    // Optional launch clip — seeds pad 0 so something plays immediately.
     let clip_path = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("VP404_CLIP").ok())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no clip given — pass a HAP .mov path as the first argument or set VP404_CLIP"
-            )
-        })?;
+        .map(PathBuf::from);
 
     // VP404_PROBE=1: print clip metadata (format/frames/fps) and exit — no GUI.
     if std::env::var("VP404_PROBE").is_ok() {
-        let mut r = QtHapReader::open(&clip_path)?;
+        let clip_path = clip_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("VP404_PROBE needs a clip path"))?;
+        let mut r = QtHapReader::open(clip_path)?;
         let (w, h) = r.resolution();
         let fmt = r.texture_format();
         let f0 = r.read_frame(0).map(|f| f.format);

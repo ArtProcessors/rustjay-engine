@@ -51,6 +51,7 @@
 - [Sputnik — Rutt-Etra Mesh Displacement](examples/sputnik.md)
 - [ISF Shader Viewer](examples/isf-example.md)
 - [videowall — HDMI-Matrix Mapper](examples/videowall.md)
+- [VP-404 — Live Video Sampler](examples/vp404.md)
 - [vjarda — Full Multi-Deck VJ App](examples/vjarda.md)
 - [CuePool — Theatre Show Control](examples/cuepool/README.md)
   - [Getting Started](examples/cuepool/getting-started.md)
