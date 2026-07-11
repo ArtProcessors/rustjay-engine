@@ -694,16 +694,16 @@ impl<P: EffectPlugin> App<P> {
         #[cfg(not(target_os = "macos"))]
         let syphon_changed = false;
 
-        if done || syphon_changed {
-            if let Some(manager) = self.input_manager.as_ref() {
-                if self.use_egui {
-                    #[cfg(feature = "egui")]
-                    if let Some(ref mut gui) = self.egui_control_gui.as_mut() {
-                        gui.update_device_lists(manager);
-                    }
-                } else if let Some(ref mut gui) = self.control_gui.as_mut() {
+        if (done || syphon_changed)
+            && let Some(manager) = self.input_manager.as_ref()
+        {
+            if self.use_egui {
+                #[cfg(feature = "egui")]
+                if let Some(ref mut gui) = self.egui_control_gui.as_mut() {
                     gui.update_device_lists(manager);
                 }
+            } else if let Some(ref mut gui) = self.control_gui.as_mut() {
+                gui.update_device_lists(manager);
             }
         }
         if done {
