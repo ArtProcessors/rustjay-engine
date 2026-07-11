@@ -239,6 +239,31 @@ impl InputManager {
         &[]
     }
 
+    /// Re-snapshot the Syphon server directory (cheap in-process read) and
+    /// return whether the list changed.
+    ///
+    /// The directory populates asynchronously via run-loop notifications, so a
+    /// one-shot scan at startup sees an empty list; poll this periodically
+    /// (main thread only) to keep the list live without a manual refresh.
+    #[cfg(target_os = "macos")]
+    pub fn refresh_syphon_servers(&mut self) -> bool {
+        let servers = syphon_input::SyphonDiscovery::new().discover_servers();
+        let changed = match &self.syphon_servers {
+            Some(cur) => {
+                cur.len() != servers.len()
+                    || cur
+                        .iter()
+                        .zip(&servers)
+                        .any(|(a, b)| a.uuid != b.uuid || a.name != b.name)
+            }
+            None => true,
+        };
+        if changed {
+            self.syphon_servers = Some(servers);
+        }
+        changed
+    }
+
     /// Whether background discovery is currently in progress
     pub fn is_discovering(&self) -> bool {
         self.is_discovering

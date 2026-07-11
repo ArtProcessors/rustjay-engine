@@ -681,7 +681,20 @@ impl<P: EffectPlugin> App<P> {
             .input_manager
             .as_mut()
             .is_some_and(|m| m.poll_discovery());
-        if done {
+
+        // Syphon's server directory populates via run-loop notifications, so
+        // the one-shot startup discovery sees an empty list. Re-snapshot it on
+        // this (already throttled) tick — an in-process read — so servers
+        // appear/disappear live without a manual refresh.
+        #[cfg(target_os = "macos")]
+        let syphon_changed = self
+            .input_manager
+            .as_mut()
+            .is_some_and(|m| m.refresh_syphon_servers());
+        #[cfg(not(target_os = "macos"))]
+        let syphon_changed = false;
+
+        if done || syphon_changed {
             if let Some(manager) = self.input_manager.as_ref() {
                 if self.use_egui {
                     #[cfg(feature = "egui")]
@@ -692,6 +705,8 @@ impl<P: EffectPlugin> App<P> {
                     gui.update_device_lists(manager);
                 }
             }
+        }
+        if done {
             self.shared_state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

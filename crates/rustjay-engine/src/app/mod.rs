@@ -499,6 +499,10 @@ impl<P: EffectPlugin> App<P> {
         {
             let mut state = shared_state.lock().unwrap_or_else(|e| e.into_inner());
             state.web_app_name = app_name.clone();
+            // Kick an initial device discovery so Syphon/NDI/webcam sources
+            // appear without a manual "Refresh": the first command pump
+            // processes this exactly like the Refresh button.
+            state.input_command = rustjay_core::InputCommand::RefreshDevices;
         }
 
         #[cfg(feature = "projection")]
