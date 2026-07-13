@@ -12,6 +12,8 @@ mixer   = ["rustjay-engine/mixer", "dep:rustjay-mixer"]
 # Keep it off the default build so headless/Pi builds stay lean.
 capture = ["dep:rustjay-io", "rustjay-io/webcam"]
 ndi     = ["rustjay-engine/ndi"]
+# Ableton Link tempo sync (sync-source picker + Link panel in the Audio tab).
+link    = ["rustjay-engine/link"]
 # REST/WebSocket API layer + browser pad-grid page.
 # Gate off by default so the base build stays lean (no tokio/axum/utoipa).
 api     = ["rustjay-engine/api", "dep:serde_json"]
