@@ -65,12 +65,13 @@ The frame part is display-only; set its rate under **Settings → Timecode**
 shown as `next: Q12 @ 00:03:15.00`.
 
 **Pause freezes the show clock** and no timecode triggers fire while
-paused. While paused, **⏭ frame-step** advances the current video one frame
-at a time with the clock following in lockstep — creep up on the exact
+paused. While paused, **⏭ / ⏮ frame-step** move the current video one frame
+forward or back with the clock following in lockstep — creep up on the exact
 moment, then either hit **Capture** on a cue's timecode trigger or just add
 a new cue: **cues created while the clock is live are pre-filled with a
 timecode trigger at the current time.** Triggers stepped past while paused
-fire on resume.
+fire on resume. (Stepping back briefly re-seeks the decoder, so the first
+back-step can take a moment on long-GOP files.)
 
 ## Per-cue triggers
 
@@ -82,8 +83,9 @@ to the GO chain:
 - **Wall clock** — a time of day (12/24-hour), once or daily. Useful for
   house music, pre-show loops, and installations.
 - **Timecode** — a time on the show clock, which is started by a
-  [TimeCode cue](cues.md#timecode). A capture button stamps the trigger with
-  the current show time.
+  [TimeCode cue](cues.md#timecode). Entered as `HH:MM:SS.FF` (matching the
+  show clock display; a bare number is plain seconds). A capture button
+  stamps the trigger with the current show time.
 
 ## MIDI Show Control (MSC)
 
