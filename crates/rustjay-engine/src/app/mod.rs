@@ -418,12 +418,31 @@ impl<P: EffectPlugin> App<P> {
             (state.osc_host.clone(), state.osc_port)
         };
         let osc_server = {
-            let server = OscServer::new(&osc_host, osc_port, "/rustjay");
+            let mut server = OscServer::new(&osc_host, osc_port, "/rustjay");
             if let Ok(mut state) = server.state().lock() {
                 state.register_default_parameters();
                 state.register_parameters(&descriptors);
             }
             log::info!("OSC server initialized");
+            // Config saves `osc.enabled` from state (see save()) but nothing
+            // restored it — autostart when the config says so, matching the
+            // GUI's OscCommand::Start path.
+            let enabled = {
+                let state = shared_state.lock().unwrap_or_else(|e| e.into_inner());
+                state.osc_enabled
+            };
+            if enabled {
+                match server.start() {
+                    Ok(()) => {}
+                    Err(e) => {
+                        log::error!("Failed to autostart OSC server: {}", e);
+                        shared_state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .osc_enabled = false;
+                    }
+                }
+            }
             Some(server)
         };
 

@@ -291,6 +291,7 @@ impl AppSettings {
         }
         state.osc_host = self.osc.host.clone();
         state.osc_port = self.osc.port;
+        state.osc_enabled = self.osc.enabled;
         state.web_host = self.web_host.clone();
         state.web_port = self.web_port;
         state.web_lan_trust = self.web_lan_trust;
