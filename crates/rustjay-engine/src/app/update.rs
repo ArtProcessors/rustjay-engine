@@ -509,6 +509,40 @@ impl<P: EffectPlugin> App<P> {
                         }
                     }
 
+                    // Apply app-published param values (e.g. vp404 pad-loaded
+                    // flags) so the mirrors below — web and controller — see them.
+                    let queued = shared
+                        .app_param_queue
+                        .lock()
+                        .map(|mut g| std::mem::take(&mut *g))
+                        .unwrap_or_default();
+                    for (id, v) in queued {
+                        shared.set_param_base(&id, v);
+                    }
+
+                    // Mirror engine values into the OSC state so changes made
+                    // elsewhere (web UI, presets) reach the feedback target;
+                    // set_value's delta guard suppresses echo of OSC-origin
+                    // changes.
+                    #[cfg(feature = "osc-feedback")]
+                    {
+                        osc_state.set_value("/rustjay/color/hue_shift", shared.hsb_params.hue_shift);
+                        osc_state.set_value("/rustjay/color/saturation", shared.hsb_params.saturation);
+                        osc_state.set_value("/rustjay/color/brightness", shared.hsb_params.brightness);
+                        osc_state.set_value(
+                            "/rustjay/color/enabled",
+                            if shared.color_enabled { 1.0 } else { 0.0 },
+                        );
+                        osc_state.set_value("/rustjay/audio/amplitude", shared.audio.amplitude);
+                        osc_state.set_value("/rustjay/audio/smoothing", shared.audio.smoothing);
+                        for (i, desc) in descriptors.iter().enumerate() {
+                            if let Some(addr) = shared.param_osc_addresses.get(i)
+                                && let Some(v) = shared.get_param_base(&desc.id) {
+                                    osc_state.set_value(addr, v);
+                                }
+                        }
+                    }
+
                     shared.osc_message_log = osc_state.message_log.clone();
                 }
     }

@@ -16,6 +16,8 @@ pub enum OscCommand {
 }
 
 use rosc::{decoder, OscMessage, OscPacket, OscType};
+#[cfg(feature = "osc-feedback")]
+use rosc::encoder;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::{
@@ -113,6 +115,9 @@ pub struct OscState {
     pub last_message: Option<(String, f32)>,
     /// Message history (recent messages)
     pub message_log: Vec<(String, f32, f64)>,
+    /// Controller feedback target, adopted from the last `<base>/sync` sender
+    #[cfg(feature = "osc-feedback")]
+    feedback: Option<(UdpSocket, std::net::SocketAddr)>,
 }
 
 impl OscState {
@@ -131,6 +136,8 @@ impl OscState {
             base_address: base,
             last_message: None,
             message_log: Vec::with_capacity(100),
+            #[cfg(feature = "osc-feedback")]
+            feedback: None,
         }
     }
 
@@ -251,9 +258,50 @@ impl OscState {
         };
 
         if let Some(param) = self.parameters.get_mut(&full_address) {
-            param.value = value.clamp(param.min_value, param.max_value);
+            let new_value = value.clamp(param.min_value, param.max_value);
+            let _changed = (new_value - param.value).abs() > 0.001;
+            param.value = new_value;
             // Note: We don't set dirty here since this is from UI, not OSC
+            #[cfg(feature = "osc-feedback")]
+            if _changed {
+                let normalized = self.parameters[&full_address].get_normalized();
+                self.send_feedback(&full_address, normalized);
+            }
         }
+    }
+
+    /// Adopt `target` as the controller feedback destination (last `/sync`
+    /// sender wins).
+    #[cfg(feature = "osc-feedback")]
+    pub fn set_feedback_target(&mut self, target: std::net::SocketAddr) {
+        match UdpSocket::bind("0.0.0.0:0") {
+            Ok(sock) => {
+                log::info!("OSC feedback -> {}", target);
+                self.feedback = Some((sock, target));
+            }
+            Err(e) => log::warn!("OSC feedback bind failed: {}", e),
+        }
+    }
+
+    /// Push every registered parameter to the feedback target (controller
+    /// boot sync). ponytail: one datagram per param, no bundling — revisit if
+    /// the controller drops part of the burst.
+    #[cfg(feature = "osc-feedback")]
+    pub fn send_all_feedback(&self) {
+        for p in self.parameters.values() {
+            self.send_feedback(&p.address, p.get_normalized());
+        }
+    }
+
+    #[cfg(feature = "osc-feedback")]
+    fn send_feedback(&self, address: &str, normalized: f32) {
+        if let Some((sock, target)) = &self.feedback
+            && let Ok(bytes) = encoder::encode(&OscPacket::Message(OscMessage {
+                addr: address.to_string(),
+                args: vec![OscType::Float(normalized)],
+            })) {
+                let _ = sock.send_to(&bytes, target);
+            }
     }
 
     /// Check if parameter exists
@@ -339,11 +387,11 @@ impl OscServer {
             while running.load(Ordering::SeqCst) {
                 // Try to receive a packet
                 match socket.recv_from(&mut buf) {
-                    Ok((size, _)) => {
+                    Ok((size, peer)) => {
                         // Parse OSC packet
                         match decoder::decode_udp(&buf[..size]) {
                             Ok((_, packet)) => {
-                                Self::handle_packet(&state, &packet);
+                                Self::handle_packet(&state, &packet, peer.ip());
                             }
                             Err(e) => {
                                 log::warn!("OSC decode error: {}", e);
@@ -389,21 +437,37 @@ impl OscServer {
     }
 
     /// Handle an OSC packet
-    fn handle_packet(state: &Arc<Mutex<OscState>>, packet: &OscPacket) {
+    fn handle_packet(state: &Arc<Mutex<OscState>>, packet: &OscPacket, peer: std::net::IpAddr) {
         match packet {
             OscPacket::Message(msg) => {
-                Self::handle_message(state, msg);
+                Self::handle_message(state, msg, peer);
             }
             OscPacket::Bundle(bundle) => {
                 for content in &bundle.content {
-                    Self::handle_packet(state, content);
+                    Self::handle_packet(state, content, peer);
                 }
             }
         }
     }
 
     /// Handle an OSC message
-    fn handle_message(state: &Arc<Mutex<OscState>>, msg: &OscMessage) {
+    fn handle_message(state: &Arc<Mutex<OscState>>, msg: &OscMessage, _peer: std::net::IpAddr) {
+        // `<base>/sync [port]` — adopt the sender as feedback target and push
+        // every current value (controller boot handshake). Default port 9001
+        // is the Mk1 bridge's OSC input.
+        #[cfg(feature = "osc-feedback")]
+        if msg.addr.ends_with("/sync")
+            && let Ok(mut st) = state.lock()
+            && msg.addr == format!("{}/sync", st.base_address) {
+                let port = msg.args.first().and_then(|a| match a {
+                    OscType::Int(p) => u16::try_from(*p).ok(),
+                    _ => None,
+                });
+                st.set_feedback_target((_peer, port.unwrap_or(9001)).into());
+                st.send_all_feedback();
+                return;
+            }
+
         // Extract value from arguments
         let value = msg.args.first().and_then(|arg| match arg {
             OscType::Float(f) => Some(*f),
@@ -442,4 +506,42 @@ pub fn make_address(base: &str, tab: &str, param: &str) -> String {
 #[allow(dead_code)]
 pub fn format_address_for_display(address: &str) -> String {
     address.trim_start_matches('/').replace('/', " → ")
+}
+
+#[cfg(all(test, feature = "osc-feedback"))]
+mod feedback_tests {
+    use super::*;
+
+    #[test]
+    fn set_value_feeds_back_normalized() {
+        let controller = UdpSocket::bind("127.0.0.1:0").unwrap();
+        controller
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let mut state = OscState::new("127.0.0.1", 0, "/rustjay");
+        state.register_parameter("/color/hue_shift", "Hue", "color", -180.0, 180.0);
+        state.set_feedback_target(controller.local_addr().unwrap());
+
+        state.set_value("/rustjay/color/hue_shift", 90.0);
+
+        let mut buf = [0u8; 256];
+        let (n, _) = controller.recv_from(&mut buf).expect("no feedback datagram");
+        let (_, packet) = decoder::decode_udp(&buf[..n]).unwrap();
+        let OscPacket::Message(msg) = packet else {
+            panic!("expected message")
+        };
+        assert_eq!(msg.addr, "/rustjay/color/hue_shift");
+        let OscType::Float(v) = msg.args[0] else {
+            panic!("expected float")
+        };
+        assert!((v - 0.75).abs() < 1e-3, "got {v}"); // 90 in [-180,180] = 0.75
+
+        // Same value again: delta guard must suppress the echo.
+        state.set_value("/rustjay/color/hue_shift", 90.0);
+        controller
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        assert!(controller.recv_from(&mut buf).is_err(), "unexpected echo");
+    }
 }

@@ -1118,6 +1118,13 @@ pub struct EngineState {
     /// `api` feature is off.
     pub app_command_queue: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 
+    /// App→engine parameter writes: `(param_id, value)` pairs pushed by the
+    /// app from `prepare()` (which only gets `&EngineState`), drained by the
+    /// engine frame loop into `set_param_base`. Registered params picked up
+    /// here flow onward to the web UI mirror and, with `osc-feedback`, to the
+    /// OSC controller (e.g. vp404's `pad<i>_loaded` LED sources).
+    pub app_param_queue: Arc<std::sync::Mutex<Vec<(String, f32)>>>,
+
     /// Transient toast notifications posted by the app or engine.
     /// Rendered globally by the control GUI and expired automatically.
     pub notifications: Arc<Mutex<Vec<Notification>>>,
@@ -1271,6 +1278,7 @@ impl EngineState {
             app_state: Arc::new(std::sync::Mutex::new(None)),
             app_ui_html: None,
             app_command_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
+            app_param_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             notifications: Arc::new(Mutex::new(Vec::new())),
             output_sinks: Arc::new(Mutex::new(Vec::new())),
             param_restore: Arc::new(Mutex::new(Vec::new())),

@@ -54,6 +54,8 @@ webcam  = ["rustjay-io/webcam"]
 egui    = ["rustjay-gui/egui"]
 mixer   = ["dep:rustjay-mixer"]
 api     = ["dep:rustjay-api"]
+# Push parameter changes back to an OSC controller (Maschine Mk1 bridge).
+osc-feedback = ["rustjay-control/osc-feedback"]
 projection = ["dep:rustjay-projection", "rustjay-projection/surface-import", "rustjay-projection/auto-edge-blend"]
 spout   = []
 v4l2    = []

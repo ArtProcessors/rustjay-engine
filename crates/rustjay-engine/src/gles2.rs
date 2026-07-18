@@ -861,6 +861,16 @@ fn run_drm_gles2_loop<P: rustjay_core::EffectPlugin>(
 
         if let Ok(mut osc_st) = osc_server.state().lock() {
             if let Ok(mut state) = shared_state.lock() {
+                // Apply app-published param values (see EngineState::app_param_queue).
+                let queued = state
+                    .app_param_queue
+                    .lock()
+                    .map(|mut g| std::mem::take(&mut *g))
+                    .unwrap_or_default();
+                for (id, v) in queued {
+                    state.set_param_base(&id, v);
+                }
+
                 let descs = std::sync::Arc::clone(&state.param_descriptors);
                 for (i, desc) in descs.iter().enumerate() {
                     if let Some(addr) = state.param_osc_addresses.get(i).cloned() {
@@ -868,6 +878,16 @@ fn run_drm_gles2_loop<P: rustjay_core::EffectPlugin>(
                             state.set_param_base(&desc.id, v.clamp(desc.min, desc.max));
                         }
                     }
+                }
+                // Mirror engine values back for controller feedback (see
+                // app/update.rs — same pattern, GLES2 only handles the
+                // shader params over OSC).
+                #[cfg(feature = "osc-feedback")]
+                for (i, desc) in descs.iter().enumerate() {
+                    if let Some(addr) = state.param_osc_addresses.get(i)
+                        && let Some(v) = state.get_param_base(&desc.id) {
+                            osc_st.set_value(addr, v);
+                        }
                 }
             }
         }

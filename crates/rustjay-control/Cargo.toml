@@ -10,6 +10,8 @@ categories = ["graphics", "multimedia::video"]
 
 [features]
 mtc = []
+# Push parameter changes to an OSC controller (e.g. the Maschine Mk1 bridge).
+osc-feedback = []
 
 [dependencies]
 rustjay-core = { workspace = true }
