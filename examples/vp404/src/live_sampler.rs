@@ -145,6 +145,20 @@ impl LiveSampler {
     }
 
     /// Cancel an in-progress recording or encoding.
+    /// Stop a free-length recording now and encode what's been captured so
+    /// far (rec-button workflow). Nothing captured yet → plain cancel.
+    /// In-flight readbacks are dropped (≤2 frames).
+    pub fn finish(&mut self) {
+        if self.state != SamplerState::Recording {
+            return;
+        }
+        if self.recording.as_ref().is_none_or(|r| r.frames.is_empty()) {
+            self.cancel();
+        } else {
+            self.finish_recording();
+        }
+    }
+
     pub fn cancel(&mut self) {
         self.recording = None;
         self.encoding_handle = None;

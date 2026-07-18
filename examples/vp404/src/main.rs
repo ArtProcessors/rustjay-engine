@@ -61,6 +61,8 @@ struct Vp404 {
     /// so the SP-404 trim only re-ranges the last pad when actually adjusted.
     prev_in: f32,
     prev_out: f32,
+    /// Whether each trim knob has moved since launch (first move only seeds).
+    trim_live: (bool, bool),
     /// MIDI step-write cursor: the step position where the next stopped-mode
     /// pad trigger will be recorded. Wraps at `pattern.length()`.
     edit_step: usize,
@@ -71,6 +73,18 @@ struct Vp404 {
     /// Total elapsed beats from the engine tempo clock, used for synced pads.
     accumulated_beats: f32,
     last_tick: Instant,
+    /// Controller transport: previous param values for edge detection
+    /// (record, seq_play, step_record, pattern_next, pattern_prev).
+    prev_transport: [f32; 5],
+    /// Record armed — the next pad press live-samples into that pad.
+    rec_armed: bool,
+    /// Last quarter-beat index a note-repeat retrigger fired on.
+    retrig_step: i32,
+    /// Previously published pad-loaded flags (change-detected into the queue).
+    prev_loaded: Vec<bool>,
+    /// Previously published sampler state (rec_state param).
+    #[cfg(feature = "capture")]
+    prev_rec_state: f32,
     /// Live sampler (capture → HAP5 → pad), only present when `capture` is enabled.
     #[cfg(feature = "capture")]
     live_sampler: Option<std::sync::Mutex<live_sampler::LiveSampler>>,
@@ -109,10 +123,17 @@ impl Vp404 {
             prev_trig: vec![0.0; PAD_COUNT],
             prev_in: 0.0,
             prev_out: 1.0,
+            trim_live: (false, false),
             edit_step: 0,
             record_mode: false,
             accumulated_beats: 0.0,
             last_tick: Instant::now(),
+            prev_transport: [0.0; 5],
+            rec_armed: false,
+            retrig_step: -1,
+            prev_loaded: vec![false; PAD_COUNT],
+            #[cfg(feature = "capture")]
+            prev_rec_state: 0.0,
             #[cfg(feature = "capture")]
             live_sampler: None,
         }
@@ -175,6 +196,41 @@ impl EffectPlugin for Vp404 {
             1.0,
             0.001,
         ));
+        // Controller transport (docs/design.md Mk1 mapping: rec / erase /
+        // play / step / note-repeat / step_left+right).
+        for (id, name) in [
+            ("record", "Record (arm/stop)"),
+            ("erase", "Erase (hold)"),
+            ("seq_play", "Sequencer Play"),
+            ("step_record", "Step Record"),
+            ("retrigger", "Note Repeat (hold)"),
+            ("pattern_next", "Pattern Next"),
+            ("pattern_prev", "Pattern Prev"),
+            ("rec_state", "Sampler State (out)"),
+        ] {
+            params.push(ParameterDescriptor::float(
+                id,
+                name,
+                ParamCategory::Custom("Transport".into()),
+                0.0,
+                1.0,
+                0.0,
+                0.01,
+            ));
+        }
+        // Read-only pad-loaded flags, published via `app_param_queue` —
+        // controller LED sources (loaded pads light up).
+        for i in 0..PAD_COUNT {
+            params.push(ParameterDescriptor::float(
+                format!("pad{i}_loaded"),
+                format!("Pad {} Loaded (out)", i + 1),
+                ParamCategory::Custom("Pads".into()),
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ));
+        }
         let mixer = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
         params.extend(mixer.parameters());
         params
@@ -399,15 +455,88 @@ impl EffectPlugin for Vp404 {
                 }
             }
 
+            // 2b-. Controller transport (docs/design.md Mk1 mapping), all
+            // edge-detected like pad trigs. `erase` is a hold-modifier read
+            // by the pad loop below; `record` runs the SP-404 arm workflow:
+            // arm → next pad press starts a free-length capture into that
+            // pad → record again stops and encodes.
+            let erase_held = engine.get_param_base("erase").unwrap_or(0.0) > 0.5;
+            {
+                let vals = [
+                    engine.get_param_base("record").unwrap_or(0.0),
+                    engine.get_param_base("seq_play").unwrap_or(0.0),
+                    engine.get_param_base("step_record").unwrap_or(0.0),
+                    engine.get_param_base("pattern_next").unwrap_or(0.0),
+                    engine.get_param_base("pattern_prev").unwrap_or(0.0),
+                ];
+                let rising: Vec<bool> = vals
+                    .iter()
+                    .zip(self.prev_transport)
+                    .map(|(&v, p)| trig_edge(v, p) == Some(true))
+                    .collect();
+                self.prev_transport = vals;
+
+                if rising[0] {
+                    #[cfg(feature = "capture")]
+                    {
+                        let sampler_recording = self
+                            .live_sampler
+                            .as_mut()
+                            .map(|s| s.get_mut().unwrap_or_else(|e| e.into_inner()).state())
+                            == Some(live_sampler::SamplerState::Recording);
+                        if sampler_recording {
+                            if let Some(s) = self.live_sampler.as_mut() {
+                                s.get_mut().unwrap_or_else(|e| e.into_inner()).finish();
+                            }
+                        } else {
+                            self.rec_armed = !self.rec_armed;
+                        }
+                    }
+                    #[cfg(not(feature = "capture"))]
+                    log::warn!("VP-404: record pressed but built without `capture`");
+                }
+                if rising[1] {
+                    state.sequencer.toggle_playback();
+                }
+                if rising[2] {
+                    self.record_mode = !self.record_mode;
+                }
+                let n = state.sequencer.patterns.len();
+                if rising[3] && n > 0 {
+                    state
+                        .sequencer
+                        .queue_pattern((state.sequencer.current_pattern + 1) % n);
+                }
+                if rising[4] && n > 0 {
+                    state
+                        .sequencer
+                        .queue_pattern((state.sequencer.current_pattern + n - 1) % n);
+                }
+            }
+
             // 2b. Edge-detect pad trig params — MIDI Note-On/Off, OSC, and web all
             // set `pad<i>_trig`; rising edge fires trigger (or step-write when
-            // sequencer is stopped), falling fires release.
+            // sequencer is stopped), falling fires release. Erase-hold clears
+            // instead; an armed record captures into the pad instead.
             for i in 0..bank.pads.len() {
                 let val = engine
                     .get_param_base(&format!("pad{i}_trig"))
                     .unwrap_or(0.0);
                 let prev = self.prev_trig.get(i).copied().unwrap_or(0.0);
                 match trig_edge(val, prev) {
+                    Some(true) if erase_held => {
+                        bank.pads[i].clear();
+                    }
+                    Some(true) if self.rec_armed => {
+                        self.rec_armed = false;
+                        #[cfg(feature = "capture")]
+                        if let Some(s) = self.live_sampler.as_mut() {
+                            let s = s.get_mut().unwrap_or_else(|e| e.into_inner());
+                            if let Err(e) = s.start_recording(i, FREE_REC_MAX_FRAMES) {
+                                log::error!("VP-404 start sampling: {e}");
+                            }
+                        }
+                    }
                     Some(true) => {
                         if self.record_mode && !state.sequencer.is_playing {
                             // Step-write: record track i at cursor, then audition.
@@ -426,23 +555,43 @@ impl EffectPlugin for Vp404 {
             }
 
             // 2c. SP-404-style start/end trim: the global `in_point`/`out_point`
-            // knobs adjust the *last-pressed* pad. Applied only when a knob
-            // actually moves (MIDI/OSC/LFO/UI) so idle pads keep their own trim.
+            // knobs adjust the *last-pressed* pad, applied as RELATIVE deltas.
+            // The Mk1 knobs are endless encoders reporting absolute 0..1
+            // positions, so applying the value directly snaps the trim to
+            // wherever the knob happens to sit (the "6 frames on a light
+            // touch" artifact). Deltas are wrap-corrected for the 999->0
+            // rollover; the first sample after launch only seeds the baseline.
             {
                 let in_v = engine.get_param("in_point").unwrap_or(0.0).clamp(0.0, 1.0);
                 let out_v = engine.get_param("out_point").unwrap_or(1.0).clamp(0.0, 1.0);
-                let moved =
-                    (in_v - self.prev_in).abs() > 1e-4 || (out_v - self.prev_out).abs() > 1e-4;
+                let mut din = wrap_delta(in_v - self.prev_in);
+                let mut dout = wrap_delta(out_v - self.prev_out);
                 self.prev_in = in_v;
                 self.prev_out = out_v;
-                if moved {
+                // The first movement of each knob after launch only seeds the
+                // baseline — where the encoder happens to sit is meaningless.
+                if din.abs() > 1e-4 && !self.trim_live.0 {
+                    self.trim_live.0 = true;
+                    din = 0.0;
+                }
+                if dout.abs() > 1e-4 && !self.trim_live.1 {
+                    self.trim_live.1 = true;
+                    dout = 0.0;
+                }
+                if din.abs() > 1e-4 || dout.abs() > 1e-4 {
                     if let Some(pad) = bank.last_triggered.and_then(|i| bank.pads.get_mut(i)) {
                         if let Some(sample) = pad.sample.as_mut() {
                             let last = sample.frame_count.saturating_sub(1) as f32;
-                            sample.set_range(
-                                (in_v * last).round() as u32,
-                                (out_v * last).round() as u32,
-                            );
+                            if last > 0.0 {
+                                let in_f =
+                                    (sample.in_point as f32 / last + din).clamp(0.0, 1.0);
+                                let out_f =
+                                    (sample.out_point as f32 / last + dout).clamp(0.0, 1.0);
+                                sample.set_range(
+                                    (in_f * last).round() as u32,
+                                    (out_f * last).round() as u32,
+                                );
+                            }
                         }
                     }
                 }
@@ -486,6 +635,55 @@ impl EffectPlugin for Vp404 {
             self.accumulated_beats += bpm / 60.0 * dt.as_secs_f32();
             for p in &mut bank.pads {
                 p.update(dt, self.accumulated_beats);
+            }
+
+            // Note-repeat: while held, retrigger the last-pressed pad every
+            // 1/4 beat. ponytail: fixed 1/16-note division — knob/division
+            // select is later polish.
+            if engine.get_param_base("retrigger").unwrap_or(0.0) > 0.5 {
+                let step = (self.accumulated_beats / 0.25) as i32;
+                if step != self.retrig_step {
+                    self.retrig_step = step;
+                    if let Some(p) = bank.last_triggered.and_then(|i| bank.pads.get_mut(i)) {
+                        p.trigger();
+                    }
+                }
+            }
+
+            // Publish pad-loaded flags + sampler state for controller LEDs
+            // (change-detected; drained by the engine into params, which the
+            // osc-feedback mirror then pushes to the controller).
+            {
+                let mut q: Vec<(String, f32)> = Vec::new();
+                for (i, p) in bank.pads.iter().enumerate() {
+                    let loaded = p.has_sample();
+                    if self.prev_loaded[i] != loaded {
+                        self.prev_loaded[i] = loaded;
+                        q.push((format!("pad{i}_loaded"), loaded as u8 as f32));
+                    }
+                }
+                #[cfg(feature = "capture")]
+                {
+                    let rec_state = match self
+                        .live_sampler
+                        .as_mut()
+                        .map(|s| s.get_mut().unwrap_or_else(|e| e.into_inner()).state())
+                    {
+                        Some(live_sampler::SamplerState::Recording) => 1.0,
+                        Some(live_sampler::SamplerState::Encoding) => 0.7,
+                        _ if self.rec_armed => 0.4,
+                        _ => 0.0,
+                    };
+                    if (rec_state - self.prev_rec_state).abs() > 1e-3 {
+                        self.prev_rec_state = rec_state;
+                        q.push(("rec_state".into(), rec_state));
+                    }
+                }
+                if !q.is_empty() {
+                    if let Ok(mut g) = engine.app_param_queue.lock() {
+                        g.extend(q);
+                    }
+                }
             }
 
             // 5. Tick the pad sequencer from the same master clock.
@@ -561,6 +759,23 @@ impl EffectPlugin for Vp404 {
 }
 
 /// Rising → `Some(true)`, falling → `Some(false)`, no edge → `None`.
+/// Free-length live-sampling cap. ponytail: frames are raw RGBA in RAM
+/// (~8 MB/frame at 1080p), so ~10 s at 30 fps — streaming encode is the
+/// upgrade path if longer grabs are ever needed.
+#[cfg(feature = "capture")]
+const FREE_REC_MAX_FRAMES: u32 = 300;
+
+/// Delta between two endless-encoder positions (0..1), wrap-corrected.
+fn wrap_delta(d: f32) -> f32 {
+    if d > 0.5 {
+        d - 1.0
+    } else if d < -0.5 {
+        d + 1.0
+    } else {
+        d
+    }
+}
+
 fn trig_edge(val: f32, prev: f32) -> Option<bool> {
     if val > 0.5 && prev <= 0.5 {
         Some(true)

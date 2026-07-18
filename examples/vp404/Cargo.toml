@@ -11,6 +11,8 @@ mixer   = ["rustjay-engine/mixer", "dep:rustjay-mixer"]
 # Live sampling pulls in rustjay-io capture (webcam / platform Syphon/Spout).
 # Keep it off the default build so headless/Pi builds stay lean.
 capture = ["dep:rustjay-io", "rustjay-io/webcam"]
+# Push param values (pad<i>_loaded, rec_state, ...) to an OSC controller.
+osc-feedback = ["rustjay-engine/osc-feedback"]
 ndi     = ["rustjay-engine/ndi"]
 # Ableton Link tempo sync (sync-source picker + Link panel in the Audio tab).
 link    = ["rustjay-engine/link"]
