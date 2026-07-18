@@ -198,6 +198,11 @@ impl Pad {
 
     /// Trigger (key down). Behaviour depends on `trigger_mode`.
     pub fn trigger(&mut self) {
+        if self.sample.is_none() {
+            // Empty pad: never mark playing, or the mixer composites the
+            // channel's stale GPU texture from a previously cleared sample.
+            return;
+        }
         self.is_triggered = true;
         self.trigger_level = 1.0;
         match self.trigger_mode {
