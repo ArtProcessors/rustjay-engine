@@ -9,10 +9,26 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::pad::{Pad, TriggerMode};
+use serde::{Deserialize, Serialize};
+
+use crate::pad::{Pad, PlaybackMode, TriggerMode};
 
 /// Default pad count. ponytail: 16 for now — full count-as-setting is later polish.
 pub const PAD_COUNT: usize = 16;
+
+/// One pad's persisted layout — the per-pad entry of the `plugin_state` blob
+/// stored in engine presets. Clips restore by path; `speed` is already an
+/// engine param (`ch_pad<N>_speed`) so presets carry it via custom_values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PadSnap {
+    pub path: PathBuf,
+    pub trigger_mode: TriggerMode,
+    pub loop_enabled: bool,
+    pub playback_mode: PlaybackMode,
+    pub beat_division: usize,
+    pub in_point: u32,
+    pub out_point: u32,
+}
 
 pub struct Bank {
     pub pads: Vec<Pad>,
@@ -46,6 +62,7 @@ pub enum PadCmd {
     Load(usize, PathBuf),
     Clear(usize),
     SetMode(usize, TriggerMode),
+    SetLoop(usize, bool),
     SetRange(usize, u32, u32),
     /// Start live-sampling `frame_count` frames into the given pad.
     #[cfg(feature = "capture")]
@@ -64,6 +81,7 @@ pub struct PadInfo {
     pub playing: bool,
     pub progress: f32,
     pub trigger_mode: TriggerMode,
+    pub loop_enabled: bool,
     pub beat_division: usize,
     pub in_point: u32,
     pub out_point: u32,

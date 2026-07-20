@@ -249,6 +249,11 @@ impl AnyEguiTab for PadGridTab {
                 }
             });
 
+        let mut looped = info.loop_enabled;
+        if ui.checkbox(&mut looped, "Loop").clicked() {
+            self.handle.post(PadCmd::SetLoop(sel, looped));
+        }
+
         let opacity_id = format!("ch_pad{sel}_opacity");
         param_slider(ui, engine, &opacity_id, "Opacity", 0.0, 1.0);
 

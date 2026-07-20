@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use bank::{Bank, BankHandle, PadCmd, PadInfo, PAD_COUNT};
+use bank::{Bank, BankHandle, PadCmd, PadInfo, PadSnap, PAD_COUNT};
 use grid_tab::PadGridTab;
 use hap_wgpu::QtHapReader;
 use output_tab::OutputTab;
@@ -75,7 +75,7 @@ struct Vp404 {
     last_tick: Instant,
     /// Controller transport: previous param values for edge detection
     /// (record, seq_play, step_record, pattern_next, pattern_prev).
-    prev_transport: [f32; 5],
+    prev_transport: [f32; 6],
     /// Record armed — the next pad press live-samples into that pad.
     rec_armed: bool,
     /// Last quarter-beat index a note-repeat retrigger fired on.
@@ -128,7 +128,7 @@ impl Vp404 {
             record_mode: false,
             accumulated_beats: 0.0,
             last_tick: Instant::now(),
-            prev_transport: [0.0; 5],
+            prev_transport: [0.0; 6],
             rec_armed: false,
             retrig_step: -1,
             prev_loaded: vec![false; PAD_COUNT],
@@ -206,6 +206,7 @@ impl EffectPlugin for Vp404 {
             ("retrigger", "Note Repeat (hold)"),
             ("pattern_next", "Pattern Next"),
             ("pattern_prev", "Pattern Prev"),
+            ("loop_toggle", "Loop Toggle (last pad)"),
             ("rec_state", "Sampler State (out)"),
         ] {
             params.push(ParameterDescriptor::float(
@@ -373,6 +374,11 @@ impl EffectPlugin for Vp404 {
                             p.trigger_mode = m;
                         }
                     }
+                    PadCmd::SetLoop(i, on) => {
+                        if let Some(p) = bank.pads.get_mut(i) {
+                            p.loop_enabled = on;
+                        }
+                    }
                     PadCmd::SetRange(i, in_pt, out_pt) => {
                         if let Some(pad) = bank.pads.get_mut(i) {
                             if let Some(sample) = pad.sample.as_mut() {
@@ -468,6 +474,7 @@ impl EffectPlugin for Vp404 {
                     engine.get_param_base("step_record").unwrap_or(0.0),
                     engine.get_param_base("pattern_next").unwrap_or(0.0),
                     engine.get_param_base("pattern_prev").unwrap_or(0.0),
+                    engine.get_param_base("loop_toggle").unwrap_or(0.0),
                 ];
                 let rising: Vec<bool> = vals
                     .iter()
@@ -511,6 +518,14 @@ impl EffectPlugin for Vp404 {
                     state
                         .sequencer
                         .queue_pattern((state.sequencer.current_pattern + n - 1) % n);
+                }
+                // Loop toggle targets the last-pressed pad, same convention
+                // as the in/out trim knobs and note-repeat.
+                if rising[5] {
+                    if let Some(p) = bank.last_triggered.and_then(|i| bank.pads.get_mut(i)) {
+                        p.loop_enabled = !p.loop_enabled;
+                        log::info!("VP-404: pad {} loop {}", p.index + 1, p.loop_enabled);
+                    }
                 }
             }
 
@@ -691,6 +706,19 @@ impl EffectPlugin for Vp404 {
         }
     }
 
+    /// Presets persist the pad/clip layout (paths + modes) via the engine's
+    /// plugin_state blob; clips restore by path on preset load.
+    fn serialize_preset_state(&self, _state: &Vp404State) -> Option<String> {
+        snapshot_pads(&self.bank.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn deserialize_preset_state(&self, data: &str, _state: &mut Vp404State) {
+        restore_pads(
+            &mut self.bank.lock().unwrap_or_else(|e| e.into_inner()),
+            data,
+        );
+    }
+
     #[allow(unused_variables)]
     fn render(&mut self, ctx: &mut RenderHookCtx<'_>, state: &mut Self::State) -> bool {
         // 1. Publish pad state for the grid tab.
@@ -704,6 +732,7 @@ impl EffectPlugin for Vp404 {
                 playing: p.is_playing,
                 progress: p.progress(),
                 trigger_mode: p.trigger_mode,
+                loop_enabled: p.loop_enabled,
                 beat_division: p.beat_division,
                 in_point: p.sample.as_ref().map(|s| s.in_point).unwrap_or(0),
                 out_point: p.sample.as_ref().map(|s| s.out_point).unwrap_or(0),
@@ -766,6 +795,63 @@ impl EffectPlugin for Vp404 {
 const FREE_REC_MAX_FRAMES: u32 = 300;
 
 /// Delta between two endless-encoder positions (0..1), wrap-corrected.
+/// Pad/clip layout → JSON for the engine preset `plugin_state` blob.
+fn snapshot_pads(bank: &Bank) -> Option<String> {
+    let snaps: Vec<Option<PadSnap>> = bank
+        .pads
+        .iter()
+        .map(|p| {
+            p.sample.as_ref().map(|s| PadSnap {
+                path: s.path.clone(),
+                trigger_mode: p.trigger_mode,
+                loop_enabled: p.loop_enabled,
+                playback_mode: p.playback_mode,
+                beat_division: p.beat_division,
+                in_point: s.in_point,
+                out_point: s.out_point,
+            })
+        })
+        .collect();
+    serde_json::to_string(&snaps).ok()
+}
+
+/// Rebuild the bank from a preset's `plugin_state` blob. A missing clip file
+/// clears its pad and keeps going — one moved file must not kill the set.
+fn restore_pads(bank: &mut Bank, blob: &str) {
+    let snaps: Vec<Option<PadSnap>> = match serde_json::from_str(blob) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("VP-404: preset pad state unreadable: {e}");
+            return;
+        }
+    };
+    for (i, snap) in snaps.into_iter().enumerate() {
+        let Some(pad) = bank.pads.get_mut(i) else { break };
+        let Some(s) = snap else {
+            pad.clear();
+            continue;
+        };
+        match sample::Sample::open(&s.path) {
+            Ok(mut smp) => {
+                smp.set_range(s.in_point, s.out_point);
+                pad.assign_sample(smp);
+            }
+            Err(e) => {
+                log::warn!(
+                    "VP-404: preset clip for pad {} missing ({e}); clearing",
+                    i + 1
+                );
+                pad.clear();
+            }
+        }
+        pad.trigger_mode = s.trigger_mode;
+        pad.loop_enabled = s.loop_enabled;
+        pad.playback_mode = s.playback_mode;
+        pad.beat_division = s.beat_division;
+    }
+    log::info!("VP-404: pad bank restored from preset");
+}
+
 fn wrap_delta(d: f32) -> f32 {
     if d > 0.5 {
         d - 1.0
@@ -776,10 +862,21 @@ fn wrap_delta(d: f32) -> f32 {
     }
 }
 
+/// Press threshold ≈ cabl's 200/4095 for these pads; release sits lower so a
+/// held pad whose pressure wobbles never re-crosses a single threshold.
+const TRIG_PRESS: f32 = 0.05;
+const TRIG_RELEASE: f32 = 0.03;
+
+/// Edge-detect a trigger param. GUI/web/MIDI send clean 1.0/0.0; the Mk1
+/// streams continuous pad pressure, so this is a Schmitt trigger, not a
+/// single threshold — one threshold made every mid-hold pressure dip fire
+/// release+retrigger (Gate stuttered, OneShot machine-gunned "forever").
+/// ponytail: stateless (compares prev against both thresholds), ambiguous
+/// only for holds parked inside the 0.03–0.05 band — feather-touch territory.
 fn trig_edge(val: f32, prev: f32) -> Option<bool> {
-    if val > 0.5 && prev <= 0.5 {
+    if val > TRIG_PRESS && prev <= TRIG_PRESS {
         Some(true)
-    } else if val <= 0.5 && prev > 0.5 {
+    } else if val <= TRIG_RELEASE && prev > TRIG_RELEASE {
         Some(false)
     } else {
         None
@@ -833,21 +930,29 @@ mod tests {
     use super::trig_edge;
 
     #[test]
-    fn edge_rising_above_threshold() {
+    fn edge_rising_through_press() {
         assert_eq!(trig_edge(1.0, 0.0), Some(true));
-        assert_eq!(trig_edge(0.51, 0.49), Some(true));
+        assert_eq!(trig_edge(0.06, 0.04), Some(true));
     }
 
     #[test]
-    fn edge_falling_below_threshold() {
+    fn edge_falling_through_release() {
         assert_eq!(trig_edge(0.0, 1.0), Some(false));
-        assert_eq!(trig_edge(0.49, 0.51), Some(false));
+        assert_eq!(trig_edge(0.02, 0.04), Some(false));
     }
 
     #[test]
     fn no_edge_when_stable() {
         assert_eq!(trig_edge(1.0, 1.0), None);
         assert_eq!(trig_edge(0.0, 0.0), None);
-        assert_eq!(trig_edge(0.5, 0.5), None); // exactly at threshold = no edge
+    }
+
+    #[test]
+    fn held_pad_pressure_wobble_is_silent() {
+        // A held Mk1 pad streams varying pressure; dips that stay above the
+        // release threshold must not fire release or retrigger.
+        assert_eq!(trig_edge(0.4, 0.9), None);
+        assert_eq!(trig_edge(0.9, 0.4), None);
+        assert_eq!(trig_edge(0.06, 0.9), None); // deep dip, still held
     }
 }

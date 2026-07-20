@@ -475,11 +475,32 @@ impl<P: EffectPlugin> ApplicationHandler<WindowAction> for App<P> {
                                             };
                                             if let Some(s) = slot
                                                 && let Some(ref mut bank) = self.preset_bank {
+                                                    // Same flow as PresetCommand::LoadSlot —
+                                                    // the plugin blob (vp404 clips) must
+                                                    // restore here too, not just params.
+                                                    let plugin_state =
+                                                        bank.get_slot(s).and_then(|idx| {
+                                                            bank.presets
+                                                                .get(idx)
+                                                                .and_then(|p| p.plugin_state.clone())
+                                                        });
                                                     let mut state = self
                                                         .shared_state
                                                         .lock()
                                                         .unwrap_or_else(|e| e.into_inner());
                                                     let _ = bank.apply_slot(s, &mut state);
+                                                    if let Some(ref plugin) = self.plugin {
+                                                        if let Some(ref data) = plugin_state {
+                                                            plugin.deserialize_preset_state(
+                                                                data,
+                                                                &mut self.app_state,
+                                                            );
+                                                        }
+                                                        plugin.on_preset_applied(
+                                                            &mut self.app_state,
+                                                            &mut state,
+                                                        );
+                                                    }
                                                 }
                                         }
                                     }

@@ -95,6 +95,8 @@ impl Preset {
                 .map(|(i, d)| (d.id.clone(), state.custom_param_bases[i]))
                 .collect(),
             midi_mappings: state.midi_mappings.clone(),
+            // Filled by the runtime via EffectPlugin::serialize_preset_state —
+            // EngineState carries no app blob.
             plugin_state: None,
         }
     }
@@ -430,6 +432,7 @@ impl PresetBank {
         }
 
         let name = self.presets[index].name.clone();
+        // In-place update has no plugin access — keep the stored app blob.
         let plugin_state = self.presets[index].plugin_state.clone();
         let mut preset = Preset::from_state(&name, state);
         preset.plugin_state = plugin_state;

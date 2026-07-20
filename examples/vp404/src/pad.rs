@@ -58,9 +58,10 @@ impl PlaybackMode {
 
 /// Advance a playhead one tick and report whether it's still playing.
 ///
-/// Pure (no GPU / no I/O) so the loop/clamp logic is unit-testable. Mirrors
-/// rustjay-404's `SamplePad::update` wrapping rules.
-#[allow(clippy::too_many_arguments)]
+/// Pure (no GPU / no I/O) so the loop/clamp logic is unit-testable.
+/// `loop_enabled` is the sole boundary authority: loop on wraps seamlessly,
+/// loop off stops dead at the boundary — a finished clip never holds its
+/// last frame on the output, in any trigger mode.
 pub fn advance(
     current: f32,
     speed: f32,
@@ -68,36 +69,25 @@ pub fn advance(
     dt: f32,
     in_f: f32,
     out_f: f32,
-    mode: TriggerMode,
     loop_enabled: bool,
 ) -> (f32, bool) {
     let speed = speed.clamp(-5.0, 5.0);
-    let mut frame = current + speed * fps * dt;
+    let frame = current + speed * fps * dt;
 
     if speed >= 0.0 {
         if frame >= out_f {
-            // Forward: Latch/Gate/loop keep going; One-Shot stops at the end.
-            if loop_enabled || mode == TriggerMode::Latch || mode == TriggerMode::Gate {
-                if mode == TriggerMode::Gate && !loop_enabled {
-                    frame = out_f; // hold at end while key held
-                } else {
-                    frame = in_f + (frame - out_f); // seamless wrap
-                }
+            return if loop_enabled {
+                (in_f + (frame - out_f), true) // seamless wrap
             } else {
-                return (out_f, false);
-            }
+                (out_f, false)
+            };
         }
     } else if frame <= in_f {
-        // Reverse: Gate/loop keep going; otherwise stop at the start.
-        if loop_enabled || mode == TriggerMode::Gate {
-            if mode == TriggerMode::Gate && !loop_enabled {
-                frame = in_f;
-            } else {
-                frame = out_f - (in_f - frame);
-            }
+        return if loop_enabled {
+            (out_f - (in_f - frame), true)
         } else {
-            return (in_f, false);
-        }
+            (in_f, false)
+        };
     }
     (frame, true)
 }
@@ -276,6 +266,8 @@ impl Pad {
 
         match self.playback_mode {
             PlaybackMode::Free => {
+                // One-Shot means once — it never loops, whatever the flag says.
+                let looping = self.loop_enabled && self.trigger_mode != TriggerMode::OneShot;
                 let (frame, playing) = advance(
                     self.current_frame,
                     self.speed,
@@ -283,8 +275,7 @@ impl Pad {
                     dt.as_secs_f32(),
                     sample.in_point as f32,
                     sample.out_point as f32,
-                    self.trigger_mode,
-                    self.loop_enabled,
+                    looping,
                 );
                 self.current_frame = frame;
                 self.is_playing = playing;
@@ -334,37 +325,37 @@ mod tests {
 
     #[test]
     fn forward_no_cross_keeps_playing() {
-        let (f, playing) = advance(2.0, 1.0, FPS, 0.1, IN, OUT, TriggerMode::OneShot, false);
+        let (f, playing) = advance(2.0, 1.0, FPS, 0.1, IN, OUT, false);
         assert!((f - 5.0).abs() < 1e-3);
         assert!(playing);
     }
 
     #[test]
-    fn oneshot_stops_at_out() {
-        let (f, playing) = advance(9.0, 1.0, FPS, 0.1, IN, OUT, TriggerMode::OneShot, false);
+    fn no_loop_stops_at_out() {
+        let (f, playing) = advance(9.0, 1.0, FPS, 0.1, IN, OUT, false);
         assert!((f - OUT).abs() < 1e-3);
-        assert!(!playing); // 9 + 3 = 12 ≥ 10 → clamp to out, stop
+        assert!(!playing); // 9 + 3 = 12 ≥ 10 → clip over, never held
     }
 
     #[test]
-    fn latch_wraps_seamlessly() {
-        let (f, playing) = advance(9.0, 1.0, FPS, 0.1, IN, OUT, TriggerMode::Latch, false);
+    fn loop_wraps_seamlessly() {
+        let (f, playing) = advance(9.0, 1.0, FPS, 0.1, IN, OUT, true);
         assert!((f - 2.0).abs() < 1e-3); // 12 → in + (12 - 10) = 2
         assert!(playing);
     }
 
     #[test]
-    fn gate_holds_at_out_when_not_looping() {
-        let (f, playing) = advance(9.0, 1.0, FPS, 0.1, IN, OUT, TriggerMode::Gate, false);
-        assert!((f - OUT).abs() < 1e-3);
-        assert!(playing); // held at end, still playing
+    fn reverse_no_loop_stops_at_in() {
+        let (f, playing) = advance(1.0, -1.0, FPS, 0.1, IN, OUT, false);
+        assert!((f - IN).abs() < 1e-3);
+        assert!(!playing);
     }
 
     #[test]
-    fn reverse_oneshot_stops_at_in() {
-        let (f, playing) = advance(1.0, -1.0, FPS, 0.1, IN, OUT, TriggerMode::OneShot, false);
-        assert!((f - IN).abs() < 1e-3);
-        assert!(!playing);
+    fn reverse_loop_wraps() {
+        let (f, playing) = advance(1.0, -1.0, FPS, 0.1, IN, OUT, true);
+        assert!((f - 8.0).abs() < 1e-3); // 1 - 3 = -2 → out - (in - -2) = 8
+        assert!(playing);
     }
 
     #[test]
