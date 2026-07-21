@@ -275,7 +275,7 @@ fn ensure_camera_authorized() -> bool {
 /// an exact `RequestedFormat` for it.  Returns None for real cameras, and for
 /// idle loopbacks that no producer has configured yet.
 #[cfg(target_os = "linux")]
-fn loopback_exact_format(index: &CameraIndex) -> Option<RequestedFormat> {
+fn loopback_exact_format(index: &CameraIndex) -> Option<RequestedFormat<'_>> {
     use v4l::video::Capture as _;
 
     let n = match index {
