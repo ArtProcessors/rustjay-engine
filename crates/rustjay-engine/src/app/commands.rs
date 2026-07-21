@@ -640,7 +640,14 @@ impl<P: EffectPlugin> App<P> {
                         let state = lock(&self.shared_state);
                         rustjay_presets::Preset::from_state(&name, &state)
                     };
-                    if let Some(ref plugin) = self.plugin {
+                    // resumed() moves the plugin into the output engine —
+                    // reach it there; headless keeps it in self.plugin.
+                    if let Some(plugin) = self
+                        .output_engine
+                        .as_ref()
+                        .map(|e| e.plugin())
+                        .or(self.plugin.as_ref())
+                    {
                         preset.plugin_state = plugin.serialize_preset_state(&self.app_state);
                     }
                     match bank.add_preset(preset) {
@@ -658,7 +665,12 @@ impl<P: EffectPlugin> App<P> {
                         if let Err(e) = bank.apply_preset(index, &mut state) {
                             log::error!("Failed to load preset: {}", e);
                         }
-                        if let Some(ref plugin) = self.plugin {
+                        if let Some(plugin) = self
+                            .output_engine
+                            .as_ref()
+                            .map(|e| e.plugin())
+                            .or(self.plugin.as_ref())
+                        {
                             if let Some(ref data) = plugin_state {
                                 plugin.deserialize_preset_state(data, &mut self.app_state);
                             }
@@ -684,7 +696,12 @@ impl<P: EffectPlugin> App<P> {
                         if let Err(e) = bank.apply_slot(slot, &mut state) {
                             log::warn!("Failed to apply preset slot {}: {}", slot, e);
                         }
-                        if let Some(ref plugin) = self.plugin {
+                        if let Some(plugin) = self
+                            .output_engine
+                            .as_ref()
+                            .map(|e| e.plugin())
+                            .or(self.plugin.as_ref())
+                        {
                             if let Some(ref data) = plugin_state {
                                 plugin.deserialize_preset_state(data, &mut self.app_state);
                             }

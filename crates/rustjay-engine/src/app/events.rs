@@ -49,12 +49,14 @@ impl<P: EffectPlugin> ApplicationHandler<WindowAction> for App<P> {
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
 
-            // On Linux, wgpu always passes None as the display handle to wgpu-hal, so the
-            // GLES backend falls back to a surfaceless EGL display that has no EGL_WINDOW_BIT
-            // configs. We bypass this by initialising the GLES HAL instance directly with
-            // the event loop's display handle (Wayland or X11), then wrapping it with
-            // wgpu::Instance::from_hal. Vulkan (Pi 4/5) is unaffected — it doesn't use EGL.
-            #[cfg(target_os = "linux")]
+            // On Linux GLES2 builds (Pi), wgpu always passes None as the display handle to
+            // wgpu-hal, so the GLES backend falls back to a surfaceless EGL display that has
+            // no EGL_WINDOW_BIT configs. We bypass this by initialising the GLES HAL instance
+            // directly with the event loop's display handle (Wayland or X11), then wrapping
+            // it with wgpu::Instance::from_hal. Vulkan (Pi 4/5) is unaffected — it doesn't
+            // use EGL. Desktop Linux must NOT take this path: proprietary drivers (NVIDIA)
+            // happily initialise EGL but then can't present, leaving a GL-only instance.
+            #[cfg(all(target_os = "linux", any(feature = "gles2", feature = "drm-gles2")))]
             let instance = {
                 use raw_window_handle::HasDisplayHandle as _;
                 #[allow(unused_imports)] // Api trait is unused on the non-GL paths
@@ -82,6 +84,14 @@ impl<P: EffectPlugin> ApplicationHandler<WindowAction> for App<P> {
                     }
                 }
             };
+
+            // Desktop Linux (no GLES2 features): use the normal backend set — Vulkan on
+            // NVIDIA/AMD/Intel. The GLES-HAL workaround above is only for Pi-class targets.
+            #[cfg(all(target_os = "linux", not(any(feature = "gles2", feature = "drm-gles2"))))]
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
 
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -489,7 +499,12 @@ impl<P: EffectPlugin> ApplicationHandler<WindowAction> for App<P> {
                                                         .lock()
                                                         .unwrap_or_else(|e| e.into_inner());
                                                     let _ = bank.apply_slot(s, &mut state);
-                                                    if let Some(ref plugin) = self.plugin {
+                                                    if let Some(plugin) = self
+                                                        .output_engine
+                                                        .as_ref()
+                                                        .map(|e| e.plugin())
+                                                        .or(self.plugin.as_ref())
+                                                    {
                                                         if let Some(ref data) = plugin_state {
                                                             plugin.deserialize_preset_state(
                                                                 data,

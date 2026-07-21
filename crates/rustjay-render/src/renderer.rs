@@ -90,6 +90,12 @@ pub struct WgpuEngine<P: EffectPlugin> {
 }
 
 impl<P: EffectPlugin> WgpuEngine<P> {
+    /// The plugin instance this engine drives. The app moves the plugin in
+    /// here at `resumed()`; preset save/load hooks need to reach it after.
+    pub fn plugin(&self) -> &P {
+        &self.plugin_renderer.plugin
+    }
+
     /// Create a new `WgpuEngine` with the given window, state, and plugin.
     pub async fn new(
         instance: &wgpu::Instance,

@@ -289,7 +289,6 @@ impl EffectPlugin for Vp404 {
                 let pad = &mut bank.pads[0];
                 pad.assign_sample(s);
                 pad.trigger_mode = TriggerMode::Gate;
-                pad.loop_enabled = true;
                 pad.trigger();
                 bank.last_triggered = Some(0);
             }
@@ -429,7 +428,8 @@ impl EffectPlugin for Vp404 {
                                 );
                                 if let Some(pad) = bank.pads.get_mut(pad_index) {
                                     pad.assign_sample(s);
-                                    pad.loop_enabled = true;
+                                    // Loop stays off on load/record — enable
+                                    // deliberately (checkbox or Grid button).
                                     // Don't auto-play — wait for a trigger.
                                 }
                             }
@@ -706,17 +706,34 @@ impl EffectPlugin for Vp404 {
         }
     }
 
-    /// Presets persist the pad/clip layout (paths + modes) via the engine's
-    /// plugin_state blob; clips restore by path on preset load.
-    fn serialize_preset_state(&self, _state: &Vp404State) -> Option<String> {
-        snapshot_pads(&self.bank.lock().unwrap_or_else(|e| e.into_inner()))
+    /// Presets persist the pad/clip layout (paths + modes) and the sequencer
+    /// patterns via the engine's plugin_state blob; clips restore by path.
+    fn serialize_preset_state(&self, state: &Vp404State) -> Option<String> {
+        let bank = self.bank.lock().unwrap_or_else(|e| e.into_inner());
+        serde_json::to_string(&PresetBlob {
+            pads: pad_snaps(&bank),
+            sequencer: Some(state.sequencer.clone()),
+        })
+        .ok()
     }
 
-    fn deserialize_preset_state(&self, data: &str, _state: &mut Vp404State) {
+    fn deserialize_preset_state(&self, data: &str, state: &mut Vp404State) {
+        let blob: PresetBlob = match serde_json::from_str(data) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("VP-404: preset app state unreadable: {e}");
+                return;
+            }
+        };
         restore_pads(
             &mut self.bank.lock().unwrap_or_else(|e| e.into_inner()),
-            data,
+            blob.pads,
         );
+        if let Some(seq) = blob.sequencer {
+            // serde(skip) runtime fields (is_playing, clocks) come back as
+            // defaults — a loaded preset starts with the transport stopped.
+            state.sequencer = seq;
+        }
     }
 
     #[allow(unused_variables)]
@@ -795,10 +812,16 @@ impl EffectPlugin for Vp404 {
 const FREE_REC_MAX_FRAMES: u32 = 300;
 
 /// Delta between two endless-encoder positions (0..1), wrap-corrected.
-/// Pad/clip layout → JSON for the engine preset `plugin_state` blob.
-fn snapshot_pads(bank: &Bank) -> Option<String> {
-    let snaps: Vec<Option<PadSnap>> = bank
-        .pads
+/// App state carried in the engine preset `plugin_state` blob.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PresetBlob {
+    pads: Vec<Option<PadSnap>>,
+    #[serde(default)]
+    sequencer: Option<sequencer::SequencerEngine>,
+}
+
+fn pad_snaps(bank: &Bank) -> Vec<Option<PadSnap>> {
+    bank.pads
         .iter()
         .map(|p| {
             p.sample.as_ref().map(|s| PadSnap {
@@ -811,20 +834,12 @@ fn snapshot_pads(bank: &Bank) -> Option<String> {
                 out_point: s.out_point,
             })
         })
-        .collect();
-    serde_json::to_string(&snaps).ok()
+        .collect()
 }
 
-/// Rebuild the bank from a preset's `plugin_state` blob. A missing clip file
+/// Rebuild the bank from a preset's pad snapshots. A missing clip file
 /// clears its pad and keeps going — one moved file must not kill the set.
-fn restore_pads(bank: &mut Bank, blob: &str) {
-    let snaps: Vec<Option<PadSnap>> = match serde_json::from_str(blob) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("VP-404: preset pad state unreadable: {e}");
-            return;
-        }
-    };
+fn restore_pads(bank: &mut Bank, snaps: Vec<Option<PadSnap>>) {
     for (i, snap) in snaps.into_iter().enumerate() {
         let Some(pad) = bank.pads.get_mut(i) else { break };
         let Some(s) = snap else {

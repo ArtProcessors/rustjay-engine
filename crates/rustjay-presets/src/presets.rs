@@ -157,10 +157,14 @@ impl Preset {
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let metadata = std::fs::metadata(path)?;
-        // Limit file size to mitigate stack-overflow DoS from deeply nested JSON.
-        if metadata.len() > 65_536 {
+        // Bound file size as DoS mitigation (depth is separately bounded by
+        // serde_json's recursion limit). 4 MiB, not 64 KiB: presets carry the
+        // app's plugin_state blob (vp404 pads + sequencer), and the old cap
+        // silently dropped saved presets on rescan once blobs grew.
+        const MAX_PRESET_BYTES: u64 = 4 * 1024 * 1024;
+        if metadata.len() > MAX_PRESET_BYTES {
             return Err(anyhow::anyhow!(
-                "Preset file too large: {} bytes (max 64 KiB)",
+                "Preset file too large: {} bytes (max {MAX_PRESET_BYTES})",
                 metadata.len()
             ));
         }
