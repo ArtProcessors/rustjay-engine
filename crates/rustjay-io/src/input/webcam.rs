@@ -89,8 +89,13 @@ impl WebcamCapture {
                     Ok(frame) => {
                         let buffer = frame.buffer();
 
-                        // Convert YUY2 to BGRA
-                        let yuyv_data = buffer.to_vec();
+                        // Convert YUY2 to BGRA.  v4l2loopback (and some UVC
+                        // drivers) page-align the frame buffer, so the raw
+                        // buffer can exceed width*height*2 — the tail is
+                        // padding, not pixels.  Decode only the real frame.
+                        let raw = buffer.to_vec();
+                        let frame_len = (actual_width * actual_height * 2) as usize;
+                        let yuyv_data = &raw[..frame_len.min(raw.len())];
                         let mut bgra_data =
                             Vec::with_capacity((actual_width * actual_height * 4) as usize);
 
@@ -266,6 +271,40 @@ fn ensure_camera_authorized() -> bool {
 // Camera open with multi-strategy fallback
 // ---------------------------------------------------------------------------
 
+/// If `index` is a v4l2loopback device with a producer-pinned YUYV format, build
+/// an exact `RequestedFormat` for it.  Returns None for real cameras, and for
+/// idle loopbacks that no producer has configured yet.
+#[cfg(target_os = "linux")]
+fn loopback_exact_format(index: &CameraIndex) -> Option<RequestedFormat> {
+    use v4l::video::Capture as _;
+
+    let n = match index {
+        CameraIndex::Index(n) => *n,
+        _ => return None,
+    };
+    let device = v4l::Device::with_path(format!("/dev/video{n}")).ok()?;
+    let caps = device.query_caps().ok()?;
+    if !caps.driver.contains("loopback") {
+        return None;
+    }
+    let fmt = device.format().ok()?;
+    if fmt.width == 0 || fmt.height == 0 || fmt.fourcc != v4l::FourCC::new(b"YUYV") {
+        return None;
+    }
+    log::info!(
+        "[Webcam] /dev/video{n} is v4l2loopback pinned at {}x{} YUYV",
+        fmt.width,
+        fmt.height
+    );
+    Some(RequestedFormat::new::<YuyvFormat>(
+        RequestedFormatType::Exact(CameraFormat::new(
+            Resolution::new(fmt.width, fmt.height),
+            FrameFormat::YUYV,
+            30,
+        )),
+    ))
+}
+
 /// Try to open a camera with progressively more permissive format strategies.
 ///
 /// AVFoundation (macOS) rejects `lockForConfiguration` when a specific format
@@ -274,6 +313,19 @@ fn ensure_camera_authorized() -> bool {
 fn try_open_camera(index: CameraIndex) -> anyhow::Result<Camera> {
     if !ensure_camera_authorized() {
         return Err(anyhow::anyhow!("Camera access not authorized. Grant access in System Settings > Privacy & Security > Camera."));
+    }
+
+    // Strategy 0 (Linux): a v4l2loopback device already has a producer-pinned
+    // format.  nokhwa sizes its read buffer by the *requested* format, and the
+    // loopback rejects S_FMT changes while a producer is attached — so any
+    // other request makes every read() fail with EINVAL.  Request it exactly.
+    #[cfg(target_os = "linux")]
+    if let Some(fmt) = loopback_exact_format(&index) {
+        log::info!("[Webcam] Trying loopback-pinned format...");
+        if let Ok(cam) = try_create_camera(&index, fmt) {
+            log::info!("[Webcam] Success with loopback-pinned format");
+            return Ok(cam);
+        }
     }
 
     // Strategy 1: Let the camera decide (no format constraint)
