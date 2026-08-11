@@ -64,7 +64,8 @@ jobs:
             "include": [
               {"app": "cuepool", "display": "CuePool",
                "manifest": "--manifest-path examples/cuepool/Cargo.toml",
-               "target_dir": "examples/cuepool/target", "ffmpeg": true},
+               "target_dir": "examples/cuepool/target", "ffmpeg": true,
+               "file_ext": "qproj"},
               {"app": "vjarda", "ffmpeg": true, "ndi": true},
               {"app": "vp404", "display": "VP-404", "ndi": true},
               {"app": "shaderglass", "display": "ShaderGlass", "ndi": true},
@@ -276,10 +277,13 @@ jobs:
             Copy-Item "$env:NDI_SDK_DIR\Bin\x64\Processing.NDI.Lib.x64.dll" $dist
           }
           Compress-Archive -Path "$dist\*" -DestinationPath "out\$app-windows-x86_64.zip"
+          # Optional Explorer file association (e.g. .qproj -> CuePool).
+          $extArgs = @()
+          if ('${{ matrix.file_ext }}') { $extArgs = @('-FileExt', '${{ matrix.file_ext }}') }
           .github\scripts\make-msi.ps1 -Name $display -Version $env:VERSION `
             -SourceDir $dist -Exe "$app.exe" `
             -Icon "examples\$app\packaging\icon.ico" `
-            -Out "out\$app-windows-x86_64.msi"
+            -Out "out\$app-windows-x86_64.msi" @extArgs
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
