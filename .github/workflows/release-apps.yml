@@ -278,8 +278,10 @@ jobs:
           }
           Compress-Archive -Path "$dist\*" -DestinationPath "out\$app-windows-x86_64.zip"
           # Optional Explorer file association (e.g. .qproj -> CuePool).
-          $extArgs = @()
-          if ('${{ matrix.file_ext }}') { $extArgs = @('-FileExt', '${{ matrix.file_ext }}') }
+          # Hashtable splat: array splats bind positionally, which assigns the
+          # '-FileExt' string itself to the FileExt slot and errors on its value.
+          $extArgs = @{}
+          if ('${{ matrix.file_ext }}') { $extArgs['FileExt'] = '${{ matrix.file_ext }}' }
           .github\scripts\make-msi.ps1 -Name $display -Version $env:VERSION `
             -SourceDir $dist -Exe "$app.exe" `
             -Icon "examples\$app\packaging\icon.ico" `
