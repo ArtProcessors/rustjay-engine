@@ -3,8 +3,9 @@
 ## Scope
 
 Upgrade only the nested `examples/cuepool` workspace from CPAL 0.15.3 to
-0.18.1. CuePool owns its CPAL dependency and exposes no CPAL types across the
-workspace seam, so the root workspace and `rustjay-audio` remain unchanged.
+0.18.1. The root workspace already uses CPAL 0.17. CuePool owns its CPAL
+dependency and exposes no CPAL types across the workspace seam, so the root
+workspace and `rustjay-audio` remain unchanged.
 
 ## Implementation
 
@@ -12,7 +13,10 @@ Keep the output-selection and conversion structure introduced in #71. Rank
 supported formats as F32, I32, I24, then I16, and route I24 callbacks through
 the existing generic `render_converted` path using CPAL's four-byte `I24`
 in-memory sample type. CPAL handles packing those samples into native three-byte
-ASIO buffers.
+ASIO buffers. Clamp only I24 conversion inputs to its representable range so
+full-scale and over-range mix samples saturate rather than wrap. If a runtime
+ASIO buffer resize exceeds the preallocated conversion scratch buffer, keep the
+safe silence fallback and log the first occurrence for that stream.
 
 Adapt only the CPAL 0.18 API changes used by `cuepool-audio`: unified errors,
 device descriptions, the `SampleRate` alias, and by-value stream configs.
