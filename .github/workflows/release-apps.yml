@@ -6,6 +6,7 @@ name: Release Apps
 #   Linux  -> .tar.gz
 #
 # Trigger: push a tag like `apps-v0.1.0`, or run manually (workflow_dispatch).
+# The tag groups app releases; each package's version comes from its Cargo manifest.
 # A manual run builds from the dispatched ref; pick a single app to skip the rest
 # of the matrix. With `release_tag` empty it's a dry run (artifacts only); set it
 # to an existing apps-v* tag to re-release — same-name assets on that release are
@@ -193,15 +194,12 @@ jobs:
           "APRILTAG_SYS_WINDOWS_PTHREAD_INCLUDE_DIR=$vcpkg\include"           >> $env:GITHUB_ENV
           "APRILTAG_SYS_WINDOWS_PTHREAD_STATIC_LIB=$vcpkg\lib\pthreadVC3.lib" >> $env:GITHUB_ENV
 
-      - name: Version from tag
+      - name: Build identity from Cargo and Git
         shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          tag="${RELEASE_TAG:-$GITHUB_REF_NAME}"
-          v="${tag#apps-v}"
-          [[ "$tag" == apps-v* ]] || v=0.0.0
-          echo "VERSION=$v" >> "$GITHUB_ENV"
+          package_id="$(cargo pkgid ${{ matrix.manifest }} -p ${{ matrix.app }})"
+          echo "VERSION=${package_id##*#}" >> "$GITHUB_ENV"
+          echo "CUEPOOL_BUILD_ID=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --locked ${{ matrix.manifest }} -p ${{ matrix.app }} --all-features
