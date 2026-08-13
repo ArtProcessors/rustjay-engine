@@ -5,7 +5,9 @@ standalone CuePool workspace under `examples/cuepool`.
 
 ## Workspace boundary
 
-- Run Cargo commands from `examples/cuepool`, not the repository root.
+- Run Cargo commands from `examples/cuepool`, or pass
+  `--manifest-path examples/cuepool/Cargo.toml` from the repository root. Do
+  not invoke the repository-root workspace and expect it to include CuePool.
 - Keep CuePool dependencies in this workspace's `Cargo.toml`.
 - The intentional dependency across the nested-workspace boundary is
   `rustjay-lighting`; do not introduce another engine-crate dependency without
@@ -54,3 +56,8 @@ cargo check --workspace
 
 Hardware-dependent audio, video, MIDI, and lighting behavior needs a short
 manual verification note when automated coverage cannot exercise it.
+
+On Windows, building CuePool from source requires FFmpeg development headers
+and import libraries discoverable through vcpkg or `pkg-config`. Runtime DLLs
+alone are insufficient, and a vcpkg checkout must also have the FFmpeg port
+installed for the target triplet.

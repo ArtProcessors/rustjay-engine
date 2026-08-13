@@ -13,6 +13,22 @@ cd examples/cuepool
 cargo run --release
 ```
 
+Equivalently, from the repository root:
+
+```sh
+cargo run --manifest-path examples/cuepool/Cargo.toml --release --package cuepool --bin cuepool
+```
+
+### Windows build prerequisite
+
+CuePool links to FFmpeg through `ffmpeg-next`. Building from source therefore
+requires FFmpeg development files (headers and import libraries) for the MSVC
+target, discoverable through either vcpkg or `pkg-config`. Runtime FFmpeg DLLs
+alone are not sufficient, and a vcpkg checkout must also have the FFmpeg port
+installed for the target triplet. Missing development files typically surface
+as `Could not find ffmpeg with vcpkg` followed by a failed `pkg-config` probe for
+`libavutil`.
+
 ## Window layout
 
 | Area | What it is |
