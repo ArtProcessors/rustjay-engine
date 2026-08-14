@@ -33,6 +33,14 @@ Source: https://github.com/DietrichGebert/ponytail
 
 ## Agent skills
 
+### CuePool versioning
+
+When changing CuePool (`examples/cuepool/`), bump `workspace.package.version` in
+`examples/cuepool/Cargo.toml` whenever the change affects users: patch for fixes,
+minor for backward-compatible features, and major for breaking changes. Keep
+`examples/cuepool/Cargo.lock` in sync. Pure documentation, test, or internal
+refactoring changes do not need a bump.
+
 ### Issue tracker
 
 Issues live in GitHub Issues (`BlueJayLouche/rustjay-engine`), using the `gh` CLI. External PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
