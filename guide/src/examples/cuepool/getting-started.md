@@ -17,11 +17,13 @@ On Windows, `package-windows.ps1` builds and bundles the app with its FFmpeg
 DLLs. You can also open a project straight from the command line:
 
 ```sh
-cargo run --release -- MyShow.qproj
+cargo run --release -- --project MyShow.qproj
 ```
 
-CuePool is single-instance: launching a second copy while one is running
-exits immediately.
+The legacy positional form, `cuepool MyShow.qproj`, remains supported. CuePool
+is single-instance: launching a second copy while one is running shows an error
+and exits with a nonzero status; it does not forward the project to the running
+instance.
 
 ## Your first show
 
