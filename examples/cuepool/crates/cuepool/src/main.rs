@@ -226,6 +226,7 @@ struct App {
     show_engine: ShowEngine,
     engine_epoch: Instant,
     window_ids: Option<WindowIds>,
+    terminal_error: Option<&'static str>,
 
     // ── playback adapter state ──
     paused: bool,
@@ -357,7 +358,6 @@ impl App {
         proxy: winit::event_loop::EventLoopProxy<AppEvent>,
         zero_copy: ZeroCopyAvailability,
         cuepool: CuePoolApp,
-        log_file: String,
     ) -> Self {
         let show_engine = ShowEngine::new(cuepool.state().clone(), None);
         // Protocol settings from project settings (fallback to defaults)
@@ -461,7 +461,6 @@ impl App {
             d.app_version = cuepool_gui::build_identity();
             d.os = std::env::consts::OS.into();
             d.arch = std::env::consts::ARCH.into();
-            d.log_file = log_file;
             d.gpu_name = info.name;
             d.gpu_backend = format!("{:?}", info.backend);
             d.gpu_driver = info.driver;
@@ -544,6 +543,7 @@ impl App {
             show_engine,
             engine_epoch: Instant::now(),
             window_ids: None,
+            terminal_error: None,
             event_loop_proxy: proxy,
             current_text_qid: None,
             output_windows: Vec::new(),
@@ -3052,7 +3052,9 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::DeviceLost => {
-                log::error!("GPU device lost; CuePool cannot recover without a restart — exiting");
+                let error = "GPU device lost; CuePool cannot recover without a restart";
+                log::error!("{error} — exiting");
+                self.terminal_error = Some(error);
                 event_loop.exit();
             }
         }
@@ -3747,6 +3749,7 @@ fn run(log_file: String) -> anyhow::Result<()> {
     } else {
         log::info!(target: PERSIST_TARGET, "CuePool startup project load result=not_requested");
     }
+    cuepool.state().lock_unpoisoned().diagnostics.log_file = log_file;
 
     // 1 ms timer resolution so WaitUntil/sleep don't quantize to 15.6 ms.
     #[cfg(windows)]
@@ -3825,7 +3828,6 @@ fn run(log_file: String) -> anyhow::Result<()> {
         proxy,
         zero_copy,
         cuepool,
-        log_file,
     );
 
     // Ctrl-C / SIGTERM handler for graceful emergency save
@@ -3866,6 +3868,9 @@ fn run(log_file: String) -> anyhow::Result<()> {
     #[cfg(windows)]
     win_timer::release();
 
+    if let Some(error) = app.terminal_error {
+        anyhow::bail!("{error}");
+    }
     Ok(())
 }
 

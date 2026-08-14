@@ -247,6 +247,40 @@ fn backup_path(path: &Path, index: usize) -> PathBuf {
     name.into()
 }
 
+fn bounded_message(arguments: std::fmt::Arguments<'_>) -> String {
+    struct BoundedWriter {
+        message: String,
+        truncated: bool,
+    }
+
+    impl std::fmt::Write for BoundedWriter {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let remaining = MAX_MESSAGE_BYTES.saturating_sub(self.message.len());
+            if value.len() <= remaining {
+                self.message.push_str(value);
+            } else {
+                let mut end = remaining;
+                while !value.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.message.push_str(&value[..end]);
+                self.truncated = true;
+            }
+            Ok(())
+        }
+    }
+
+    let mut writer = BoundedWriter {
+        message: String::new(),
+        truncated: false,
+    };
+    let _ = std::fmt::write(&mut writer, arguments);
+    if writer.truncated {
+        writer.message.push_str("… [truncated]");
+    }
+    writer.message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,38 +362,4 @@ mod tests {
         assert!(message.ends_with("… [truncated]"));
         assert!(message.len() <= MAX_MESSAGE_BYTES + "… [truncated]".len());
     }
-}
-
-fn bounded_message(arguments: std::fmt::Arguments<'_>) -> String {
-    struct BoundedWriter {
-        message: String,
-        truncated: bool,
-    }
-
-    impl std::fmt::Write for BoundedWriter {
-        fn write_str(&mut self, value: &str) -> std::fmt::Result {
-            let remaining = MAX_MESSAGE_BYTES.saturating_sub(self.message.len());
-            if value.len() <= remaining {
-                self.message.push_str(value);
-            } else {
-                let mut end = remaining;
-                while !value.is_char_boundary(end) {
-                    end -= 1;
-                }
-                self.message.push_str(&value[..end]);
-                self.truncated = true;
-            }
-            Ok(())
-        }
-    }
-
-    let mut writer = BoundedWriter {
-        message: String::new(),
-        truncated: false,
-    };
-    let _ = std::fmt::write(&mut writer, arguments);
-    if writer.truncated {
-        writer.message.push_str("… [truncated]");
-    }
-    writer.message
 }
