@@ -1,7 +1,9 @@
 use crate::FramePool;
 use crate::ZeroCopyAvailability;
 use crate::frame::{BitDepth, ChromaSubsample, VideoFrame, YuvPlane};
+use ffmpeg_next::Packet;
 use ffmpeg_next::{codec, color, ffi, format, frame, media::Type, software::scaling, threading};
+use hap_parser::{HapFrame, TextureFormat as HapFormat};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -150,8 +152,690 @@ unsafe extern "C" fn hw_get_format(
     }
 }
 
-/// Wraps an FFmpeg video stream decoder and produces `VideoFrame`s.
+enum VideoBackend {
+    Ffmpeg(FfmpegVideoSource),
+    Hap(HapVideoSource),
+}
+
+/// Chooses GPU-native HAP packet decoding when available, otherwise delegates
+/// to CuePool's existing FFmpeg decoder.
 pub struct VideoSource {
+    path: String,
+    frame_pool: Arc<FramePool>,
+    fallback_decode_time: Duration,
+    backend: VideoBackend,
+}
+
+enum HapProbe {
+    NotHap(format::context::Input),
+    Native(Box<HapVideoSource>),
+    Fallback(String),
+}
+
+enum HapRead {
+    Frame(VideoFrame),
+    Eof,
+    Fallback {
+        reason: String,
+        pts: f64,
+        decode_time: Duration,
+    },
+}
+
+#[derive(Debug)]
+enum HapPacketError {
+    Unsupported(String),
+    Corrupt(String),
+}
+
+impl std::fmt::Display for HapPacketError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(reason) | Self::Corrupt(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+struct HapVideoSource {
+    ictx: format::context::Input,
+    stream_index: usize,
+    time_base: f64,
+    width: u32,
+    height: u32,
+    frame_duration: f64,
+    max_texture_dimension_2d: u32,
+    next_pts: f64,
+    pending: Option<(Packet, HapFrame, Duration)>,
+    last_timings: VideoFrameTimings,
+    corrupt_warned: bool,
+}
+
+impl VideoSource {
+    pub fn open(path: &str) -> anyhow::Result<Self> {
+        Self::open_with_pool(path, Arc::new(FramePool::new(0)))
+    }
+
+    pub fn open_with_pool(path: &str, frame_pool: Arc<FramePool>) -> anyhow::Result<Self> {
+        Self::open_with_pool_and_hap(
+            path,
+            frame_pool,
+            Some(wgpu::Limits::default().max_texture_dimension_2d),
+        )
+    }
+
+    pub fn open_with_pool_and_hap(
+        path: &str,
+        frame_pool: Arc<FramePool>,
+        native_hap_max_dimension: Option<u32>,
+    ) -> anyhow::Result<Self> {
+        Self::open_backend(path, frame_pool, None, native_hap_max_dimension)
+    }
+
+    pub fn open_with_zero_copy(
+        path: &str,
+        frame_pool: Arc<FramePool>,
+        availability: ZeroCopyAvailability,
+    ) -> anyhow::Result<Self> {
+        Self::open_with_acceleration(
+            path,
+            frame_pool,
+            availability,
+            Some(wgpu::Limits::default().max_texture_dimension_2d),
+        )
+    }
+
+    pub fn open_with_acceleration(
+        path: &str,
+        frame_pool: Arc<FramePool>,
+        availability: ZeroCopyAvailability,
+        native_hap_max_dimension: Option<u32>,
+    ) -> anyhow::Result<Self> {
+        Self::open_backend(
+            path,
+            frame_pool,
+            Some(availability),
+            native_hap_max_dimension,
+        )
+    }
+
+    fn open_backend(
+        path: &str,
+        frame_pool: Arc<FramePool>,
+        availability: Option<ZeroCopyAvailability>,
+        native_hap_max_dimension: Option<u32>,
+    ) -> anyhow::Result<Self> {
+        let unavailable = hap_unavailable_reason(
+            std::env::var("QPLAYER_NO_HWACCEL").as_deref() == Ok("1"),
+            native_hap_max_dimension.is_some(),
+        );
+        match HapVideoSource::probe(
+            path,
+            unavailable,
+            native_hap_max_dimension.unwrap_or_default(),
+        )? {
+            HapProbe::Native(source) => Ok(Self {
+                path: path.to_owned(),
+                frame_pool,
+                fallback_decode_time: Duration::ZERO,
+                backend: VideoBackend::Hap(*source),
+            }),
+            HapProbe::Fallback(reason) => {
+                log::warn!("Video decode: {reason}; using FFmpeg software fallback");
+                let source = FfmpegVideoSource::open_with_options(
+                    path,
+                    Arc::clone(&frame_pool),
+                    OpenOptions::software(Some(reason)),
+                    None,
+                )?;
+                Ok(Self {
+                    path: path.to_owned(),
+                    frame_pool,
+                    fallback_decode_time: Duration::ZERO,
+                    backend: VideoBackend::Ffmpeg(source),
+                })
+            }
+            HapProbe::NotHap(input) => {
+                let source = FfmpegVideoSource::open_with_options(
+                    path,
+                    Arc::clone(&frame_pool),
+                    OpenOptions::hardware(availability),
+                    Some(input),
+                )?;
+                Ok(Self {
+                    path: path.to_owned(),
+                    frame_pool,
+                    fallback_decode_time: Duration::ZERO,
+                    backend: VideoBackend::Ffmpeg(source),
+                })
+            }
+        }
+    }
+
+    pub fn read_frame(&mut self) -> Option<VideoFrame> {
+        self.read_frame_with_cancel(None)
+    }
+
+    pub fn read_frame_cancellable(
+        &mut self,
+        stop_flag: &std::sync::atomic::AtomicBool,
+    ) -> Option<VideoFrame> {
+        self.read_frame_with_cancel(Some(stop_flag))
+    }
+
+    fn read_frame_with_cancel(
+        &mut self,
+        stop_flag: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Option<VideoFrame> {
+        loop {
+            if stop_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                return None;
+            }
+            let read = match &mut self.backend {
+                VideoBackend::Ffmpeg(source) => {
+                    let frame = source.read_frame();
+                    source.last_timings.decode += std::mem::take(&mut self.fallback_decode_time);
+                    return frame;
+                }
+                VideoBackend::Hap(source) => source.read_frame(stop_flag),
+            };
+            match read {
+                HapRead::Frame(frame) => return Some(frame),
+                HapRead::Eof => return None,
+                HapRead::Fallback {
+                    reason,
+                    pts,
+                    decode_time,
+                } => {
+                    log::warn!("Video decode: {reason}; reopening in FFmpeg software at {pts:.3}s");
+                    let mut source = match FfmpegVideoSource::open_with_options(
+                        &self.path,
+                        Arc::clone(&self.frame_pool),
+                        OpenOptions::software(Some(reason)),
+                        None,
+                    ) {
+                        Ok(source) => source,
+                        Err(error) => {
+                            log::error!("Video decode: mid-stream software reopen failed: {error}");
+                            return None;
+                        }
+                    };
+                    if pts > 0.0
+                        && let Err(error) = source.seek_before(pts)
+                    {
+                        log::error!("Video decode: mid-stream software seek failed: {error}");
+                        return None;
+                    }
+                    self.fallback_decode_time += decode_time;
+                    self.backend = VideoBackend::Ffmpeg(source);
+                }
+            }
+        }
+    }
+
+    pub fn seek_before(&mut self, secs: f64) -> anyhow::Result<()> {
+        match &mut self.backend {
+            VideoBackend::Ffmpeg(source) => source.seek_before(secs),
+            VideoBackend::Hap(source) => source.seek_before(secs),
+        }
+    }
+
+    pub fn duration_secs(&self) -> Option<f64> {
+        match &self.backend {
+            VideoBackend::Ffmpeg(source) => source.duration_secs(),
+            VideoBackend::Hap(source) => source.duration_secs(),
+        }
+    }
+
+    pub fn decode_path(&self) -> &'static str {
+        match &self.backend {
+            VideoBackend::Ffmpeg(source) => source.decode_path(),
+            VideoBackend::Hap(_) => "hap gpu-native",
+        }
+    }
+
+    pub fn width(&self) -> u32 {
+        match &self.backend {
+            VideoBackend::Ffmpeg(source) => source.width(),
+            VideoBackend::Hap(source) => source.width,
+        }
+    }
+
+    pub fn height(&self) -> u32 {
+        match &self.backend {
+            VideoBackend::Ffmpeg(source) => source.height(),
+            VideoBackend::Hap(source) => source.height,
+        }
+    }
+
+    pub fn dst_width(&self) -> u32 {
+        self.width()
+    }
+    pub fn dst_height(&self) -> u32 {
+        self.height()
+    }
+
+    pub fn last_timings(&self) -> VideoFrameTimings {
+        match &self.backend {
+            VideoBackend::Ffmpeg(source) => source.last_timings(),
+            VideoBackend::Hap(source) => source.last_timings,
+        }
+    }
+
+    pub fn fallback_reason(&self) -> Option<&str> {
+        match &self.backend {
+            VideoBackend::Ffmpeg(source) => source.fallback_reason(),
+            VideoBackend::Hap(_) => None,
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn fallback_zero_copy(&mut self, reason: String) -> bool {
+        match &mut self.backend {
+            VideoBackend::Ffmpeg(source) => source.fallback_zero_copy(reason),
+            VideoBackend::Hap(_) => false,
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn mark_zero_copy_engaged(&mut self) {
+        if let VideoBackend::Ffmpeg(source) = &mut self.backend {
+            source.mark_zero_copy_engaged();
+        }
+    }
+}
+
+fn hap_unavailable_reason(no_hw_accel: bool, allow_native_hap: bool) -> Option<&'static str> {
+    if no_hw_accel {
+        Some("GPU-native HAP disabled by QPLAYER_NO_HWACCEL=1")
+    } else if !allow_native_hap {
+        Some("GPU-native HAP unavailable: GPU device lacks BC texture compression")
+    } else {
+        None
+    }
+}
+
+const HAP_COMPRESSOR_NONE: u8 = 0xA0;
+const HAP_COMPRESSOR_SNAPPY: u8 = 0xB0;
+const HAP_COMPRESSOR_COMPLEX: u8 = 0xC0;
+const HAP_MULTI_IMAGE: u8 = 0x0D;
+const HAP_DECODE_INSTRUCTIONS: u8 = 0x01;
+const HAP_CHUNK_COMPRESSORS: u8 = 0x02;
+const HAP_CHUNK_SIZES: u8 = 0x03;
+const HAP_CHUNK_OFFSETS: u8 = 0x04;
+const HAP_CHUNK_NONE: u8 = 0x0A;
+const HAP_CHUNK_SNAPPY: u8 = 0x0B;
+
+fn hap_section(data: &[u8]) -> Result<(u8, &[u8], usize), String> {
+    if data.len() < 4 {
+        return Err(format!(
+            "truncated HAP section header: have {} bytes",
+            data.len()
+        ));
+    }
+    let (body_len, header_len) = if data[..3] == [0, 0, 0] {
+        if data.len() < 8 {
+            return Err(format!(
+                "truncated extended HAP section header: have {} bytes",
+                data.len()
+            ));
+        }
+        (
+            u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize,
+            8usize,
+        )
+    } else {
+        (
+            usize::from(data[0]) | (usize::from(data[1]) << 8) | (usize::from(data[2]) << 16),
+            4usize,
+        )
+    };
+    let end = header_len
+        .checked_add(body_len)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| {
+            format!(
+                "truncated HAP section body: need {} bytes, have {}",
+                header_len.saturating_add(body_len),
+                data.len()
+            )
+        })?;
+    Ok((data[3], &data[header_len..end], end))
+}
+
+/// Read Snappy's leading uncompressed-length varint without allocating its
+/// declared output. `hap-parser` allocates from this value, so the HAP frame's
+/// exact BC byte count must be checked first.
+fn snappy_declared_len(data: &[u8]) -> Result<usize, String> {
+    let mut value = 0u32;
+    for shift in (0..=28).step_by(7) {
+        let byte = *data
+            .get(shift / 7)
+            .ok_or_else(|| "truncated Snappy length".to_string())?;
+        if shift == 28 && byte > 0x0F {
+            return Err("invalid Snappy length".into());
+        }
+        value |= u32::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value as usize);
+        }
+    }
+    Err("invalid Snappy length".into())
+}
+
+fn table_u32(table: &[u8], index: usize, name: &str) -> Result<usize, String> {
+    let start = index
+        .checked_mul(4)
+        .ok_or_else(|| format!("HAP {name} table index overflow"))?;
+    let bytes = table
+        .get(start..start + 4)
+        .ok_or_else(|| format!("truncated HAP {name} table"))?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
+}
+
+fn chunked_declared_len(data: &[u8], expected: usize) -> Result<usize, String> {
+    let (section_type, instructions, frame_data_start) = hap_section(data)?;
+    if section_type != HAP_DECODE_INSTRUCTIONS {
+        return Err(format!(
+            "expected HAP decode instructions, got section 0x{section_type:02X}"
+        ));
+    }
+    let frame_data = &data[frame_data_start..];
+    let (mut compressors, mut sizes, mut offsets) = (&[][..], &[][..], None);
+    let mut position = 0;
+    let mut instruction_sections = 0usize;
+    while position < instructions.len() {
+        instruction_sections += 1;
+        if instruction_sections > 16 {
+            return Err("HAP decode instructions contain too many sections".into());
+        }
+        let (section_type, body, consumed) = hap_section(&instructions[position..])?;
+        match section_type {
+            HAP_CHUNK_COMPRESSORS => compressors = body,
+            HAP_CHUNK_SIZES => sizes = body,
+            HAP_CHUNK_OFFSETS => offsets = Some(body),
+            _ => {}
+        }
+        position += consumed;
+    }
+    if compressors.len() > 4_096 {
+        return Err(format!(
+            "HAP frame declares too many chunks: {} (limit 4096)",
+            compressors.len()
+        ));
+    }
+
+    let mut total = 0usize;
+    let mut running_offset = 0usize;
+    for (index, compressor) in compressors.iter().copied().enumerate() {
+        let size = table_u32(sizes, index, "chunk-size")?;
+        let offset = match offsets {
+            Some(table) => table_u32(table, index, "chunk-offset")?,
+            None => running_offset,
+        };
+        let end = offset
+            .checked_add(size)
+            .filter(|end| *end <= frame_data.len())
+            .ok_or_else(|| "HAP chunk runs past the packet".to_string())?;
+        let chunk = &frame_data[offset..end];
+        let decoded = match compressor {
+            HAP_CHUNK_NONE => chunk.len(),
+            HAP_CHUNK_SNAPPY => snappy_declared_len(chunk)?,
+            other => return Err(format!("unsupported HAP chunk compressor 0x{other:02X}")),
+        };
+        total = total
+            .checked_add(decoded)
+            .filter(|total| *total <= expected)
+            .ok_or_else(|| format!("HAP chunks declare more than the expected {expected} bytes"))?;
+        running_offset = running_offset
+            .checked_add(size)
+            .ok_or_else(|| "HAP chunk offset overflow".to_string())?;
+    }
+    Ok(total)
+}
+
+fn validate_hap_packet(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    max_texture_dimension_2d: u32,
+) -> Result<HapFormat, HapPacketError> {
+    if width == 0 || height == 0 {
+        return Err(HapPacketError::Corrupt("zero stream dimensions".into()));
+    }
+    if width > max_texture_dimension_2d || height > max_texture_dimension_2d {
+        return Err(HapPacketError::Unsupported(format!(
+            "dimensions {width}x{height} exceed the device texture limit {max_texture_dimension_2d}"
+        )));
+    }
+    let (section_type, body, _) = hap_section(data).map_err(HapPacketError::Corrupt)?;
+    if section_type == HAP_MULTI_IMAGE {
+        return Err(HapPacketError::Unsupported(
+            "HAP Q Alpha is not supported by the GPU-native path".into(),
+        ));
+    }
+    let format = hap_parser::detect_format(data)
+        .map_err(|error| HapPacketError::Unsupported(error.to_string()))?;
+    if !matches!(
+        format,
+        HapFormat::RgbDxt1 | HapFormat::RgbaDxt5 | HapFormat::YcoCgDxt5
+    ) {
+        return Err(HapPacketError::Unsupported(format!(
+            "unsupported HAP texture format: {format:?}"
+        )));
+    }
+    let expected = format.frame_size(width, height);
+    let declared = match section_type & 0xF0 {
+        HAP_COMPRESSOR_NONE => body.len(),
+        HAP_COMPRESSOR_SNAPPY => snappy_declared_len(body).map_err(HapPacketError::Corrupt)?,
+        HAP_COMPRESSOR_COMPLEX => {
+            chunked_declared_len(body, expected).map_err(HapPacketError::Corrupt)?
+        }
+        other => {
+            return Err(HapPacketError::Unsupported(format!(
+                "unsupported HAP compressor 0x{other:02X}"
+            )));
+        }
+    };
+    if declared != expected {
+        return Err(HapPacketError::Corrupt(format!(
+            "compressed size mismatch for {width}x{height} {format:?}: declared {declared}, expected {expected}"
+        )));
+    }
+    Ok(format)
+}
+
+impl HapVideoSource {
+    fn probe(
+        path: &str,
+        unavailable: Option<&str>,
+        max_texture_dimension_2d: u32,
+    ) -> anyhow::Result<HapProbe> {
+        ffmpeg_next::init()?;
+        let mut ictx = format::input(path)?;
+        let (stream_index, time_base, width, height, frame_duration, is_hap) = {
+            let input = ictx
+                .streams()
+                .best(Type::Video)
+                .ok_or_else(|| anyhow::anyhow!("no video stream found"))?;
+            let parameters = input.parameters();
+            let is_hap = parameters.id() == codec::Id::HAP;
+            let (width, height) =
+                unsafe { ((*parameters.as_ptr()).width, (*parameters.as_ptr()).height) };
+            let rate = f64::from(input.avg_frame_rate());
+            (
+                input.index(),
+                f64::from(input.time_base()),
+                u32::try_from(width).unwrap_or(0),
+                u32::try_from(height).unwrap_or(0),
+                if rate > 0.0 { 1.0 / rate } else { 0.0 },
+                is_hap,
+            )
+        };
+        if !is_hap {
+            return Ok(HapProbe::NotHap(ictx));
+        }
+        if let Some(reason) = unavailable {
+            return Ok(HapProbe::Fallback(reason.to_owned()));
+        }
+        if width == 0 || height == 0 {
+            return Ok(HapProbe::Fallback(
+                "GPU-native HAP first packet invalid: zero stream dimensions".into(),
+            ));
+        }
+        if width > max_texture_dimension_2d || height > max_texture_dimension_2d {
+            return Ok(HapProbe::Fallback(format!(
+                "GPU-native HAP dimensions {width}x{height} exceed the device texture limit {max_texture_dimension_2d}"
+            )));
+        }
+        let started = Instant::now();
+        let Some(packet) = ictx
+            .packets()
+            .find_map(|(stream, packet)| (stream.index() == stream_index).then_some(packet))
+        else {
+            return Ok(HapProbe::Fallback(
+                "GPU-native HAP first packet unavailable".into(),
+            ));
+        };
+        let parsed = match Self::parse_packet(&packet, width, height, max_texture_dimension_2d) {
+            Ok(frame) => frame,
+            Err(error) => {
+                return Ok(HapProbe::Fallback(format!(
+                    "GPU-native HAP first packet invalid: {error}"
+                )));
+            }
+        };
+        log::info!(
+            "Video decode: HAP GPU-native path selected ({:?})",
+            parsed.format
+        );
+        Ok(HapProbe::Native(Box::new(Self {
+            ictx,
+            stream_index,
+            time_base,
+            width,
+            height,
+            frame_duration,
+            max_texture_dimension_2d,
+            next_pts: 0.0,
+            pending: Some((packet, parsed, started.elapsed())),
+            last_timings: VideoFrameTimings::default(),
+            corrupt_warned: false,
+        })))
+    }
+
+    fn parse_packet(
+        packet: &Packet,
+        width: u32,
+        height: u32,
+        max_texture_dimension_2d: u32,
+    ) -> Result<HapFrame, HapPacketError> {
+        let data = packet
+            .data()
+            .ok_or_else(|| HapPacketError::Corrupt("empty packet".into()))?;
+        let expected_format = validate_hap_packet(data, width, height, max_texture_dimension_2d)?;
+        let frame = hap_parser::parse_frame(data)
+            .map_err(|error| HapPacketError::Corrupt(error.to_string()))?;
+        if frame.format != expected_format {
+            return Err(HapPacketError::Corrupt(format!(
+                "HAP texture format changed while parsing: expected {expected_format:?}, got {:?}",
+                frame.format
+            )));
+        }
+        Ok(frame)
+    }
+
+    fn frame_from_packet(&mut self, packet: Packet, parsed: HapFrame) -> VideoFrame {
+        let packet_step = packet.duration() as f64 * self.time_base;
+        let step = if packet_step > 0.0 {
+            packet_step
+        } else {
+            self.frame_duration
+        };
+        let pts = packet
+            .pts()
+            .or(packet.dts())
+            .map(|value| value as f64 * self.time_base)
+            .unwrap_or(self.next_pts);
+        self.next_pts = pts + step.max(0.0);
+        VideoFrame::hap(self.width, self.height, pts, parsed.format, parsed.data)
+    }
+
+    fn read_frame(&mut self, stop_flag: Option<&std::sync::atomic::AtomicBool>) -> HapRead {
+        self.last_timings = VideoFrameTimings::default();
+        loop {
+            if stop_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                return HapRead::Eof;
+            }
+            if let Some((packet, parsed, elapsed)) = self.pending.take() {
+                self.last_timings.decode = elapsed;
+                return HapRead::Frame(self.frame_from_packet(packet, parsed));
+            }
+            let started = Instant::now();
+            let mut next_packet = None;
+            for (stream, packet) in self.ictx.packets() {
+                if stop_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                    return HapRead::Eof;
+                }
+                if stream.index() == self.stream_index {
+                    next_packet = Some(packet);
+                    break;
+                }
+            }
+            let Some(packet) = next_packet else {
+                return HapRead::Eof;
+            };
+            match Self::parse_packet(
+                &packet,
+                self.width,
+                self.height,
+                self.max_texture_dimension_2d,
+            ) {
+                Ok(parsed) => {
+                    self.last_timings.decode += started.elapsed();
+                    return HapRead::Frame(self.frame_from_packet(packet, parsed));
+                }
+                Err(HapPacketError::Unsupported(reason)) => {
+                    self.last_timings.decode += started.elapsed();
+                    let pts = packet
+                        .pts()
+                        .or(packet.dts())
+                        .map(|value| value as f64 * self.time_base)
+                        .unwrap_or(self.next_pts)
+                        .max(0.0);
+                    return HapRead::Fallback {
+                        reason: format!("GPU-native HAP variant changed mid-stream: {reason}"),
+                        pts,
+                        decode_time: self.last_timings.decode,
+                    };
+                }
+                Err(HapPacketError::Corrupt(error)) => {
+                    self.last_timings.decode += started.elapsed();
+                    if !std::mem::replace(&mut self.corrupt_warned, true) {
+                        log::warn!("Video decode: skipping corrupt HAP packet: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn seek_before(&mut self, secs: f64) -> anyhow::Result<()> {
+        let secs = secs.max(0.0);
+        let ts = (secs * f64::from(ffi::AV_TIME_BASE)) as i64;
+        self.ictx.seek(ts, ..ts)?;
+        self.pending = None;
+        self.next_pts = secs;
+        self.corrupt_warned = false;
+        Ok(())
+    }
+
+    fn duration_secs(&self) -> Option<f64> {
+        let duration = self.ictx.duration();
+        (duration > 0).then(|| duration as f64 / f64::from(ffi::AV_TIME_BASE))
+    }
+}
+
+/// The existing FFmpeg pixel decoder, kept as the universal fallback.
+struct FfmpegVideoSource {
     /// Kept so a broken hwaccel can reopen the whole source in software.
     path: String,
     ictx: format::context::Input,
@@ -348,33 +1032,12 @@ enum Decoded {
     ReopenReadback(String),
 }
 
-impl VideoSource {
-    /// Open a video file and initialise the decoder (+ a CPU scaler only if the
-    /// pixel format is not handled natively by the GPU converter).
-    ///
-    /// Frames are produced at the source's **native resolution**; aspect-ratio
-    /// fitting is the canvas's job, so forcing a fixed size here would pre-stretch
-    /// non-matching sources.
-    pub fn open(path: &str) -> anyhow::Result<Self> {
-        Self::open_with_pool(path, Arc::new(FramePool::new(0)))
-    }
-
-    pub fn open_with_pool(path: &str, frame_pool: Arc<FramePool>) -> anyhow::Result<Self> {
-        Self::open_with_options(path, frame_pool, OpenOptions::hardware(None))
-    }
-
-    pub fn open_with_zero_copy(
-        path: &str,
-        frame_pool: Arc<FramePool>,
-        availability: ZeroCopyAvailability,
-    ) -> anyhow::Result<Self> {
-        Self::open_with_options(path, frame_pool, OpenOptions::hardware(Some(availability)))
-    }
-
+impl FfmpegVideoSource {
     fn open_with_options(
         path: &str,
         frame_pool: Arc<FramePool>,
         options: OpenOptions,
+        mut input_context: Option<format::context::Input>,
     ) -> anyhow::Result<Self> {
         let OpenOptions {
             route,
@@ -393,7 +1056,14 @@ impl VideoSource {
         if route == OpenRoute::SoftwareOnly
             || std::env::var("QPLAYER_NO_HWACCEL").as_deref() == Ok("1")
         {
-            return Self::open_with(path, None, frame_pool, no_direct_pool(), fallback_reason);
+            return Self::open_with(
+                path,
+                None,
+                frame_pool,
+                no_direct_pool(),
+                fallback_reason,
+                input_context.take(),
+            );
         }
         for &hw in HW_CANDIDATES {
             #[cfg(windows)]
@@ -409,6 +1079,7 @@ impl VideoSource {
                     Arc::clone(&frame_pool),
                     Some(request.clone()),
                     None,
+                    input_context.take(),
                 ) {
                     Ok(source) => return Ok(source),
                     Err(error) => {
@@ -428,12 +1099,20 @@ impl VideoSource {
                 Arc::clone(&frame_pool),
                 no_direct_pool(),
                 fallback_reason.clone(),
+                input_context.take(),
             ) {
                 Ok(src) => return Ok(src),
                 Err(e) => log::warn!("Video decode: {} unavailable ({e})", hw.2),
             }
         }
-        Self::open_with(path, None, frame_pool, no_direct_pool(), fallback_reason)
+        Self::open_with(
+            path,
+            None,
+            frame_pool,
+            no_direct_pool(),
+            fallback_reason,
+            input_context.take(),
+        )
     }
 
     fn open_with(
@@ -442,10 +1121,14 @@ impl VideoSource {
         frame_pool: Arc<FramePool>,
         _direct_pool: DirectPoolOption,
         fallback_reason: Option<String>,
+        input_context: Option<format::context::Input>,
     ) -> anyhow::Result<Self> {
         ffmpeg_next::init()?;
 
-        let ictx = format::input(path)?;
+        let ictx = match input_context {
+            Some(input) => input,
+            None => format::input(path)?,
+        };
         let input = ictx
             .streams()
             .best(Type::Video)
@@ -782,7 +1465,7 @@ impl VideoSource {
             "Video zero-copy fallback: {}; retrying hardware readback",
             options.fallback_reason.as_deref().unwrap_or_default()
         );
-        match Self::open_with_options(&path, Arc::clone(&self.frame_pool), options) {
+        match Self::open_with_options(&path, Arc::clone(&self.frame_pool), options, None) {
             Ok(source) => {
                 *self = source;
                 true
@@ -816,6 +1499,7 @@ impl VideoSource {
             &path,
             Arc::clone(&self.frame_pool),
             OpenOptions::software(self.fallback_reason.clone()),
+            None,
         ) {
             Ok(src) => {
                 log::warn!("Video decode: hardware broke on first frame, reopened in software");
@@ -904,12 +1588,6 @@ impl VideoSource {
     pub fn height(&self) -> u32 {
         self.height
     }
-    pub fn dst_width(&self) -> u32 {
-        self.dst_width
-    }
-    pub fn dst_height(&self) -> u32 {
-        self.dst_height
-    }
     pub fn last_timings(&self) -> VideoFrameTimings {
         self.last_timings
     }
@@ -921,6 +1599,83 @@ impl VideoSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FramePixels;
+    use hap_qt::{HapFormat as QtHapFormat, HapFrameEncoder, QtHapWriter, VideoConfig};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_MEDIA_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempHap {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TempHap {
+        fn new(format: QtHapFormat, width: u32, height: u32, frames: u32) -> Self {
+            let id = NEXT_MEDIA_ID.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("cuepool-hap-test-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("fixture.mov");
+            let encoder = (!matches!(format, QtHapFormat::HapA | QtHapFormat::Hap7))
+                .then(|| HapFrameEncoder::new(format, width, height).unwrap());
+            let mut writer =
+                QtHapWriter::create(&path, VideoConfig::new(width, height, 50.0, format)).unwrap();
+            for index in 0..frames {
+                let mut rgba = vec![0; (width * height * 4) as usize];
+                for pixel in rgba.chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&[
+                        32 + index as u8,
+                        96,
+                        160,
+                        if format == QtHapFormat::Hap5 {
+                            128
+                        } else {
+                            255
+                        },
+                    ]);
+                }
+                let encoded = match format {
+                    // hap-qt advertises these variants but does not yet encode
+                    // them. A single uncompressed BC block is enough to verify
+                    // CuePool's explicit software-fallback routing.
+                    QtHapFormat::HapA => [vec![8, 0, 0, 0xA1], vec![0; 8]].concat(),
+                    QtHapFormat::Hap7 => [vec![16, 0, 0, 0xAC], vec![0; 16]].concat(),
+                    _ => encoder.as_ref().unwrap().encode(&rgba).unwrap(),
+                };
+                writer.write_frame(&encoded).unwrap();
+            }
+            writer.finalize().unwrap();
+            Self { dir, path }
+        }
+
+        fn with_midstream_alpha() -> Self {
+            let id = NEXT_MEDIA_ID.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("cuepool-hap-test-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("fixture.mov");
+            let encoder = HapFrameEncoder::new(QtHapFormat::Hap1, 8, 8).unwrap();
+            let mut writer =
+                QtHapWriter::create(&path, VideoConfig::new(8, 8, 50.0, QtHapFormat::Hap1))
+                    .unwrap();
+            writer
+                .write_frame(&encoder.encode(&[64; 8 * 8 * 4]).unwrap())
+                .unwrap();
+            writer
+                .write_frame(&[vec![8, 0, 0, 0xA1], vec![0; 8]].concat())
+                .unwrap();
+            writer.finalize().unwrap();
+            Self { dir, path }
+        }
+    }
+
+    impl Drop for TempHap {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 
     #[test]
     fn zero_copy_is_enabled_only_by_exact_opt_in() {
@@ -941,6 +1696,198 @@ mod tests {
                 ZeroCopyPreference::Disabled
             );
         }
+    }
+
+    #[test]
+    fn hap_disable_reasons_are_explicit_and_prioritise_the_escape_hatch() {
+        assert_eq!(hap_unavailable_reason(false, true), None);
+        assert_eq!(
+            hap_unavailable_reason(false, false),
+            Some("GPU-native HAP unavailable: GPU device lacks BC texture compression")
+        );
+        assert_eq!(
+            hap_unavailable_reason(true, false),
+            Some("GPU-native HAP disabled by QPLAYER_NO_HWACCEL=1")
+        );
+    }
+
+    #[test]
+    fn common_hap_variants_use_packet_native_frames_with_pts_and_seek() {
+        for (qt_format, expected) in [
+            (QtHapFormat::Hap1, HapFormat::RgbDxt1),
+            (QtHapFormat::Hap5, HapFormat::RgbaDxt5),
+            (QtHapFormat::HapY, HapFormat::YcoCgDxt5),
+        ] {
+            let media = TempHap::new(qt_format, 8, 8, 5);
+            let mut source = VideoSource::open_with_pool_and_hap(
+                media.path.to_str().unwrap(),
+                Arc::new(FramePool::new(0)),
+                Some(wgpu::Limits::default().max_texture_dimension_2d),
+            )
+            .unwrap();
+
+            assert_eq!(source.decode_path(), "hap gpu-native");
+            assert_eq!((source.width(), source.height()), (8, 8));
+            assert!(source.fallback_reason().is_none());
+            let first = source.read_frame().unwrap();
+            assert_eq!(first.pts, 0.0);
+            let FramePixels::Hap {
+                format,
+                data,
+                padded_width,
+                padded_height,
+            } = first.pixels
+            else {
+                panic!("expected HAP pixels");
+            };
+            assert_eq!(format, expected);
+            assert_eq!(data.len(), expected.frame_size(8, 8));
+            assert_eq!((padded_width, padded_height), (8, 8));
+            assert!((source.read_frame().unwrap().pts - 0.02).abs() < 1e-6);
+
+            source.seek_before(0.04).unwrap();
+            let sought = source.read_frame().unwrap();
+            assert!(sought.pts <= 0.04 + 1e-6, "PTS was {}", sought.pts);
+        }
+    }
+
+    #[test]
+    fn unavailable_or_unsupported_hap_uses_software_with_a_reason() {
+        let common = TempHap::new(QtHapFormat::Hap1, 8, 8, 1);
+        let source = VideoSource::open_with_pool_and_hap(
+            common.path.to_str().unwrap(),
+            Arc::new(FramePool::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(source.decode_path(), "software");
+        assert_eq!(
+            source.fallback_reason(),
+            Some("GPU-native HAP unavailable: GPU device lacks BC texture compression")
+        );
+
+        let unsupported = TempHap::new(QtHapFormat::HapA, 4, 4, 1);
+        let source = VideoSource::open_with_pool_and_hap(
+            unsupported.path.to_str().unwrap(),
+            Arc::new(FramePool::new(0)),
+            Some(wgpu::Limits::default().max_texture_dimension_2d),
+        )
+        .unwrap();
+        assert_eq!(source.decode_path(), "software");
+        assert!(source.fallback_reason().unwrap().contains("AlphaRgtc1"));
+    }
+
+    #[test]
+    fn malformed_hap_packet_is_rejected_before_gpu_upload() {
+        let packet = Packet::copy(&[1, 2, 3]);
+        assert!(HapVideoSource::parse_packet(&packet, 8, 8, 8_192).is_err());
+    }
+
+    #[test]
+    fn oversized_snappy_output_is_rejected_before_decompression() {
+        let packet = Packet::copy(&[
+            5, 0, 0, 0xBB, // five-byte Snappy BC1 section
+            0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // declares u32::MAX output bytes
+        ]);
+        let error = HapVideoSource::parse_packet(&packet, 8, 8, 8_192).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("declared 4294967295, expected 32")
+        );
+    }
+
+    #[test]
+    fn bounded_preflight_accepts_complex_chunked_hap() {
+        fn section(section_type: u8, body: &[u8]) -> Vec<u8> {
+            let len = body.len();
+            let mut result = vec![len as u8, (len >> 8) as u8, (len >> 16) as u8, section_type];
+            result.extend_from_slice(body);
+            result
+        }
+
+        let compressors = section(HAP_CHUNK_COMPRESSORS, &[HAP_CHUNK_NONE]);
+        let sizes = section(HAP_CHUNK_SIZES, &32u32.to_le_bytes());
+        let instructions = section(HAP_DECODE_INSTRUCTIONS, &[compressors, sizes].concat());
+        let packet = Packet::copy(&section(
+            HAP_COMPRESSOR_COMPLEX | 0x0B,
+            &[instructions, vec![0x55; 32]].concat(),
+        ));
+        let parsed = HapVideoSource::parse_packet(&packet, 8, 8, 8_192).unwrap();
+        assert_eq!(parsed.format, HapFormat::RgbDxt1);
+        assert_eq!(parsed.data, vec![0x55; 32]);
+    }
+
+    #[test]
+    fn complex_hap_rejects_excessive_chunk_counts() {
+        fn section(section_type: u8, body: &[u8]) -> Vec<u8> {
+            let len = body.len();
+            let mut result = vec![len as u8, (len >> 8) as u8, (len >> 16) as u8, section_type];
+            result.extend_from_slice(body);
+            result
+        }
+
+        let compressors = section(HAP_CHUNK_COMPRESSORS, &vec![HAP_CHUNK_NONE; 4_097]);
+        let sizes = section(HAP_CHUNK_SIZES, &vec![0; 4_097 * 4]);
+        let body = section(HAP_DECODE_INSTRUCTIONS, &[compressors, sizes].concat());
+        assert!(
+            chunked_declared_len(&body, 32)
+                .unwrap_err()
+                .contains("too many chunks")
+        );
+    }
+
+    #[test]
+    fn cancellation_stops_hap_scanning_without_consuming_a_pending_frame() {
+        let media = TempHap::new(QtHapFormat::Hap1, 8, 8, 1);
+        let mut source = VideoSource::open_with_pool_and_hap(
+            media.path.to_str().unwrap(),
+            Arc::new(FramePool::new(0)),
+            Some(8_192),
+        )
+        .unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        assert!(source.read_frame_cancellable(&stop).is_none());
+        stop.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(source.read_frame_cancellable(&stop).is_some());
+    }
+
+    #[test]
+    fn unsupported_midstream_variant_reopens_the_software_decoder() {
+        let media = TempHap::with_midstream_alpha();
+        let mut source = VideoSource::open_with_pool_and_hap(
+            media.path.to_str().unwrap(),
+            Arc::new(FramePool::new(0)),
+            Some(8_192),
+        )
+        .unwrap();
+        assert!(matches!(
+            source.read_frame().unwrap().pixels,
+            FramePixels::Hap { .. }
+        ));
+        let _ = source.read_frame();
+        assert_eq!(source.decode_path(), "software");
+        assert!(
+            source
+                .fallback_reason()
+                .unwrap()
+                .contains("variant changed mid-stream")
+        );
+    }
+
+    #[test]
+    fn native_hap_rejects_dimensions_above_the_device_limit() {
+        let encoded = HapFrameEncoder::new(QtHapFormat::Hap1, 8, 8)
+            .unwrap()
+            .encode(&[0; 8 * 8 * 4])
+            .unwrap();
+        let packet = Packet::copy(&encoded);
+        let error = HapVideoSource::parse_packet(&packet, 8, 8, 4).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceed the device texture limit 4")
+        );
     }
 
     #[test]

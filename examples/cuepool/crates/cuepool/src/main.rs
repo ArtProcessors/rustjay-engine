@@ -483,6 +483,7 @@ struct App {
     /// independent of the projector canvas). Sized to the playing media.
     pixmap_texture: Option<cuepool_video::CanvasTexture>,
     pixmap_yuv: Option<cuepool_video::YuvConverter>,
+    pixmap_hap: Option<cuepool_video::HapConverter>,
     pixmap_frame_rx: Option<std::sync::mpsc::Receiver<VideoFrame>>,
     pixmap_stop_flag: Arc<AtomicBool>,
     current_pixmap_qid: Option<rust_decimal::Decimal>,
@@ -824,6 +825,7 @@ impl App {
             last_pixel_sample: Instant::now(),
             pixmap_texture: None,
             pixmap_yuv: None,
+            pixmap_hap: None,
             pixmap_frame_rx: None,
             pixmap_stop_flag: Arc::new(AtomicBool::new(false)),
             current_pixmap_qid: None,
@@ -1393,9 +1395,23 @@ impl App {
         self.pixmap_frame_rx = Some(rx);
         let stop = Arc::clone(&self.pixmap_stop_flag);
         let frame_pool = Arc::clone(&self.frame_pool);
+        let native_hap_max_dimension = self
+            .device
+            .features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+            .then(|| self.device.limits().max_texture_dimension_2d);
         if let Err(e) = std::thread::Builder::new()
             .name("pixmap-decode".into())
-            .spawn(move || pixmap_decode_thread(&resolved, loop_mode, stop, tx, frame_pool))
+            .spawn(move || {
+                pixmap_decode_thread(
+                    &resolved,
+                    loop_mode,
+                    stop,
+                    tx,
+                    frame_pool,
+                    native_hap_max_dimension,
+                )
+            })
         {
             // Drop the receiver again so the render tick sees "no stream"
             // instead of a channel that never fills; the cue degrades to a
@@ -1446,6 +1462,34 @@ impl App {
             self.ensure_pixmap_texture(w, h);
             let tex = self.pixmap_texture.as_ref().unwrap();
             tex.upload_frame(&self.queue, &frame, cuepool_core::CanvasFit::Stretch);
+        } else if matches!(&frame.pixels, cuepool_video::FramePixels::Hap { .. }) {
+            self.ensure_pixmap_texture(w, h);
+            if self.pixmap_hap.is_none() {
+                self.pixmap_hap = Some(cuepool_video::HapConverter::new(
+                    &self.device,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                ));
+            }
+            let conv = self.pixmap_hap.as_mut().unwrap();
+            match conv.upload(
+                &self.device,
+                &self.queue,
+                &frame,
+                [w, h],
+                cuepool_core::CanvasFit::Stretch,
+            ) {
+                Ok(()) => {
+                    let tex = self.pixmap_texture.as_ref().unwrap();
+                    let mut encoder =
+                        self.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("pixmap-hap"),
+                            });
+                    conv.encode(&mut encoder, &tex.render_view());
+                    self.queue.submit(Some(encoder.finish()));
+                }
+                Err(error) => log::warn!("PixelMap HAP upload skipped: {error}"),
+            }
         } else {
             // YUV planes → GPU convert pass straight into the pixmap texture.
             self.ensure_pixmap_texture(w, h);
@@ -2012,6 +2056,11 @@ impl App {
         let diag_state = Arc::clone(self.cuepool.state());
         let video_control = Arc::clone(&self.video_control);
         let zero_copy = self.zero_copy.clone();
+        let native_hap_max_dimension = self
+            .device
+            .features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+            .then(|| self.device.limits().max_texture_dimension_2d);
 
         match std::thread::Builder::new()
             .name("video-decode".into())
@@ -2029,6 +2078,7 @@ impl App {
                     frame_pool,
                     timings,
                     zero_copy,
+                    native_hap_max_dimension,
                 );
             }) {
             Ok(join) => self.video_decode_join = Some(join),
@@ -2051,6 +2101,7 @@ impl App {
         self.lighting.shutdown();
         self.pixmap_texture = None;
         self.pixmap_yuv = None;
+        self.pixmap_hap = None;
         self.pixel_sampler = None;
         self.output_windows.clear();
         self.output_windows_built_from = None;
@@ -4566,6 +4617,11 @@ fn run(log_file: String) -> anyhow::Result<()> {
     let zero_copy_preference = ZeroCopyPreference::from_env();
     let zero_copy_features =
         ZeroCopyAvailability::required_features(&adapter, zero_copy_preference);
+    let hap_features = if std::env::var("QPLAYER_NO_HWACCEL").as_deref() == Ok("1") {
+        wgpu::Features::empty()
+    } else {
+        adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC
+    };
     let request_device = |features| {
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("cuepool-device"),
@@ -4575,13 +4631,18 @@ fn run(log_file: String) -> anyhow::Result<()> {
             ..Default::default()
         }))
     };
-    let (device, queue, device_fallback) = match request_device(zero_copy_features) {
+    let optional_features = zero_copy_features | hap_features;
+    let (device, queue, device_fallback) = match request_device(optional_features) {
         Ok((device, queue)) => (device, queue, None),
-        Err(error) if !zero_copy_features.is_empty() => {
-            let reason = format!("zero-copy device feature request failed: {error}");
-            log::warn!("Video zero-copy fallback: {reason}; retrying the stock device");
+        Err(error) if !optional_features.is_empty() => {
+            let reason = format!("video acceleration feature request failed: {error}");
+            log::warn!("Video acceleration fallback: {reason}; retrying the stock device");
             let (device, queue) = request_device(wgpu::Features::empty())?;
-            (device, queue, Some(reason))
+            (
+                device,
+                queue,
+                (!zero_copy_features.is_empty()).then_some(reason),
+            )
         }
         Err(error) => return Err(error.into()),
     };
