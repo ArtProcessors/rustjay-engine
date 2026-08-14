@@ -2731,6 +2731,13 @@ impl App {
             cmds
         };
 
+        // Commands this drain doesn't own (e.g. OpenProject and SaveProject,
+        // which the GUI drain handles) go back on the queue instead of being
+        // dropped. This loop runs every about_to_wait (~250/s) while the GUI
+        // drains only on control-window redraws, so this side usually wins
+        // the race — silently discarding GUI-only commands broke `cuepool
+        // <show.qproj>` startup loads and OSC-triggered saves (#138).
+        let mut unhandled = Vec::new();
         for cmd in commands {
             match cmd {
                 AppCommand::Go => self.handle_go(event_loop),
@@ -2787,7 +2794,8 @@ impl App {
                 AppCommand::OpenProjectionOutputs => {
                     self.create_output_windows(event_loop);
                 }
-                AppCommand::SaveProject | AppCommand::SaveProjectAs { .. } => {}
+                // SaveProject/SaveProjectAs fall through to `unhandled` below —
+                // the GUI drain owns them.
                 AppCommand::LearnMidiTrigger { qid } => {
                     if let Ok(mut state) = self.cuepool.state().lock() {
                         state.pending_midi_learn = Some(qid);
@@ -2828,8 +2836,13 @@ impl App {
                 AppCommand::FrameStep => self.frame_step(),
                 AppCommand::FrameStepBack => self.frame_step_back(),
                 AppCommand::SeekCue { instance_id, secs } => self.seek_cue(instance_id, secs),
-                _ => {}
+                other => unhandled.push(other),
             }
+        }
+        if !unhandled.is_empty()
+            && let Ok(mut state) = self.cuepool.state().lock()
+        {
+            state.command_queue.extend(unhandled);
         }
     }
 
