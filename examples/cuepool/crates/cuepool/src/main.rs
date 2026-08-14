@@ -18,6 +18,7 @@ use cuepool_core::{
 };
 use cuepool_gui::{AppCommand, CuePoolApp, OutputDiagnostics, VideoTimings};
 use cuepool_gui::app::CueState;
+use cuepool_gui::logging::PERSIST_TARGET;
 use cuepool_protocols::midi::mtc::{MtcFrameRate, MtcReceiver, MtcState};
 use cuepool_protocols::midi::{MidiEvent, MidiManager};
 use cuepool_protocols::msc::{MscCommandFlags, MscEvent, MscManager};
@@ -356,6 +357,7 @@ impl App {
         proxy: winit::event_loop::EventLoopProxy<AppEvent>,
         zero_copy: ZeroCopyAvailability,
         cuepool: CuePoolApp,
+        log_file: String,
     ) -> Self {
         let show_engine = ShowEngine::new(cuepool.state().clone(), None);
         // Protocol settings from project settings (fallback to defaults)
@@ -459,6 +461,7 @@ impl App {
             d.app_version = cuepool_gui::build_identity();
             d.os = std::env::consts::OS.into();
             d.arch = std::env::consts::ARCH.into();
+            d.log_file = log_file;
             d.gpu_name = info.name;
             d.gpu_backend = format!("{:?}", info.backend);
             d.gpu_driver = info.driver;
@@ -469,7 +472,7 @@ impl App {
                 (ffmpeg >> 8) & 0xff,
                 ffmpeg & 0xff,
             );
-            for var in ["QPLAYER_PRESENT_MODE", "QPLAYER_FPS_DEBUG", "QPLAYER_NO_HWACCEL", "QPLAYER_ZEROCOPY"] {
+            for var in ["RUST_LOG", "QPLAYER_PRESENT_MODE", "QPLAYER_FPS_DEBUG", "QPLAYER_NO_HWACCEL", "QPLAYER_ZEROCOPY"] {
                 if let Ok(value) = std::env::var(var) {
                     d.env_overrides.push((var.into(), value));
                 }
@@ -1676,7 +1679,8 @@ impl App {
     /// returns through `run_app` and runs Rust drops (wgpu device/surfaces, threads)
     /// which can wedge the main thread on macOS (beachball); the OS reclaims
     /// everything on `process::exit`, just like the Ctrl-C handler and Dock-quit.
-    fn hard_exit(&self) -> ! {
+    fn hard_exit(&self, reason: &str) -> ! {
+        log::info!(target: PERSIST_TARGET, "Shutdown requested: {reason}");
         let recent_files = self
             .cuepool
             .state()
@@ -1686,6 +1690,8 @@ impl App {
         save_settings(&AppSettings { recent_files });
         #[cfg(windows)]
         win_timer::release();
+        log::info!(target: PERSIST_TARGET, "Shutdown complete: {reason}");
+        log::logger().flush();
         std::process::exit(0);
     }
 
@@ -3088,7 +3094,7 @@ impl ApplicationHandler<AppEvent> for App {
                             state.pending_close_confirm = true;
                         }
                     } else {
-                        self.hard_exit();
+                        self.hard_exit("control window closed");
                     }
                 }
                 WindowEvent::Resized(size) => {
@@ -3224,7 +3230,7 @@ impl ApplicationHandler<AppEvent> for App {
         }
         // Quit confirmed by the in-app modal — hard-exit (see hard_exit for why).
         if self.cuepool.state().lock().map(|s| s.quit).unwrap_or(false) {
-            self.hard_exit();
+            self.hard_exit("operator confirmed discard and quit");
         }
 
         if !self.consume_failure_reported
@@ -3615,6 +3621,13 @@ fn parse_cli_project(args: impl IntoIterator<Item = OsString>) -> Result<Option<
     Ok(project)
 }
 
+fn persistent_log_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("CuePool")
+        .join("cuepool.log")
+}
+
 fn load_startup_project(cuepool: &CuePoolApp, path: &Path) -> Result<(), String> {
     let data = std::fs::read_to_string(path)
         .map_err(|error| format!("Cannot read startup project '{}': {error}", path.display()))?;
@@ -3638,14 +3651,38 @@ fn startup_error(title: &str, message: String) -> anyhow::Error {
 }
 
 fn main() -> anyhow::Result<()> {
-    cuepool_gui::logging::init_logger();
+    let log_file = match cuepool_gui::logging::init_logger(&persistent_log_path()) {
+        Ok(path) => path.display().to_string(),
+        Err(error) => format!("unavailable: {error}"),
+    };
 
     human_panic::setup_panic!(
         Metadata::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
             .authors("CuePool Contributors")
             .homepage("https://github.com/BlueJayLouche/CuePool")
     );
+    let human_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!(target: PERSIST_TARGET, "CuePool crashed: {info}");
+        log::logger().flush();
+        human_panic_hook(info);
+    }));
 
+    log::info!(
+        target: PERSIST_TARGET,
+        "CuePool {} starting",
+        cuepool_gui::build_identity()
+    );
+    let result = run(log_file);
+    match &result {
+        Ok(()) => log::info!(target: PERSIST_TARGET, "CuePool shutdown complete"),
+        Err(error) => log::error!(target: PERSIST_TARGET, "CuePool exiting with error: {error:#}"),
+    }
+    log::logger().flush();
+    result
+}
+
+fn run(log_file: String) -> anyhow::Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     let cwd = std::env::current_dir().map_err(|error| {
         startup_error(
@@ -3703,11 +3740,12 @@ fn main() -> anyhow::Result<()> {
             )
         })?;
         log::info!(
+            target: PERSIST_TARGET,
             "CuePool startup project load result=success: path={}",
             path.display()
         );
     } else {
-        log::info!("CuePool startup project load result=not_requested");
+        log::info!(target: PERSIST_TARGET, "CuePool startup project load result=not_requested");
     }
 
     // 1 ms timer resolution so WaitUntil/sleep don't quantize to 15.6 ms.
@@ -3779,14 +3817,25 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    let mut app = App::new(instance, adapter, device, queue, proxy, zero_copy, cuepool);
+    let mut app = App::new(
+        instance,
+        adapter,
+        device,
+        queue,
+        proxy,
+        zero_copy,
+        cuepool,
+        log_file,
+    );
 
     // Ctrl-C / SIGTERM handler for graceful emergency save
     {
         let state = Arc::clone(app.cuepool.state());
         ctrlc::set_handler(move || {
-            log::info!("SIGINT received, performing emergency save...");
-            emergency_save(&state);
+            log::info!(target: PERSIST_TARGET, "Shutdown requested: termination signal");
+            emergency_save(&state, "termination signal");
+            log::info!(target: PERSIST_TARGET, "Shutdown complete: termination signal");
+            log::logger().flush();
             std::process::exit(0);
         })?;
     }
