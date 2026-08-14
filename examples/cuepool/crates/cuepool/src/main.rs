@@ -362,6 +362,25 @@ struct App {
     // ── plugins ──
 }
 
+fn drain_app_commands(
+    state: &cuepool_gui::SharedStateHandle,
+    mut dispatch: impl FnMut(AppCommand) -> Result<(), AppCommand>,
+) {
+    let commands = {
+        let Ok(mut state) = state.lock() else { return };
+        std::mem::take(&mut state.command_queue)
+    };
+    let unhandled: Vec<_> = commands
+        .into_iter()
+        .filter_map(|command| dispatch(command).err())
+        .collect();
+    if !unhandled.is_empty()
+        && let Ok(mut state) = state.lock()
+    {
+        state.command_queue.extend(unhandled);
+    }
+}
+
 impl App {
     fn new(
         instance: wgpu::Instance,
@@ -2724,21 +2743,14 @@ impl App {
 
     /// Drain any AppCommands queued by the UI and execute them.
     fn process_commands(&mut self, event_loop: &ActiveEventLoop) {
-        let commands = {
-            let Ok(mut state) = self.cuepool.state().lock() else { return };
-            let cmds = state.command_queue.clone();
-            state.command_queue.clear();
-            cmds
-        };
-
         // Commands this drain doesn't own (e.g. OpenProject and SaveProject,
         // which the GUI drain handles) go back on the queue instead of being
         // dropped. This loop runs every about_to_wait (~250/s) while the GUI
         // drains only on control-window redraws, so this side usually wins
         // the race — silently discarding GUI-only commands broke `cuepool
         // <show.qproj>` startup loads and OSC-triggered saves (#138).
-        let mut unhandled = Vec::new();
-        for cmd in commands {
+        let state = Arc::clone(self.cuepool.state());
+        drain_app_commands(&state, |cmd| {
             match cmd {
                 AppCommand::Go => self.handle_go(event_loop),
                 AppCommand::Stop => self.stop_all(),
@@ -2836,14 +2848,10 @@ impl App {
                 AppCommand::FrameStep => self.frame_step(),
                 AppCommand::FrameStepBack => self.frame_step_back(),
                 AppCommand::SeekCue { instance_id, secs } => self.seek_cue(instance_id, secs),
-                other => unhandled.push(other),
+                other => return Err(other),
             }
-        }
-        if !unhandled.is_empty()
-            && let Ok(mut state) = self.cuepool.state().lock()
-        {
-            state.command_queue.extend(unhandled);
-        }
+            Ok(())
+        });
     }
 
     /// Drain MIDI input events and fire any cues whose MIDI trigger matches.
@@ -4362,6 +4370,41 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn winit_drain_requeues_gui_file_commands() {
+        let state = Arc::new(Mutex::new(cuepool_gui::SharedState::default()));
+        state.lock().unwrap().command_queue.extend([
+            AppCommand::OpenProject {
+                path: "open.qproj".into(),
+            },
+            AppCommand::SaveProject,
+            AppCommand::SaveProjectAs {
+                path: "save-as.qproj".into(),
+            },
+            AppCommand::Go,
+        ]);
+
+        let mut handled = 0;
+        drain_app_commands(&state, |command| match command {
+            AppCommand::Go => {
+                handled += 1;
+                Ok(())
+            }
+            other => Err(other),
+        });
+
+        assert_eq!(handled, 1);
+        let state = state.lock().unwrap();
+        assert!(matches!(
+            state.command_queue.as_slice(),
+            [
+                AppCommand::OpenProject { .. },
+                AppCommand::SaveProject,
+                AppCommand::SaveProjectAs { .. }
+            ]
+        ));
+    }
 
 
     fn cli_project_test_dir() -> PathBuf {
