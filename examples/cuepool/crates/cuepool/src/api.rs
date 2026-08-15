@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::{BroadcastStream, WatchStream};
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{IntoParams, Modify, OpenApi, ToSchema};
 
@@ -27,7 +28,8 @@ const COMMAND_HISTORY_CAPACITY: usize = 256;
 const MAX_QID_BYTES: usize = 64;
 const STATUS_HISTORY_CAPACITY: usize = 3600;
 const MAIN_LOOP_STALE_AFTER: Duration = Duration::from_secs(2);
-const SHUTDOWN_RESULT_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_RESULT_TIMEOUT: Duration = Duration::from_secs(8);
+const SERVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Deserialize, ToSchema)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -176,7 +178,7 @@ fn run_server(
     listener: TcpListener,
     state: ApiState,
     result_rx: mpsc::UnboundedReceiver<ApiCommandResult>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
     shutdown_requested: Arc<AtomicBool>,
     shutdown_response_delivered: Arc<AtomicBool>,
 ) {
@@ -188,15 +190,21 @@ fn run_server(
             let listener = tokio::net::TcpListener::from_std(listener)?;
             tokio::spawn(record_command_results(state.clone(), result_rx));
             tokio::spawn(sample_state(state.clone()));
-            axum::serve(listener, build_router(state))
-                .with_graceful_shutdown(async move {
-                    while !*shutdown_rx.borrow_and_update() {
-                        if shutdown_rx.changed().await.is_err() {
-                            return;
-                        }
-                    }
-                })
-                .await?;
+            let forced_shutdown_rx = shutdown_rx.clone();
+            let server = axum::serve(listener, build_router(state))
+                .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+                .into_future();
+            tokio::pin!(server);
+            tokio::select! {
+                result = &mut server => result?,
+                () = async move {
+                    shutdown_signal(forced_shutdown_rx).await;
+                    tokio::time::sleep(SERVER_SHUTDOWN_GRACE).await;
+                } => log::warn!(
+                    "CuePool API forced closed after {} seconds waiting for clients",
+                    SERVER_SHUTDOWN_GRACE.as_secs()
+                ),
+            }
             Ok(())
         })
     });
@@ -205,6 +213,14 @@ fn run_server(
     }
     if let Err(error) = result {
         log::error!("CuePool API stopped: {error}");
+    }
+}
+
+async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
+    while !*shutdown_rx.borrow_and_update() {
+        if shutdown_rx.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -369,6 +385,7 @@ impl ApiState {
     fn complete_command(&self, result: ApiCommandResult) {
         let completed_at = now();
         let mut completed = None;
+        let mut shutdown = false;
         if let Ok(mut commands) = self.commands.lock()
             && let Some(command) = commands
                 .iter_mut()
@@ -378,6 +395,7 @@ impl ApiState {
                 ApiCommandOutcome::Applied(message) => {
                     command.status.state = CommandState::Applied;
                     command.status.message = Some(message);
+                    shutdown = matches!(command.command, ApiCommand::Shutdown);
                 }
                 ApiCommandOutcome::Rejected(message) => {
                     command.status.state = CommandState::Rejected;
@@ -390,28 +408,26 @@ impl ApiState {
         if let Some(command) = completed {
             self.emit("command", &command);
             self.command_changed.send_replace(());
+            if shutdown {
+                self.request_shutdown();
+            }
         }
     }
 
-    fn command(&self, id: u64) -> Result<(CommandStatus, bool), ApiError> {
+    fn command(&self, id: u64) -> Result<CommandStatus, ApiError> {
         self.commands
             .lock()
             .map_err(|_| ApiError::internal("command history lock poisoned"))?
             .iter()
             .find(|record| record.status.id == id)
-            .map(|record| {
-                (
-                    record.status.clone(),
-                    matches!(record.command, ApiCommand::Shutdown),
-                )
-            })
+            .map(|record| record.status.clone())
             .ok_or_else(|| ApiError::not_found(format!("command {id} not found")))
     }
 
     async fn wait_for_command(&self, id: u64) -> Result<CommandStatus, ApiError> {
         let mut changed = self.command_changed.subscribe();
         loop {
-            let (status, _) = self.command(id)?;
+            let status = self.command(id)?;
             if status.state != CommandState::Pending {
                 return Ok(status);
             }
@@ -423,7 +439,6 @@ impl ApiState {
     }
 
     fn request_shutdown(&self) {
-        self.emit("shutdown", &serde_json::json!({ "status": "stopping" }));
         self.shutdown_requested.store(true, Ordering::Release);
         self.server_shutdown.send_replace(true);
     }
@@ -1161,7 +1176,16 @@ async fn logs(Query(query): Query<LogsQuery>) -> Json<LogsResponse> {
 async fn events(
     State(api): State<ApiState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let shutdown = WatchStream::new(api.server_shutdown.subscribe()).filter_map(|stopping| {
+        stopping.then(|| {
+            Ok::<_, BroadcastStreamRecvError>(ApiEvent {
+                event_type: "shutdown",
+                data: serde_json::json!({ "status": "stopping" }),
+            })
+        })
+    });
     let stream = BroadcastStream::new(api.events.subscribe())
+        .merge(shutdown)
         .take_while(|event| !matches!(event, Ok(event) if event.event_type == "shutdown"))
         .filter_map(|event| {
             let event = match event {
@@ -1295,11 +1319,6 @@ async fn post_command(
     Json(command): Json<ApiCommand>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_control(&api, &headers)?;
-    if !api.main_loop_responsive() {
-        return Err(ApiError::unavailable(
-            "CuePool show-control loop is not ready",
-        ));
-    }
     validate_command(&command)?;
     let idempotency_key = headers
         .get("idempotency-key")
@@ -1322,15 +1341,15 @@ async fn post_command(
     if let Some(key) = idempotency_key.as_deref()
         && let Some(mut status) = api.idempotent_command(key, &command)?
     {
-        if matches!(command, ApiCommand::Shutdown) {
-            if status.state == CommandState::Pending {
-                status = wait_for_shutdown_result(&api, status.id).await?;
-            }
-            if status.state == CommandState::Applied {
-                api.request_shutdown();
-            }
+        if matches!(command, ApiCommand::Shutdown) && status.state == CommandState::Pending {
+            status = wait_for_shutdown_result(&api, status.id).await?;
         }
         return Ok((StatusCode::ACCEPTED, Json(status)));
+    }
+    if !api.main_loop_responsive() {
+        return Err(ApiError::unavailable(
+            "CuePool show-control loop is not ready",
+        ));
     }
     let prepared_project = match &command {
         ApiCommand::OpenProject { path } => {
@@ -1354,17 +1373,15 @@ async fn post_command(
     let mut status = api.register_command(command, prepared_project, idempotency_key)?;
     if shutdown {
         status = wait_for_shutdown_result(&api, status.id).await?;
-        if status.state == CommandState::Applied {
-            api.request_shutdown();
-        }
     }
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
 async fn wait_for_shutdown_result(api: &ApiState, id: u64) -> Result<CommandStatus, ApiError> {
-    tokio::time::timeout(SHUTDOWN_RESULT_TIMEOUT, api.wait_for_command(id))
-        .await
-        .map_err(|_| ApiError::unavailable("shutdown command did not complete within 10 seconds"))?
+    match tokio::time::timeout(SHUTDOWN_RESULT_TIMEOUT, api.wait_for_command(id)).await {
+        Ok(status) => status,
+        Err(_) => api.command(id),
+    }
 }
 
 #[utoipa::path(
@@ -1381,11 +1398,7 @@ async fn command_status(
     State(api): State<ApiState>,
     Path(id): Path<u64>,
 ) -> Result<Json<CommandStatus>, ApiError> {
-    let (status, shutdown) = api.command(id)?;
-    if shutdown && status.state == CommandState::Applied {
-        api.request_shutdown();
-    }
-    Ok(Json(status))
+    Ok(Json(api.command(id)?))
 }
 
 fn now() -> String {
@@ -1549,6 +1562,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_stream_opened_after_shutdown_ends_immediately() {
+        let (state, _) = test_api(None);
+        state.request_shutdown();
+
+        let response = build_router(state)
+            .oneshot(Request::get("/v1/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body =
+            tokio::time::timeout(Duration::from_secs(1), to_bytes(response.into_body(), 1024))
+                .await
+                .expect("event stream remained open after shutdown")
+                .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
     async fn control_requires_configuration_and_a_valid_token() {
         let body = r#"{"command":"go"}"#;
         let (state, _) = test_api(None);
@@ -1635,10 +1665,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotency_key_prevents_duplicate_commands() {
+    async fn idempotency_key_survives_the_stopping_state() {
         let (state, mut command_rx) = test_api(Some("secret"));
         state.ready.store(true, Ordering::Release);
-        let app = build_router(state);
+        let app = build_router(state.clone());
         let request = || {
             Request::post("/v1/commands")
                 .header("content-type", "application/json")
@@ -1649,6 +1679,7 @@ mod tests {
         };
 
         let first = app.clone().oneshot(request()).await.unwrap();
+        state.ready.store(false, Ordering::Release);
         let second = app.clone().oneshot(request()).await.unwrap();
         assert_eq!(first.status(), StatusCode::ACCEPTED);
         assert_eq!(second.status(), StatusCode::ACCEPTED);

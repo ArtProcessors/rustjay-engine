@@ -35,9 +35,22 @@ $ErrorActionPreference = 'Stop'
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 $Project = (Resolve-Path -LiteralPath $Project).Path
 $Artifact = [IO.Path]::GetFullPath($Artifact)
+$normalizedCueQid = [decimal]::Parse($CueQid, [Globalization.CultureInfo]::InvariantCulture)
+$profileRoot = Join-Path ([Environment]::GetFolderPath('ApplicationData')) "CuePool\automation\$Profile"
+$settingsPath = Join-Path $profileRoot 'settings.json'
+$persistentLogPath = Join-Path $profileRoot 'cuepool.log'
+foreach ($protectedPath in @($Executable, $Project, $settingsPath, $persistentLogPath)) {
+    if ([StringComparer]::OrdinalIgnoreCase.Equals($Artifact, $protectedPath)) {
+        throw "Artifact path must not overwrite '$protectedPath'"
+    }
+}
+if (Test-Path -LiteralPath $Artifact -PathType Container) {
+    throw "Artifact path is a directory: $Artifact"
+}
 $apiBase = "http://127.0.0.1:$ApiPort"
 $startedAt = [DateTime]::UtcNow
 $process = $null
+$processStarted = $false
 $failure = $null
 $result = 'failed'
 $exitCode = $null
@@ -104,7 +117,7 @@ function Wait-CuePoolHealth {
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
-        if ($script:process -and $script:process.HasExited) {
+        if ($script:processStarted -and $script:process.HasExited) {
             throw "CuePool exited before it became ready (exit code $($script:process.ExitCode))"
         }
         try {
@@ -129,12 +142,14 @@ function Get-FileEvidence {
     $exists = Test-Path -LiteralPath $Path -PathType Leaf
     $sha256 = $null
     if ($exists) {
+        $file = Get-Item -LiteralPath $Path
         $sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     [ordered]@{
         path = $Path
         exists = $exists
         sha256 = $sha256
+        last_write_at = if ($exists) { $file.LastWriteTimeUtc.ToString('o') } else { $null }
     }
 }
 
@@ -157,6 +172,7 @@ try {
     if (-not $process.Start()) {
         throw 'CuePool process did not start'
     }
+    $processStarted = $true
 
     $healthStart = Wait-CuePoolHealth `
         -TimeoutSeconds $StartupTimeoutSeconds `
@@ -192,8 +208,40 @@ try {
         throw 'Shutdown was not rejected while a cue was active'
     }
 
+    $activeBeforePause = @(Invoke-CuePoolGet '/v1/cues/active')
+    $targetCue = @($activeBeforePause | Where-Object {
+        [decimal]::Parse([string]$_.qid, [Globalization.CultureInfo]::InvariantCulture) -eq $normalizedCueQid
+    } | Select-Object -First 1)
+    if (-not $targetCue) {
+        throw "Cue '$CueQid' was not active before Pause"
+    }
+    $targetInstanceId = [long]$targetCue[0].instance_id
     Invoke-CuePoolCommand @{ command = 'pause' } 'smoke-pause' | Out-Null
+    Start-Sleep -Milliseconds 250
+    $pausedCues = @(Invoke-CuePoolGet '/v1/cues/active')
+    $pausedCue = @($pausedCues | Where-Object { [long]$_.instance_id -eq $targetInstanceId })
+    if (-not $pausedCue -or -not $pausedCue[0].paused) {
+        throw "Cue instance $targetInstanceId did not report itself as paused"
+    }
+    $pausedPosition = [double]$pausedCue[0].position_seconds
+    Start-Sleep -Milliseconds 500
+    $pausedAgain = @(Invoke-CuePoolGet '/v1/cues/active' | Where-Object { [long]$_.instance_id -eq $targetInstanceId })
+    if (-not $pausedAgain -or -not $pausedAgain[0].paused) {
+        throw "Cue instance $targetInstanceId did not remain paused"
+    }
+    if ([Math]::Abs([double]$pausedAgain[0].position_seconds - $pausedPosition) -gt 0.05) {
+        throw "Cue instance $targetInstanceId advanced while paused"
+    }
     Invoke-CuePoolCommand @{ command = 'resume' } 'smoke-resume' | Out-Null
+    Start-Sleep -Seconds 1
+    $resumedCues = @(Invoke-CuePoolGet '/v1/cues/active')
+    $resumedCue = @($resumedCues | Where-Object { [long]$_.instance_id -eq $targetInstanceId })
+    if (-not $resumedCue -or $resumedCue[0].paused) {
+        throw "Cue instance $targetInstanceId did not report itself as resumed"
+    }
+    if ([double]$resumedCue[0].position_seconds -le $pausedPosition) {
+        throw "Cue instance $targetInstanceId did not advance after Resume"
+    }
     Invoke-CuePoolCommand @{ command = 'stop' } 'smoke-stop' | Out-Null
     $healthIdle = Wait-CuePoolHealth `
         -FailureMessage 'CuePool did not become idle after Stop' `
@@ -224,24 +272,31 @@ catch {
     $failure = $_.Exception.Message
 }
 finally {
-    if ($process -and -not $process.HasExited) {
+    if ($processStarted -and -not $process.HasExited) {
         try {
             if (-not $healthIdle) { $healthIdle = Invoke-CuePoolGet '/v1/health' }
             if (-not $statusFinal) { $statusFinal = Invoke-CuePoolGet '/v1/status' }
             if (-not $logs) { $logs = Invoke-CuePoolGet '/v1/logs?after=0&limit=250' }
         }
         catch {}
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        try { $process.Kill() } catch {}
         $process.WaitForExit(5000) | Out-Null
     }
-    if ($process -and $process.HasExited -and $null -eq $exitCode) {
+    if ($processStarted -and $process.HasExited -and $null -eq $exitCode) {
         $exitCode = $process.ExitCode
     }
 
-    $profileRoot = Join-Path ([Environment]::GetFolderPath('ApplicationData')) "CuePool\automation\$Profile"
     $pidValue = $null
-    if ($process) {
+    if ($processStarted) {
         $pidValue = $process.Id
+    }
+    $settingsEvidence = Get-FileEvidence $settingsPath
+    $persistentLogEvidence = Get-FileEvidence $persistentLogPath
+    $settingsFresh = $settingsEvidence.exists -and ([DateTime]$settingsEvidence.last_write_at -ge $startedAt)
+    $persistentLogFresh = $persistentLogEvidence.exists -and ([DateTime]$persistentLogEvidence.last_write_at -ge $startedAt)
+    if ($result -eq 'passed' -and (-not $settingsFresh -or -not $persistentLogFresh)) {
+        $result = 'failed'
+        $failure = 'CuePool did not write fresh isolated settings and persistent log evidence'
     }
     $artifactData = [ordered]@{
         schema_version = 1
@@ -263,15 +318,29 @@ finally {
         status_history = $history
         logs = $logs
         commands = $commands
-        settings = (Get-FileEvidence (Join-Path $profileRoot 'settings.json'))
-        persistent_log = (Get-FileEvidence (Join-Path $profileRoot 'cuepool.log'))
+        settings = $settingsEvidence
+        persistent_log = $persistentLogEvidence
     }
     $parent = Split-Path -Parent $Artifact
     if ($parent) {
         [IO.Directory]::CreateDirectory($parent) | Out-Null
     }
     $json = $artifactData | ConvertTo-Json -Depth 20 -Compress
-    [IO.File]::WriteAllText($Artifact, $json, (New-Object Text.UTF8Encoding($false)))
+    $tempArtifact = "$Artifact.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($tempArtifact, $json, (New-Object Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $Artifact -PathType Leaf) {
+            [IO.File]::Replace($tempArtifact, $Artifact, $null)
+        }
+        else {
+            [IO.File]::Move($tempArtifact, $Artifact)
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $tempArtifact -PathType Leaf) {
+            Remove-Item -LiteralPath $tempArtifact -Force
+        }
+    }
     $token = $null
 }
 

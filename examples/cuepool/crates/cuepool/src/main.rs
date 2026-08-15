@@ -74,6 +74,7 @@ use video_timing::{fade_elapsed, shift_fade_start_after_pause};
 const VIDEO_QUEUE_CAP: usize = 3;
 /// Two streams × channel/peek slack × the largest decoded plane count.
 const FRAME_POOL_CAP: usize = 2 * (VIDEO_QUEUE_CAP + 2) * 3;
+const API_SHUTDOWN_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Max squared position distance (px²) for recalling an output to a saved monitor.
 /// Positions are fixed for an installed wall, so this just allows minor slop while
@@ -404,6 +405,7 @@ struct App {
     engine_epoch: Instant,
     window_ids: Option<WindowIds>,
     terminal_error: Option<TerminalError>,
+    shutdown_started_at: Option<Instant>,
 
     // ── playback adapter state ──
     paused: bool,
@@ -787,6 +789,7 @@ impl App {
             engine_epoch: Instant::now(),
             window_ids: None,
             terminal_error: None,
+            shutdown_started_at: None,
             event_loop_proxy: proxy,
             current_text_qid: None,
             output_windows: Vec::new(),
@@ -2507,12 +2510,15 @@ impl App {
             None => return,
         };
         for request in requests {
-            let outcome =
+            let outcome = if self.shutdown_started_at.is_some() {
+                ApiCommandOutcome::Rejected("shutdown is in progress".into())
+            } else {
                 match self.apply_api_command(request.command, request.prepared_project, event_loop)
                 {
                     Ok(message) => ApiCommandOutcome::Applied(message),
                     Err(message) => ApiCommandOutcome::Rejected(message),
-                };
+                }
+            };
             self.publish_active_cues_if_due(true);
             if let Some(api) = self.api.as_ref() {
                 api.complete(request.id, outcome);
@@ -2654,6 +2660,10 @@ impl App {
                 let dirty = self.cuepool.state().lock_unpoisoned().dirty;
                 if let Some(message) = shutdown_rejection(dirty, self.show_control_is_active()) {
                     return Err(message.into());
+                }
+                self.shutdown_started_at = Some(Instant::now());
+                if let Some(api) = self.api.as_ref() {
+                    api.mark_stopping();
                 }
                 Ok(format!(
                     "profile '{}' accepted shutdown",
@@ -3743,6 +3753,9 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        if self.shutdown_started_at.is_some() {
+            return;
+        }
         match event {
             AppEvent::VideoEof(epoch) => {
                 let current_epoch = self.video_control.lock_unpoisoned().stream_epoch;
@@ -3820,6 +3833,9 @@ impl ApplicationHandler<AppEvent> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self.shutdown_started_at.is_some() {
+            return;
+        }
         let is_control = self
             .window_ids
             .as_ref()
@@ -4042,12 +4058,25 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(api) = self.api.as_ref() {
             api.mark_alive();
         }
-        if self
-            .api
-            .as_ref()
-            .is_some_and(ApiRuntime::shutdown_response_delivered)
-        {
-            self.hard_exit("authenticated API shutdown");
+        if let Some(started_at) = self.shutdown_started_at {
+            self.process_api_commands(event_loop);
+            let response_delivered = self
+                .api
+                .as_ref()
+                .is_some_and(ApiRuntime::shutdown_response_delivered);
+            if response_delivered || started_at.elapsed() >= API_SHUTDOWN_EXIT_TIMEOUT {
+                if !response_delivered {
+                    log::warn!(
+                        "API shutdown acknowledgement was not delivered within {} seconds; exiting",
+                        API_SHUTDOWN_EXIT_TIMEOUT.as_secs()
+                    );
+                }
+                self.hard_exit("authenticated API shutdown");
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(4),
+            ));
+            return;
         }
         // Quit confirmed by the in-app modal — hard-exit (see hard_exit for why).
         if self.cuepool.state().lock().map(|s| s.quit).unwrap_or(false) {
@@ -4131,6 +4160,12 @@ impl ApplicationHandler<AppEvent> for App {
         // already queued for this iteration execute before newer API requests.
         self.process_commands(event_loop);
         self.process_api_commands(event_loop);
+        if self.shutdown_started_at.is_some() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(4),
+            ));
+            return;
+        }
         self.poll_wall_clock_triggers(event_loop);
         self.poll_timecode_triggers(event_loop);
         self.tick_engine(event_loop);
@@ -4782,10 +4817,11 @@ fn run(log_file: String, profile: AppProfile) -> anyhow::Result<()> {
     // Ctrl-C / SIGTERM handler for graceful emergency save
     {
         let state = Arc::clone(app.cuepool.state());
+        let profile = app.profile.clone();
         ctrlc::set_handler(move || {
             log::info!(target: PERSIST_TARGET, "Shutdown requested: termination signal");
             emergency_save(&state, "termination signal");
-            save_settings_from_state(&state);
+            save_settings_from_state(&profile, &state);
             log::info!(target: PERSIST_TARGET, "Shutdown complete: termination signal");
             log::logger().flush();
             std::process::exit(0);

@@ -21,7 +21,7 @@ impl AppProfile {
             Ok(value) if value.is_empty() => Ok(Self::Default),
             Ok(value) if valid_profile_name(&value) => Ok(Self::Automation(value)),
             Ok(_) => Err(format!(
-                "{AUTOMATION_PROFILE_ENV} must contain 1 to 64 lowercase letters, digits, or hyphens and start with a letter or digit"
+                "{AUTOMATION_PROFILE_ENV} must contain 1 to 64 lowercase letters, digits, or hyphens, start with a letter or digit, and not be a reserved Windows device name"
             )),
             Err(std::env::VarError::NotPresent) => Ok(Self::Default),
             Err(std::env::VarError::NotUnicode(_)) => {
@@ -77,6 +77,10 @@ fn valid_profile_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !matches!(name, "con" | "prn" | "aux" | "nul")
+        && !(name.len() == 4
+            && matches!(&name[..3], "com" | "lpt")
+            && matches!(name.as_bytes()[3], b'1'..=b'9'))
 }
 
 pub(crate) fn load_settings(profile: &AppProfile) -> AppSettings {
@@ -143,7 +147,16 @@ mod tests {
     #[test]
     fn automation_profiles_are_validated_and_isolated() {
         assert!(valid_profile_name("smoke-a"));
-        for invalid in ["", "UPPER", "has_space", "../escape", "-leading"] {
+        for invalid in [
+            "",
+            "UPPER",
+            "has_space",
+            "../escape",
+            "-leading",
+            "con",
+            "com1",
+            "lpt9",
+        ] {
             assert!(!valid_profile_name(invalid), "{invalid}");
         }
 
