@@ -58,7 +58,7 @@ use recorder::Recorder;
 mod remote_commands;
 use remote_commands::{parse_osc_command, resolve_udp_command, send_udp_command, strip_udp_prefix};
 mod settings;
-use settings::{load_settings, save_settings_from_state};
+use settings::{AppProfile, load_settings, save_settings_from_state};
 mod video_pipeline;
 mod video_timing;
 #[cfg(windows)]
@@ -399,6 +399,7 @@ struct App {
 
     // ── app state ──
     cuepool: CuePoolApp,
+    profile: AppProfile,
     show_engine: ShowEngine,
     engine_epoch: Instant,
     window_ids: Option<WindowIds>,
@@ -536,6 +537,7 @@ enum ShowControlCommand {
     Resume,
     Preload,
     Seek { instance_id: u64, seconds: f32 },
+    Shutdown,
 }
 
 impl App {
@@ -550,6 +552,7 @@ impl App {
         zero_copy: ZeroCopyAvailability,
         hap_acceleration: HapAcceleration,
         cuepool: CuePoolApp,
+        profile: AppProfile,
     ) -> Self {
         let show_engine = ShowEngine::new(cuepool.state().clone(), None);
         // Protocol settings from project settings (fallback to defaults)
@@ -754,7 +757,7 @@ impl App {
                 .expect("spawn video consume thread")
         };
 
-        let api = match api::start(Arc::clone(cuepool.state())) {
+        let api = match api::start(Arc::clone(cuepool.state()), profile.name().into()) {
             Ok(api) => Some(api),
             Err(error) => {
                 log::error!("CuePool API unavailable: {error}");
@@ -779,6 +782,7 @@ impl App {
             registered_fonts: std::collections::HashSet::new(),
             egui_renderer: None,
             cuepool,
+            profile,
             show_engine,
             engine_epoch: Instant::now(),
             window_ids: None,
@@ -2152,7 +2156,7 @@ impl App {
     /// everything on `process::exit`, just like the Ctrl-C handler and Dock-quit.
     fn hard_exit(&self, reason: &str) -> ! {
         log::info!(target: PERSIST_TARGET, "Shutdown requested: {reason}");
-        save_settings_from_state(self.cuepool.state());
+        save_settings_from_state(&self.profile, self.cuepool.state());
         #[cfg(windows)]
         win_timer::release();
         log::info!(target: PERSIST_TARGET, "Shutdown complete: {reason}");
@@ -2543,6 +2547,7 @@ impl App {
                 instance_id,
                 seconds,
             },
+            ApiCommand::Shutdown => ShowControlCommand::Shutdown,
         };
         self.execute_show_control(command, event_loop)
     }
@@ -2643,6 +2648,16 @@ impl App {
                 )?;
                 Ok(format!(
                     "cue instance {instance_id} seeked to {seconds:.3}s"
+                ))
+            }
+            ShowControlCommand::Shutdown => {
+                let dirty = self.cuepool.state().lock_unpoisoned().dirty;
+                if let Some(message) = shutdown_rejection(dirty, self.show_control_is_active()) {
+                    return Err(message.into());
+                }
+                Ok(format!(
+                    "profile '{}' accepted shutdown",
+                    self.profile.name()
                 ))
             }
         }
@@ -4027,6 +4042,13 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(api) = self.api.as_ref() {
             api.mark_alive();
         }
+        if self
+            .api
+            .as_ref()
+            .is_some_and(ApiRuntime::shutdown_response_delivered)
+        {
+            self.hard_exit("authenticated API shutdown");
+        }
         // Quit confirmed by the in-app modal — hard-exit (see hard_exit for why).
         if self.cuepool.state().lock().map(|s| s.quit).unwrap_or(false) {
             self.hard_exit("operator confirmed discard and quit");
@@ -4450,6 +4472,16 @@ impl ApplicationHandler<AppEvent> for App {
     }
 }
 
+fn shutdown_rejection(dirty: bool, active: bool) -> Option<&'static str> {
+    if active {
+        Some("cues are active; stop playback before shutting down")
+    } else if dirty {
+        Some("the project has unsaved changes; save or discard them before shutting down")
+    } else {
+        None
+    }
+}
+
 fn resolve_cli_project_path(path: &Path, cwd: &Path) -> Result<PathBuf, String> {
     let resolved = if path.is_absolute() {
         path.to_path_buf()
@@ -4502,13 +4534,6 @@ fn parse_cli_project(args: impl IntoIterator<Item = OsString>) -> Result<Option<
     Ok(project)
 }
 
-fn persistent_log_path() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("CuePool")
-        .join("cuepool.log")
-}
-
 fn load_startup_project(cuepool: &CuePoolApp, path: &Path) -> Result<(), String> {
     let data = std::fs::read_to_string(path)
         .map_err(|error| format!("Cannot read startup project '{}': {error}", path.display()))?;
@@ -4545,7 +4570,9 @@ fn optional_feature_candidates(
 }
 
 fn main() -> anyhow::Result<()> {
-    let log_file = match cuepool_gui::logging::init_logger(&persistent_log_path()) {
+    let profile = AppProfile::from_env()
+        .map_err(|message| startup_error("Could not start CuePool", message))?;
+    let log_file = match cuepool_gui::logging::init_logger(&profile.persistent_log_path()) {
         Ok(path) => path.display().to_string(),
         Err(error) => format!("unavailable: {error}"),
     };
@@ -4564,10 +4591,11 @@ fn main() -> anyhow::Result<()> {
 
     log::info!(
         target: PERSIST_TARGET,
-        "CuePool {} starting",
-        cuepool_gui::build_identity()
+        "CuePool {} starting: profile={}",
+        cuepool_gui::build_identity(),
+        profile.name()
     );
-    let result = run(log_file);
+    let result = run(log_file, profile);
     match &result {
         Ok(()) => log::info!(target: PERSIST_TARGET, "CuePool shutdown complete"),
         Err(error) => log::error!(target: PERSIST_TARGET, "CuePool exiting with error: {error:#}"),
@@ -4576,7 +4604,7 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-fn run(log_file: String) -> anyhow::Result<()> {
+fn run(log_file: String, profile: AppProfile) -> anyhow::Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     let cwd = std::env::current_dir().map_err(|error| {
         startup_error(
@@ -4601,15 +4629,7 @@ fn run(log_file: String) -> anyhow::Result<()> {
         log::info!("CuePool startup: resolved_project=<none>");
     }
 
-    // Single instance guard. On Unix the name is a filesystem path, and
-    // Finder launches apps with cwd=/ (read-only), so use an absolute temp path.
-    #[cfg(unix)]
-    let lock_name = std::env::temp_dir()
-        .join("CuePool.lock")
-        .to_string_lossy()
-        .into_owned();
-    #[cfg(not(unix))]
-    let lock_name = "CuePool".to_string();
+    let lock_name = profile.lock_name();
     let single = single_instance::SingleInstance::new(&lock_name).map_err(|error| {
         startup_error(
             "Could not start CuePool",
@@ -4624,7 +4644,7 @@ fn run(log_file: String) -> anyhow::Result<()> {
     }
 
     let cuepool = CuePoolApp::new();
-    let settings = load_settings();
+    let settings = load_settings(&profile);
     {
         let mut state = cuepool.state().lock_unpoisoned();
         state.recent_files = settings.recent_files;
@@ -4756,6 +4776,7 @@ fn run(log_file: String) -> anyhow::Result<()> {
         zero_copy,
         hap_acceleration,
         cuepool,
+        profile,
     );
 
     // Ctrl-C / SIGTERM handler for graceful emergency save
@@ -4777,7 +4798,7 @@ fn run(log_file: String) -> anyhow::Result<()> {
     }
 
     // Save persisted settings
-    save_settings_from_state(app.cuepool.state());
+    save_settings_from_state(&app.profile, app.cuepool.state());
 
     // Graceful exit (never reached via hard_exit, which process::exit()s):
     // stop and join the consume thread like the render threads.
@@ -4886,6 +4907,19 @@ mod tests {
         assert_eq!(
             message.args,
             vec![rosc::OscType::String("stage-left".into())]
+        );
+    }
+
+    #[test]
+    fn unattended_shutdown_requires_an_idle_clean_project() {
+        assert_eq!(shutdown_rejection(false, false), None);
+        assert_eq!(
+            shutdown_rejection(false, true),
+            Some("cues are active; stop playback before shutting down")
+        );
+        assert_eq!(
+            shutdown_rejection(true, false),
+            Some("the project has unsaved changes; save or discard them before shutting down")
         );
     }
 
