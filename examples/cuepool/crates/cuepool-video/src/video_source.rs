@@ -4,7 +4,11 @@ use crate::frame::{BitDepth, ChromaSubsample, VideoFrame, YuvPlane};
 use ffmpeg_next::Packet;
 use ffmpeg_next::{codec, color, ffi, format, frame, media::Type, software::scaling, threading};
 use hap_parser::{HapFrame, TextureFormat as HapFormat};
+use std::ffi::{CString, c_int, c_void};
+use std::ptr;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -93,6 +97,43 @@ pub struct VideoFrameTimings {
     pub plane_copy: Duration,
 }
 
+/// GPU capability passed by the renderer when native HAP uploads are safe.
+#[derive(Clone, Debug)]
+pub struct HapAcceleration {
+    max_texture_dimension_2d: Option<u32>,
+    fallback_reason: Option<String>,
+}
+
+/// Cue-lifetime memory of a native-HAP fallback decision.
+#[derive(Clone, Default)]
+pub struct HapFallbackSession(Arc<OnceLock<String>>);
+
+impl HapFallbackSession {
+    fn reason(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
+
+    fn record(&self, reason: String) {
+        let _ = self.0.set(reason);
+    }
+}
+
+impl HapAcceleration {
+    pub fn available(max_texture_dimension_2d: u32) -> Self {
+        Self {
+            max_texture_dimension_2d: Some(max_texture_dimension_2d),
+            fallback_reason: None,
+        }
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            max_texture_dimension_2d: None,
+            fallback_reason: Some(reason.into()),
+        }
+    }
+}
+
 /// A hardware decode candidate: device type, the hw pixel format its frames
 /// arrive in, and a log label.
 type HwKind = (ffi::AVHWDeviceType, ffi::AVPixelFormat, &'static str);
@@ -162,7 +203,11 @@ enum VideoBackend {
 pub struct VideoSource {
     path: String,
     frame_pool: Arc<FramePool>,
+    hap_fallback_session: HapFallbackSession,
+    interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
     fallback_decode_time: Duration,
+    recovering_fallback_reason: Option<String>,
+    terminal_error: Option<String>,
     backend: VideoBackend,
 }
 
@@ -198,16 +243,20 @@ impl std::fmt::Display for HapPacketError {
 
 struct HapVideoSource {
     ictx: format::context::Input,
+    // Must outlive `ictx`: FFmpeg's interrupt callback points into this Arc.
+    _interrupt: Option<Arc<AtomicBool>>,
     stream_index: usize,
     time_base: f64,
     width: u32,
     height: u32,
     frame_duration: f64,
+    format: HapFormat,
     max_texture_dimension_2d: u32,
     next_pts: f64,
-    pending: Option<(Packet, HapFrame, Duration)>,
+    pending: Option<(Packet, Duration)>,
     last_timings: VideoFrameTimings,
     corrupt_warned: bool,
+    corrupt_streak: u32,
 }
 
 impl VideoSource {
@@ -216,10 +265,15 @@ impl VideoSource {
     }
 
     pub fn open_with_pool(path: &str, frame_pool: Arc<FramePool>) -> anyhow::Result<Self> {
-        Self::open_with_pool_and_hap(
+        Self::open_backend(
             path,
             frame_pool,
-            Some(wgpu::Limits::default().max_texture_dimension_2d),
+            None,
+            HapAcceleration::unavailable(
+                "GPU-native HAP unavailable: caller did not provide GPU BC capability",
+            ),
+            HapFallbackSession::default(),
+            None,
         )
     }
 
@@ -228,7 +282,51 @@ impl VideoSource {
         frame_pool: Arc<FramePool>,
         native_hap_max_dimension: Option<u32>,
     ) -> anyhow::Result<Self> {
-        Self::open_backend(path, frame_pool, None, native_hap_max_dimension)
+        let hap = native_hap_max_dimension.map_or_else(
+            || {
+                HapAcceleration::unavailable(
+                    "GPU-native HAP unavailable: GPU device lacks BC texture compression",
+                )
+            },
+            HapAcceleration::available,
+        );
+        Self::open_backend(
+            path,
+            frame_pool,
+            None,
+            hap,
+            HapFallbackSession::default(),
+            None,
+        )
+    }
+
+    pub fn open_with_hap_acceleration(
+        path: &str,
+        frame_pool: Arc<FramePool>,
+        hap_acceleration: HapAcceleration,
+    ) -> anyhow::Result<Self> {
+        Self::open_with_hap_acceleration_and_session(
+            path,
+            frame_pool,
+            hap_acceleration,
+            HapFallbackSession::default(),
+        )
+    }
+
+    pub fn open_with_hap_acceleration_and_session(
+        path: &str,
+        frame_pool: Arc<FramePool>,
+        hap_acceleration: HapAcceleration,
+        hap_fallback_session: HapFallbackSession,
+    ) -> anyhow::Result<Self> {
+        Self::open_backend(
+            path,
+            frame_pool,
+            None,
+            hap_acceleration,
+            hap_fallback_session,
+            None,
+        )
     }
 
     pub fn open_with_zero_copy(
@@ -240,7 +338,9 @@ impl VideoSource {
             path,
             frame_pool,
             availability,
-            Some(wgpu::Limits::default().max_texture_dimension_2d),
+            HapAcceleration::unavailable(
+                "GPU-native HAP unavailable: caller did not provide GPU BC capability",
+            ),
         )
     }
 
@@ -248,13 +348,66 @@ impl VideoSource {
         path: &str,
         frame_pool: Arc<FramePool>,
         availability: ZeroCopyAvailability,
-        native_hap_max_dimension: Option<u32>,
+        hap_acceleration: HapAcceleration,
+    ) -> anyhow::Result<Self> {
+        Self::open_with_acceleration_and_session(
+            path,
+            frame_pool,
+            availability,
+            hap_acceleration,
+            HapFallbackSession::default(),
+        )
+    }
+
+    pub fn open_with_acceleration_and_session(
+        path: &str,
+        frame_pool: Arc<FramePool>,
+        availability: ZeroCopyAvailability,
+        hap_acceleration: HapAcceleration,
+        hap_fallback_session: HapFallbackSession,
     ) -> anyhow::Result<Self> {
         Self::open_backend(
             path,
             frame_pool,
             Some(availability),
-            native_hap_max_dimension,
+            hap_acceleration,
+            hap_fallback_session,
+            None,
+        )
+    }
+
+    pub fn open_with_acceleration_and_session_cancellable(
+        path: &str,
+        frame_pool: Arc<FramePool>,
+        availability: ZeroCopyAvailability,
+        hap_acceleration: HapAcceleration,
+        hap_fallback_session: HapFallbackSession,
+        stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<Self> {
+        Self::open_backend(
+            path,
+            frame_pool,
+            Some(availability),
+            hap_acceleration,
+            hap_fallback_session,
+            Some(stop_flag),
+        )
+    }
+
+    pub fn open_with_hap_acceleration_and_session_cancellable(
+        path: &str,
+        frame_pool: Arc<FramePool>,
+        hap_acceleration: HapAcceleration,
+        hap_fallback_session: HapFallbackSession,
+        stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<Self> {
+        Self::open_backend(
+            path,
+            frame_pool,
+            None,
+            hap_acceleration,
+            hap_fallback_session,
+            Some(stop_flag),
         )
     }
 
@@ -262,35 +415,83 @@ impl VideoSource {
         path: &str,
         frame_pool: Arc<FramePool>,
         availability: Option<ZeroCopyAvailability>,
-        native_hap_max_dimension: Option<u32>,
+        hap_acceleration: HapAcceleration,
+        hap_fallback_session: HapFallbackSession,
+        stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<Self> {
+        if stop_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            anyhow::bail!("video open cancelled");
+        }
+        if let Some(reason) = hap_fallback_session.reason() {
+            let reason =
+                format!("GPU-native HAP disabled for this cue after prior fallback: {reason}");
+            let source = FfmpegVideoSource::open_with_options(
+                path,
+                Arc::clone(&frame_pool),
+                OpenOptions::software(Some(reason.clone())),
+                None,
+                stop_flag.clone(),
+            )?;
+            return Ok(Self {
+                path: path.to_owned(),
+                frame_pool,
+                hap_fallback_session,
+                interrupt: stop_flag,
+                fallback_decode_time: Duration::ZERO,
+                recovering_fallback_reason: Some(reason),
+                terminal_error: None,
+                backend: VideoBackend::Ffmpeg(source),
+            });
+        }
         let unavailable = hap_unavailable_reason(
             std::env::var("QPLAYER_NO_HWACCEL").as_deref() == Ok("1"),
-            native_hap_max_dimension.is_some(),
+            hap_acceleration.fallback_reason.as_deref(),
         );
         match HapVideoSource::probe(
             path,
             unavailable,
-            native_hap_max_dimension.unwrap_or_default(),
+            hap_acceleration
+                .max_texture_dimension_2d
+                .unwrap_or_default(),
+            stop_flag.clone(),
         )? {
             HapProbe::Native(source) => Ok(Self {
                 path: path.to_owned(),
                 frame_pool,
+                hap_fallback_session,
+                interrupt: stop_flag,
                 fallback_decode_time: Duration::ZERO,
+                recovering_fallback_reason: None,
+                terminal_error: None,
                 backend: VideoBackend::Hap(*source),
             }),
             HapProbe::Fallback(reason) => {
+                if stop_flag
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    anyhow::bail!("video open cancelled");
+                }
+                hap_fallback_session.record(reason.clone());
                 log::warn!("Video decode: {reason}; using FFmpeg software fallback");
                 let source = FfmpegVideoSource::open_with_options(
                     path,
                     Arc::clone(&frame_pool),
-                    OpenOptions::software(Some(reason)),
+                    OpenOptions::software(Some(reason.clone())),
                     None,
+                    stop_flag.clone(),
                 )?;
                 Ok(Self {
                     path: path.to_owned(),
                     frame_pool,
+                    hap_fallback_session,
+                    interrupt: stop_flag,
                     fallback_decode_time: Duration::ZERO,
+                    recovering_fallback_reason: Some(reason),
+                    terminal_error: None,
                     backend: VideoBackend::Ffmpeg(source),
                 })
             }
@@ -300,11 +501,16 @@ impl VideoSource {
                     Arc::clone(&frame_pool),
                     OpenOptions::hardware(availability),
                     Some(input),
+                    stop_flag.clone(),
                 )?;
                 Ok(Self {
                     path: path.to_owned(),
                     frame_pool,
+                    hap_fallback_session,
+                    interrupt: stop_flag,
                     fallback_decode_time: Duration::ZERO,
+                    recovering_fallback_reason: None,
+                    terminal_error: None,
                     backend: VideoBackend::Ffmpeg(source),
                 })
             }
@@ -334,6 +540,15 @@ impl VideoSource {
                 VideoBackend::Ffmpeg(source) => {
                     let frame = source.read_frame();
                     source.last_timings.decode += std::mem::take(&mut self.fallback_decode_time);
+                    if frame.is_some() {
+                        self.recovering_fallback_reason = None;
+                    } else if let Some(reason) = self.recovering_fallback_reason.take() {
+                        let message = format!(
+                            "software fallback produced no recoverable frame after {reason}"
+                        );
+                        log::error!("Video decode: {message}");
+                        self.terminal_error = Some(message);
+                    }
                     return frame;
                 }
                 VideoBackend::Hap(source) => source.read_frame(stop_flag),
@@ -346,26 +561,47 @@ impl VideoSource {
                     pts,
                     decode_time,
                 } => {
+                    if stop_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        return None;
+                    }
+                    self.hap_fallback_session.record(reason.clone());
                     log::warn!("Video decode: {reason}; reopening in FFmpeg software at {pts:.3}s");
+                    let recovery_started = Instant::now();
                     let mut source = match FfmpegVideoSource::open_with_options(
                         &self.path,
                         Arc::clone(&self.frame_pool),
-                        OpenOptions::software(Some(reason)),
+                        OpenOptions::software(Some(reason.clone())),
                         None,
+                        self.interrupt.clone(),
                     ) {
                         Ok(source) => source,
                         Err(error) => {
-                            log::error!("Video decode: mid-stream software reopen failed: {error}");
+                            let message = format!(
+                                "mid-stream software reopen failed after {reason}: {error}"
+                            );
+                            log::error!("Video decode: {message}");
+                            self.fallback_decode_time += recovery_started.elapsed();
+                            self.terminal_error = Some(message);
                             return None;
                         }
                     };
+                    if stop_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        return None;
+                    }
                     if pts > 0.0
                         && let Err(error) = source.seek_before(pts)
                     {
-                        log::error!("Video decode: mid-stream software seek failed: {error}");
+                        let message =
+                            format!("mid-stream software seek failed after {reason}: {error}");
+                        log::error!("Video decode: {message}");
+                        self.fallback_decode_time += recovery_started.elapsed();
+                        self.terminal_error = Some(message);
                         return None;
                     }
-                    self.fallback_decode_time += decode_time;
+                    self.fallback_decode_time += decode_time + recovery_started.elapsed();
+                    self.recovering_fallback_reason = Some(reason);
                     self.backend = VideoBackend::Ffmpeg(source);
                 }
             }
@@ -415,17 +651,28 @@ impl VideoSource {
     }
 
     pub fn last_timings(&self) -> VideoFrameTimings {
-        match &self.backend {
+        let mut timings = match &self.backend {
             VideoBackend::Ffmpeg(source) => source.last_timings(),
             VideoBackend::Hap(source) => source.last_timings,
+        };
+        if matches!(&self.backend, VideoBackend::Hap(_)) {
+            timings.decode += self.fallback_decode_time;
         }
+        timings
     }
 
     pub fn fallback_reason(&self) -> Option<&str> {
+        if let Some(error) = self.terminal_error.as_deref() {
+            return Some(error);
+        }
         match &self.backend {
             VideoBackend::Ffmpeg(source) => source.fallback_reason(),
             VideoBackend::Hap(_) => None,
         }
+    }
+
+    pub fn failed(&self) -> bool {
+        self.terminal_error.is_some()
     }
 
     #[cfg(windows)]
@@ -444,13 +691,11 @@ impl VideoSource {
     }
 }
 
-fn hap_unavailable_reason(no_hw_accel: bool, allow_native_hap: bool) -> Option<&'static str> {
+fn hap_unavailable_reason(no_hw_accel: bool, fallback_reason: Option<&str>) -> Option<&str> {
     if no_hw_accel {
         Some("GPU-native HAP disabled by QPLAYER_NO_HWACCEL=1")
-    } else if !allow_native_hap {
-        Some("GPU-native HAP unavailable: GPU device lacks BC texture compression")
     } else {
-        None
+        fallback_reason
     }
 }
 
@@ -464,6 +709,7 @@ const HAP_CHUNK_SIZES: u8 = 0x03;
 const HAP_CHUNK_OFFSETS: u8 = 0x04;
 const HAP_CHUNK_NONE: u8 = 0x0A;
 const HAP_CHUNK_SNAPPY: u8 = 0x0B;
+const MAX_CONSECUTIVE_CORRUPT_HAP_PACKETS: u32 = 120;
 
 fn hap_section(data: &[u8]) -> Result<(u8, &[u8], usize), String> {
     if data.len() < 4 {
@@ -644,14 +890,71 @@ fn validate_hap_packet(
     Ok(format)
 }
 
+extern "C" fn ffmpeg_interrupt_callback(opaque: *mut c_void) -> c_int {
+    if opaque.is_null() {
+        return 0;
+    }
+    // SAFETY: `open_input` points this at an AtomicBool owned by an Arc that is
+    // retained until after the corresponding AVFormatContext is closed.
+    unsafe { (&*(opaque.cast::<AtomicBool>())).load(Ordering::Relaxed) as c_int }
+}
+
+fn open_input(
+    path: &str,
+    interrupt: Option<&Arc<AtomicBool>>,
+) -> Result<format::context::Input, ffmpeg_next::Error> {
+    let Some(stop) = interrupt else {
+        return format::input(path);
+    };
+    let path = CString::new(path).map_err(|_| ffmpeg_next::Error::InvalidData)?;
+    // ffmpeg-next 8.1's input_with_interrupt leaks its boxed callback. Point
+    // directly into our retained Arc instead, so there is no callback allocation
+    // to reclaim after repeated loop/fallback reopens.
+    unsafe {
+        let mut context = ffi::avformat_alloc_context();
+        if context.is_null() {
+            return Err(ffmpeg_next::Error::Unknown);
+        }
+        (*context).interrupt_callback = ffi::AVIOInterruptCB {
+            callback: Some(ffmpeg_interrupt_callback),
+            opaque: Arc::as_ptr(stop).cast_mut().cast(),
+        };
+        let opened = ffi::avformat_open_input(
+            &mut context,
+            path.as_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        if opened < 0 {
+            if !context.is_null() {
+                ffi::avformat_close_input(&mut context);
+            }
+            return Err(ffmpeg_next::Error::from(opened));
+        }
+        let streams = ffi::avformat_find_stream_info(context, ptr::null_mut());
+        if streams < 0 {
+            ffi::avformat_close_input(&mut context);
+            return Err(ffmpeg_next::Error::from(streams));
+        }
+        Ok(format::context::Input::wrap(context))
+    }
+}
+
 impl HapVideoSource {
     fn probe(
         path: &str,
         unavailable: Option<&str>,
         max_texture_dimension_2d: u32,
+        stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<HapProbe> {
         ffmpeg_next::init()?;
-        let mut ictx = format::input(path)?;
+        let mut ictx = open_input(path, stop_flag.as_ref())?;
+        if stop_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            anyhow::bail!("video open cancelled");
+        }
         let (stream_index, time_base, width, height, frame_duration, is_hap) = {
             let input = ictx
                 .streams()
@@ -688,38 +991,51 @@ impl HapVideoSource {
             )));
         }
         let started = Instant::now();
-        let Some(packet) = ictx
-            .packets()
-            .find_map(|(stream, packet)| (stream.index() == stream_index).then_some(packet))
-        else {
+        let mut first_packet = None;
+        for (stream, packet) in ictx.packets() {
+            if stop_flag
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                anyhow::bail!("video open cancelled");
+            }
+            if stream.index() == stream_index {
+                first_packet = Some(packet);
+                break;
+            }
+        }
+        let Some(packet) = first_packet else {
             return Ok(HapProbe::Fallback(
                 "GPU-native HAP first packet unavailable".into(),
             ));
         };
-        let parsed = match Self::parse_packet(&packet, width, height, max_texture_dimension_2d) {
-            Ok(frame) => frame,
+        let data = packet
+            .data()
+            .ok_or_else(|| anyhow::anyhow!("GPU-native HAP first packet unavailable"))?;
+        let format = match validate_hap_packet(data, width, height, max_texture_dimension_2d) {
+            Ok(format) => format,
             Err(error) => {
                 return Ok(HapProbe::Fallback(format!(
                     "GPU-native HAP first packet invalid: {error}"
                 )));
             }
         };
-        log::info!(
-            "Video decode: HAP GPU-native path selected ({:?})",
-            parsed.format
-        );
+        log::info!("Video decode: HAP GPU-native path selected ({:?})", format);
         Ok(HapProbe::Native(Box::new(Self {
             ictx,
+            _interrupt: stop_flag,
             stream_index,
             time_base,
             width,
             height,
             frame_duration,
+            format,
             max_texture_dimension_2d,
             next_pts: 0.0,
-            pending: Some((packet, parsed, started.elapsed())),
+            pending: Some((packet, started.elapsed())),
             last_timings: VideoFrameTimings::default(),
             corrupt_warned: false,
+            corrupt_streak: 0,
         })))
     }
 
@@ -766,9 +1082,33 @@ impl HapVideoSource {
             if stop_flag.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
                 return HapRead::Eof;
             }
-            if let Some((packet, parsed, elapsed)) = self.pending.take() {
-                self.last_timings.decode = elapsed;
-                return HapRead::Frame(self.frame_from_packet(packet, parsed));
+            if let Some((packet, elapsed)) = self.pending.take() {
+                let started = Instant::now();
+                match Self::parse_packet(
+                    &packet,
+                    self.width,
+                    self.height,
+                    self.max_texture_dimension_2d,
+                ) {
+                    Ok(parsed) => {
+                        self.last_timings.decode = elapsed + started.elapsed();
+                        return HapRead::Frame(self.frame_from_packet(packet, parsed));
+                    }
+                    Err(error) => {
+                        self.last_timings.decode = elapsed + started.elapsed();
+                        let pts = packet
+                            .pts()
+                            .or(packet.dts())
+                            .map(|value| value as f64 * self.time_base)
+                            .unwrap_or(self.next_pts)
+                            .max(0.0);
+                        return HapRead::Fallback {
+                            reason: format!("GPU-native HAP first packet invalid: {error}"),
+                            pts,
+                            decode_time: self.last_timings.decode,
+                        };
+                    }
+                }
             }
             let started = Instant::now();
             let mut next_packet = None;
@@ -792,6 +1132,23 @@ impl HapVideoSource {
             ) {
                 Ok(parsed) => {
                     self.last_timings.decode += started.elapsed();
+                    self.corrupt_streak = 0;
+                    if parsed.format != self.format {
+                        let pts = packet
+                            .pts()
+                            .or(packet.dts())
+                            .map(|value| value as f64 * self.time_base)
+                            .unwrap_or(self.next_pts)
+                            .max(0.0);
+                        return HapRead::Fallback {
+                            reason: format!(
+                                "GPU-native HAP variant changed mid-stream: expected {:?}, got {:?}",
+                                self.format, parsed.format
+                            ),
+                            pts,
+                            decode_time: self.last_timings.decode,
+                        };
+                    }
                     return HapRead::Frame(self.frame_from_packet(packet, parsed));
                 }
                 Err(HapPacketError::Unsupported(reason)) => {
@@ -810,8 +1167,25 @@ impl HapVideoSource {
                 }
                 Err(HapPacketError::Corrupt(error)) => {
                     self.last_timings.decode += started.elapsed();
+                    self.corrupt_streak += 1;
                     if !std::mem::replace(&mut self.corrupt_warned, true) {
                         log::warn!("Video decode: skipping corrupt HAP packet: {error}");
+                    }
+                    if self.corrupt_streak >= MAX_CONSECUTIVE_CORRUPT_HAP_PACKETS {
+                        let pts = packet
+                            .pts()
+                            .or(packet.dts())
+                            .map(|value| value as f64 * self.time_base)
+                            .unwrap_or(self.next_pts)
+                            .max(0.0);
+                        return HapRead::Fallback {
+                            reason: format!(
+                                "GPU-native HAP encountered {} consecutive corrupt packets",
+                                self.corrupt_streak
+                            ),
+                            pts,
+                            decode_time: self.last_timings.decode,
+                        };
                     }
                 }
             }
@@ -825,6 +1199,7 @@ impl HapVideoSource {
         self.pending = None;
         self.next_pts = secs;
         self.corrupt_warned = false;
+        self.corrupt_streak = 0;
         Ok(())
     }
 
@@ -839,6 +1214,8 @@ struct FfmpegVideoSource {
     /// Kept so a broken hwaccel can reopen the whole source in software.
     path: String,
     ictx: format::context::Input,
+    // Must outlive `ictx`: FFmpeg's interrupt callback points into this Arc.
+    interrupt: Option<Arc<AtomicBool>>,
     decoder: codec::decoder::Video,
     stream_index: usize,
     time_base: f64,
@@ -1038,6 +1415,7 @@ impl FfmpegVideoSource {
         frame_pool: Arc<FramePool>,
         options: OpenOptions,
         mut input_context: Option<format::context::Input>,
+        interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<Self> {
         let OpenOptions {
             route,
@@ -1063,6 +1441,7 @@ impl FfmpegVideoSource {
                 no_direct_pool(),
                 fallback_reason,
                 input_context.take(),
+                interrupt,
             );
         }
         for &hw in HW_CANDIDATES {
@@ -1080,6 +1459,7 @@ impl FfmpegVideoSource {
                     Some(request.clone()),
                     None,
                     input_context.take(),
+                    interrupt.clone(),
                 ) {
                     Ok(source) => return Ok(source),
                     Err(error) => {
@@ -1100,6 +1480,7 @@ impl FfmpegVideoSource {
                 no_direct_pool(),
                 fallback_reason.clone(),
                 input_context.take(),
+                interrupt.clone(),
             ) {
                 Ok(src) => return Ok(src),
                 Err(e) => log::warn!("Video decode: {} unavailable ({e})", hw.2),
@@ -1112,6 +1493,7 @@ impl FfmpegVideoSource {
             no_direct_pool(),
             fallback_reason,
             input_context.take(),
+            interrupt,
         )
     }
 
@@ -1122,12 +1504,13 @@ impl FfmpegVideoSource {
         _direct_pool: DirectPoolOption,
         fallback_reason: Option<String>,
         input_context: Option<format::context::Input>,
+        interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<Self> {
         ffmpeg_next::init()?;
 
         let ictx = match input_context {
             Some(input) => input,
-            None => format::input(path)?,
+            None => open_input(path, interrupt.as_ref())?,
         };
         let input = ictx
             .streams()
@@ -1224,6 +1607,7 @@ impl FfmpegVideoSource {
 
         Ok(Self {
             path: path.to_string(),
+            interrupt,
             ictx,
             decoder,
             stream_index,
@@ -1465,7 +1849,13 @@ impl FfmpegVideoSource {
             "Video zero-copy fallback: {}; retrying hardware readback",
             options.fallback_reason.as_deref().unwrap_or_default()
         );
-        match Self::open_with_options(&path, Arc::clone(&self.frame_pool), options, None) {
+        match Self::open_with_options(
+            &path,
+            Arc::clone(&self.frame_pool),
+            options,
+            None,
+            self.interrupt.clone(),
+        ) {
             Ok(source) => {
                 *self = source;
                 true
@@ -1500,6 +1890,7 @@ impl FfmpegVideoSource {
             Arc::clone(&self.frame_pool),
             OpenOptions::software(self.fallback_reason.clone()),
             None,
+            self.interrupt.clone(),
         ) {
             Ok(src) => {
                 log::warn!("Video decode: hardware broke on first frame, reopened in software");
@@ -1669,11 +2060,57 @@ mod tests {
             writer.finalize().unwrap();
             Self { dir, path }
         }
+
+        fn with_midstream_supported_format_change() -> Self {
+            let id = NEXT_MEDIA_ID.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("cuepool-hap-test-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("fixture.mov");
+            let first = HapFrameEncoder::new(QtHapFormat::Hap1, 8, 8).unwrap();
+            let second = HapFrameEncoder::new(QtHapFormat::Hap5, 8, 8).unwrap();
+            let mut writer =
+                QtHapWriter::create(&path, VideoConfig::new(8, 8, 50.0, QtHapFormat::Hap1))
+                    .unwrap();
+            writer
+                .write_frame(&first.encode(&[64; 8 * 8 * 4]).unwrap())
+                .unwrap();
+            writer
+                .write_frame(&second.encode(&[128; 8 * 8 * 4]).unwrap())
+                .unwrap();
+            writer.finalize().unwrap();
+            Self { dir, path }
+        }
+
+        fn with_malformed_first_packet() -> Self {
+            let id = NEXT_MEDIA_ID.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("cuepool-hap-test-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("fixture.mov");
+            let mut writer =
+                QtHapWriter::create(&path, VideoConfig::new(8, 8, 50.0, QtHapFormat::Hap1))
+                    .unwrap();
+            writer.write_frame(&[1, 2, 3]).unwrap();
+            writer.finalize().unwrap();
+            Self { dir, path }
+        }
     }
 
     impl Drop for TempHap {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn interruptible_input_does_not_retain_the_stop_flag_after_drop() {
+        let media = TempHap::new(QtHapFormat::Hap1, 4, 4, 1);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        for _ in 0..8 {
+            drop(open_input(media.path.to_str().unwrap(), Some(&stop)).unwrap());
+            assert_eq!(Arc::strong_count(&stop), 1);
         }
     }
 
@@ -1700,13 +2137,19 @@ mod tests {
 
     #[test]
     fn hap_disable_reasons_are_explicit_and_prioritise_the_escape_hatch() {
-        assert_eq!(hap_unavailable_reason(false, true), None);
+        assert_eq!(hap_unavailable_reason(false, None), None);
         assert_eq!(
-            hap_unavailable_reason(false, false),
+            hap_unavailable_reason(
+                false,
+                Some("GPU-native HAP unavailable: GPU device lacks BC texture compression")
+            ),
             Some("GPU-native HAP unavailable: GPU device lacks BC texture compression")
         );
         assert_eq!(
-            hap_unavailable_reason(true, false),
+            hap_unavailable_reason(
+                true,
+                Some("GPU-native HAP unavailable: GPU device lacks BC texture compression")
+            ),
             Some("GPU-native HAP disabled by QPLAYER_NO_HWACCEL=1")
         );
     }
@@ -1778,6 +2221,27 @@ mod tests {
     }
 
     #[test]
+    fn zero_frame_initial_fallback_is_a_failure_not_eof() {
+        let media = TempHap::with_malformed_first_packet();
+        let mut source = VideoSource::open_with_pool_and_hap(
+            media.path.to_str().unwrap(),
+            Arc::new(FramePool::new(0)),
+            Some(8_192),
+        )
+        .unwrap();
+
+        assert_eq!(source.decode_path(), "software");
+        assert!(source.read_frame().is_none());
+        assert!(source.failed());
+        assert!(
+            source
+                .fallback_reason()
+                .unwrap()
+                .contains("no recoverable frame")
+        );
+    }
+
+    #[test]
     fn malformed_hap_packet_is_rejected_before_gpu_upload() {
         let packet = Packet::copy(&[1, 2, 3]);
         assert!(HapVideoSource::parse_packet(&packet, 8, 8, 8_192).is_err());
@@ -1846,10 +2310,26 @@ mod tests {
             Some(8_192),
         )
         .unwrap();
-        let stop = std::sync::atomic::AtomicBool::new(true);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(true));
         assert!(source.read_frame_cancellable(&stop).is_none());
         stop.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(source.read_frame_cancellable(&stop).is_some());
+    }
+
+    #[test]
+    fn cancellation_stops_hap_open_before_packet_preflight() {
+        let media = TempHap::new(QtHapFormat::Hap1, 8, 8, 1);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let result = VideoSource::open_with_acceleration_and_session_cancellable(
+            media.path.to_str().unwrap(),
+            Arc::new(FramePool::new(0)),
+            ZeroCopyAvailability::declined("test"),
+            HapAcceleration::available(8_192),
+            HapFallbackSession::default(),
+            stop,
+        );
+
+        assert!(result.err().unwrap().to_string().contains("cancelled"));
     }
 
     #[test]
@@ -1865,14 +2345,84 @@ mod tests {
             source.read_frame().unwrap().pixels,
             FramePixels::Hap { .. }
         ));
-        let _ = source.read_frame();
+        assert!(source.read_frame().is_none());
         assert_eq!(source.decode_path(), "software");
+        assert!(source.failed());
+        assert!(source.last_timings().decode > Duration::ZERO);
         assert!(
             source
                 .fallback_reason()
                 .unwrap()
                 .contains("variant changed mid-stream")
         );
+    }
+
+    #[test]
+    fn supported_midstream_format_change_reopens_the_software_decoder() {
+        let media = TempHap::with_midstream_supported_format_change();
+        let mut source = VideoSource::open_with_pool_and_hap(
+            media.path.to_str().unwrap(),
+            Arc::new(FramePool::new(0)),
+            Some(8_192),
+        )
+        .unwrap();
+        assert!(matches!(
+            source.read_frame().unwrap().pixels,
+            FramePixels::Hap { .. }
+        ));
+
+        assert!(source.read_frame().is_none());
+
+        assert_eq!(source.decode_path(), "software");
+        assert!(source.failed());
+        assert!(
+            source
+                .fallback_reason()
+                .unwrap()
+                .contains("variant changed mid-stream")
+        );
+    }
+
+    #[test]
+    fn cue_session_keeps_software_fallback_across_reopens() {
+        let media = TempHap::with_midstream_supported_format_change();
+        let pool = Arc::new(FramePool::new(0));
+        let acceleration = HapAcceleration::available(8_192);
+        let session = HapFallbackSession::default();
+        let mut first = VideoSource::open_with_hap_acceleration_and_session(
+            media.path.to_str().unwrap(),
+            Arc::clone(&pool),
+            acceleration.clone(),
+            session.clone(),
+        )
+        .unwrap();
+        assert_eq!(first.decode_path(), "hap gpu-native");
+        assert!(first.read_frame().is_some());
+        assert!(first.read_frame().is_none());
+
+        let same_session = VideoSource::open_with_hap_acceleration_and_session(
+            media.path.to_str().unwrap(),
+            Arc::clone(&pool),
+            acceleration.clone(),
+            session,
+        )
+        .unwrap();
+        assert_eq!(same_session.decode_path(), "software");
+        assert!(
+            same_session
+                .fallback_reason()
+                .unwrap()
+                .contains("after prior fallback")
+        );
+
+        let fresh_session = VideoSource::open_with_hap_acceleration_and_session(
+            media.path.to_str().unwrap(),
+            pool,
+            acceleration,
+            HapFallbackSession::default(),
+        )
+        .unwrap();
+        assert_eq!(fresh_session.decode_path(), "hap gpu-native");
     }
 
     #[test]

@@ -37,7 +37,9 @@ pub use frame::{BitDepth, ChromaSubsample, FramePixels, VideoFrame, YuvPlane};
 pub use hap_converter::HapConverter;
 pub use pixel_sampler::PixelSampler;
 pub use projection_renderer::ProjectionRenderer;
-pub use video_source::{VideoFrameTimings, VideoSource, ZeroCopyPreference};
+pub use video_source::{
+    HapAcceleration, HapFallbackSession, VideoFrameTimings, VideoSource, ZeroCopyPreference,
+};
 pub use yuv_converter::YuvConverter;
 pub use zero_copy::ZeroCopyAvailability;
 
