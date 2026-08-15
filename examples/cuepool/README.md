@@ -80,6 +80,9 @@ PowerShell smoke script from an interactive desktop session:
 $commit = (git rev-parse --short=7 HEAD).Trim()
 $env:CUEPOOL_BUILD_ID = $commit
 cargo build --release --locked -p cuepool
+# A scheduled task does not inherit Cargo's DLL search path. Make the build
+# directory runnable before launching it in an interactive desktop session.
+Copy-Item "$env:FFMPEG_DIR\bin\*.dll" .\target\release\
 
 .\scripts\unattended-smoke.ps1 `
   -Executable .\target\release\cuepool.exe `
