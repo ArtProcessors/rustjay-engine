@@ -3380,8 +3380,6 @@ impl App {
                                 .map(|mut s| s.selected_cue_id = Some(qid_dec));
                         }
                     }
-                    OscEvent::Up => {}
-                    OscEvent::Down => {}
                     OscEvent::Save => {
                         if let Ok(mut state) = self.cuepool.state().lock() {
                             state.command_queue.push(AppCommand::SaveProject);
