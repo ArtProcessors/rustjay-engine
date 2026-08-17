@@ -21,8 +21,10 @@ controller rigs):
 | `/qplayer/unpause` | optional cue # | Resume all — or one cue |
 | `/qplayer/preload` | cue #, time | Decode a cue and hold it Ready |
 | `/qplayer/select` | cue # | Move the selection |
-| `/qplayer/up` / `/qplayer/down` | — | Move the selection |
 | `/qplayer/save` | — | Save the project |
+
+`/qplayer/up` and `/qplayer/down` from the original QPlayer protocol are not
+supported — move the selection with `/qplayer/select` and a cue number.
 
 Outbound messages are sent by [OSC cues](cues.md#osc) — command format
 `/address,arg1,arg2,…`.
