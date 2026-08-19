@@ -59,8 +59,11 @@ jobs:
           workspaces: examples/cuepool
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # --locked fails the job when Cargo.lock is out of step with the
+      # manifests (e.g. a version bump that skipped the lockfile), which
+      # otherwise leaves every deployment checkout permanently dirty.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
       - name: Security audit
         run: |
           cargo install cargo-audit --locked
