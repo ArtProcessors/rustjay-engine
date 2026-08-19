@@ -12,7 +12,7 @@
 | Enabled | Disabled cues are skipped. |
 | Loop | **OneShot**, **Looped** (× Loop Count), **LoopedInfinite**, **HoldLast** (hold the final frame/state). |
 | Retriggerable | When off, firing the cue again while it is still playing is ignored — prevents stacked audio or flashing video from a double GO. |
-| Remote Node | Fire this cue on a named [remote node](show-control.md#remote-nodes) instead of locally. |
+| Remote Node | Fire this cue on a named [remote node](show-control.md#remote-nodes) instead of locally. Pick from the detected machines rather than typing — the Inspector flags a name nothing answers to. |
 | Triggers | Optional per-cue hotkey / MIDI / wall-clock / timecode triggers — see [Show Control](show-control.md#per-cue-triggers). |
 
 ## Cue types
