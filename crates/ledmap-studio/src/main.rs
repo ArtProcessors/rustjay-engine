@@ -294,7 +294,9 @@ impl eframe::App for App {
 
 /// RGB8 → Rec.601 luma (77/150/29 ≈ /256).
 fn rgb_to_luma(rgb: &[u8]) -> Vec<u8> {
-    rgb.chunks_exact(3)
+    rgb.as_chunks::<3>()
+        .0
+        .iter()
         .map(|p| ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8) as u8)
         .collect()
 }

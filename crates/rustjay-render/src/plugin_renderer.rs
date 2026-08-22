@@ -836,9 +836,7 @@ impl<P: EffectPlugin> PluginRenderer<P> {
             }
             // Invalidate generation keys so bind groups are rebuilt even if
             // input_generation hasn't changed this frame (CORR-3).
-            for cached_gen in &mut self.cached_pass_texture_gens {
-                *cached_gen = u64::MAX;
-            }
+            self.cached_pass_texture_gens.fill(u64::MAX);
             for i in 0..needed_intermediates {
                 self.intermediate_textures
                     .push(Texture::create_render_target(
