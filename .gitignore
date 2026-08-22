@@ -53,3 +53,8 @@ dist/
 
 # Agent scratch planning/lessons (see ~/.claude/CLAUDE.md workflow)
 tasks/
+
+# egui_kittest writes these next to the committed baselines on every failing
+# snapshot run. The baseline `*.png` files are source; these are output.
+**/tests/snapshots/*.new.png
+**/tests/snapshots/*.diff.png

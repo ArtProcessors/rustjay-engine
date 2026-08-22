@@ -44,7 +44,7 @@ thiserror   = "2.0"
 flate2      = "1"
 
 # GPU / windowing
-wgpu        = { version = "29.0", features = ["spirv", "gles"] }
+wgpu        = { version = "30.0", features = ["spirv", "gles"] }
 winit       = "0.30"
 raw-window-handle = "0.6"
 pollster    = "0.4"
@@ -60,9 +60,9 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 imgui               = "0.12"
 imgui-wgpu          = "0.28"
 imgui-winit-support = "0.13"
-egui                = "0.34"
-egui-wgpu           = "0.34"
-egui-winit          = "0.34"
+egui                = "0.36"
+egui-wgpu           = "0.36"
+egui-winit          = "0.36"
 
 # Audio
 cpal    = "0.17"
@@ -106,9 +106,9 @@ isf             = { git = "https://github.com/BlueJayLouche/isf.git" }
 rustjay-projection = { path = "crates/rustjay-projection", version = "0.1.0" }
 rustjay-lighting   = { path = "crates/rustjay-lighting",   version = "0.1.0" }
 rustjay-ledmap     = { path = "crates/rustjay-ledmap",     version = "0.1.0" }
-syphon-core     = "0.3.0"
-syphon-metal    = "0.3.0"
-syphon-wgpu     = "0.3.0"
+syphon-core     = "0.4.0"
+syphon-metal    = "0.4.0"
+syphon-wgpu     = "0.4.0"
 
 [patch.crates-io]
 wgpu-hal = { path = "vendor/wgpu-hal" }

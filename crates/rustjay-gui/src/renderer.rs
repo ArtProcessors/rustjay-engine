@@ -42,6 +42,8 @@ impl ImGuiRenderer {
             .ok_or_else(|| anyhow::anyhow!("No surface formats available"))?;
 
         let surface_config = wgpu::SurfaceConfiguration {
+            // wgpu 30: Auto reproduces the pre-30 behaviour.
+            color_space: wgpu::SurfaceColorSpace::Auto,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width.max(1),
@@ -262,7 +264,7 @@ impl ImGuiRenderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        surface_texture.present();
+        self.queue.present(surface_texture);
 
         Ok(())
     }

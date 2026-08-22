@@ -73,7 +73,7 @@ impl ReadbackPool {
                     Ok(true) => {
                         let w = *width;
                         let h = *height;
-                        let data = buffer.slice(..).get_mapped_range().to_vec();
+                        let data = buffer.slice(..).get_mapped_range().expect("buffer mapped by map_async").to_vec();
                         buffer.unmap();
                         // Return the unmapped buffer to the slot cache so submit_copy
                         // can reuse it next frame without a GPU allocator call.

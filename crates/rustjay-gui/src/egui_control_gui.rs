@@ -290,26 +290,26 @@ impl EguiControlGui {
 
     // ── Main UI entry point ──────────────────────────────────────────────────
 
-    pub fn build_ui(&mut self, ctx: &egui::Context, app_state: &mut dyn std::any::Any) {
-        crate::egui_theme::apply_professional_theme(ctx);
+    pub fn build_ui(&mut self, ui: &mut egui::Ui, app_state: &mut dyn std::any::Any) {
+        crate::egui_theme::apply_professional_theme(ui.ctx());
 
-        self.build_top_bar(ctx);
-        self.build_left_sidebar(ctx);
-        self.build_preview_panel(ctx);
-        self.build_central_panel(ctx, app_state);
-        self.build_toast_overlay(ctx);
+        self.build_top_bar(ui);
+        self.build_left_sidebar(ui);
+        self.build_preview_panel(ui);
+        self.build_central_panel(ui, app_state);
+        self.build_toast_overlay(ui);
 
         if self.show_preferences {
-            self.build_preferences_window(ctx);
+            self.build_preferences_window(ui);
         }
         if self.show_routing_window {
-            self.build_routing_window(ctx);
+            self.build_routing_window(ui);
         }
     }
 
     // ── Top bar ──────────────────────────────────────────────────────────────
 
-    fn build_top_bar(&mut self, ctx: &egui::Context) {
+    fn build_top_bar(&mut self, ui: &mut egui::Ui) {
         use crate::egui_theme::colors::*;
         use crate::egui_widgets::{status_pill, PillState};
 
@@ -369,7 +369,7 @@ impl EguiControlGui {
                     .fill(SURFACE_2)
                     .stroke(egui::Stroke::new(1.0_f32, HAIR_2)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
@@ -638,7 +638,7 @@ impl EguiControlGui {
 
     // ── Toast overlay ────────────────────────────────────────────────────────
 
-    fn build_toast_overlay(&mut self, ctx: &egui::Context) {
+    fn build_toast_overlay(&mut self, ui: &mut egui::Ui) {
         use crate::egui_theme::colors::*;
 
         let now = std::time::Instant::now();
@@ -661,13 +661,13 @@ impl EguiControlGui {
         // when the soonest notification expires.
         if let Some(soonest) = notifs.iter().map(|n| n.expires_at).min() {
             let remaining = soonest.saturating_duration_since(now);
-            ctx.request_repaint_after(remaining);
+            ui.ctx().request_repaint_after(remaining);
         }
 
         egui::Area::new(egui::Id::new("toast_overlay"))
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 72.0))
             .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.vertical(|ui| {
                     for n in notifs {
                         let (bg, text) = match n.level {
@@ -692,7 +692,7 @@ impl EguiControlGui {
 
     // ── Left sidebar ─────────────────────────────────────────────────────────
 
-    fn build_left_sidebar(&mut self, ctx: &egui::Context) {
+    fn build_left_sidebar(&mut self, ui: &mut egui::Ui) {
         use crate::egui_theme::colors::*;
         use crate::egui_widgets::hud_collapsible_section_header;
 
@@ -729,7 +729,7 @@ impl EguiControlGui {
                     .fill(BG)
                     .stroke(egui::Stroke::new(1.0_f32, HAIR_2)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.add_space(10.0);
 
                 // ── SIGNAL ───────────────────────────────────────────────────────
@@ -893,11 +893,11 @@ impl EguiControlGui {
 
     // ── Central panel ────────────────────────────────────────────────────────
 
-    fn build_central_panel(&mut self, ctx: &egui::Context, app_state: &mut dyn std::any::Any) {
+    fn build_central_panel(&mut self, ui: &mut egui::Ui, app_state: &mut dyn std::any::Any) {
         use rustjay_core::GuiTab;
 
         #[allow(deprecated)] // top-level CentralPanel::show; see note on the top panel
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // A custom tab opened via its own sidebar button (it does not
                 // replace a builtin) takes precedence over the builtin dispatch.
@@ -943,7 +943,7 @@ impl EguiControlGui {
 
     // ── Preview panel ────────────────────────────────────────────────────────
 
-    fn build_preview_panel(&mut self, ctx: &egui::Context) {
+    fn build_preview_panel(&mut self, ui: &mut egui::Ui) {
         let show_preview = {
             let state = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
             state.show_preview
@@ -961,7 +961,7 @@ impl EguiControlGui {
         #[allow(deprecated)]
         egui::Panel::right("preview_panel_right")
             .exact_size(280.0)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let available = ui.available_size();
                 let preview_count = if has_input2 { 3.0 } else { 2.0 };
                 let preview_height = (available.y / preview_count - 8.0).max(20.0);
@@ -1062,14 +1062,14 @@ impl EguiControlGui {
 
     // ── Preferences window ───────────────────────────────────────────────────
 
-    fn build_preferences_window(&mut self, ctx: &egui::Context) {
+    fn build_preferences_window(&mut self, ui: &mut egui::Ui) {
         let mut open = self.show_preferences;
         egui::Window::new("Preferences")
             .collapsible(false)
             .resizable(true)
             .default_size([400.0, 300.0])
             .open(&mut open)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let mut state = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
                 ui.checkbox(&mut state.output_fullscreen, "Fullscreen Output");
                 ui.checkbox(&mut state.show_preview, "Show Preview");
@@ -1079,7 +1079,7 @@ impl EguiControlGui {
 
     // ── Routing window ───────────────────────────────────────────────────────
 
-    pub(crate) fn build_routing_window(&mut self, ctx: &egui::Context) {
+    pub(crate) fn build_routing_window(&mut self, ui: &mut egui::Ui) {
         use rustjay_core::routing::{FftBand, ModulationTarget};
 
         let mut is_open = self.show_routing_window;
@@ -1093,7 +1093,7 @@ impl EguiControlGui {
             .default_pos([500.0, 100.0])
             .default_size([450.0, 550.0])
             .open(&mut is_open)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let (can_add, route_count, max_routes) = {
                     let state = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
                     let routing = &state.audio_routing;
@@ -1603,16 +1603,12 @@ pub fn apply_param_map_overlay(
     );
     let click_id = ui.make_persistent_id(("lfo_map_click", id));
     let resp = ui.interact(rect, click_id, egui::Sense::click());
-    let popup_id = ui.make_persistent_id(("lfo_assign_popup", id));
-    if resp.clicked() {
-        ui.memory_mut(|m| m.toggle_popup(popup_id));
-    }
-    egui::popup_below_widget(
-        ui,
-        popup_id,
-        &resp,
-        egui::PopupCloseBehavior::CloseOnClick,
-        |ui| {
+    // egui 0.36 replaced `popup_below_widget` + `Memory::toggle_popup` with the
+    // `Popup` builder; `from_toggle_button_response` folds the click-to-toggle
+    // bookkeeping in and keys the popup off the response's own persistent id.
+    egui::Popup::from_toggle_button_response(&resp)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+        .show(|ui| {
             ui.set_min_width(150.0);
             ui.label(egui::RichText::new(format!("Modulate {name}")).small().strong());
             if sources.is_empty() {

@@ -42,7 +42,8 @@ fn control_harness(size: [f32; 2], pixels_per_point: f32) -> Harness<'static> {
         .with_size(size)
         .with_pixels_per_point(pixels_per_point)
         .with_theme(egui::Theme::Dark)
-        .build(move |ctx| gui.build_ui(ctx, &mut app_state));
+        // egui 0.36 / kittest 0.36: the app closure receives a root Ui.
+        .build_ui(move |ui| gui.build_ui(ui, &mut app_state));
 
     harness.ctx.set_theme(egui::Theme::Dark);
     harness.ctx.global_style_mut(|style| {

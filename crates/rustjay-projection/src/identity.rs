@@ -102,7 +102,7 @@ impl BlitPipeline {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[BlitVertex::desc()],
+                buffers: &[Some(BlitVertex::desc())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -367,6 +367,7 @@ mod tests {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                ..Default::default()
             })
             .await
             .expect("no adapter");
@@ -505,7 +506,7 @@ mod tests {
             device.poll(wgpu::PollType::Poll).ok();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("buffer mapped by map_async");
         let mut out = Vec::with_capacity((width * height * 4) as usize);
         for row in 0..height {
             let start = (row * bytes_per_row) as usize;

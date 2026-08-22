@@ -111,6 +111,7 @@ impl<P: EffectPlugin> WgpuEngine<P> {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                ..Default::default()
             })
             .await?;
 
@@ -169,6 +170,8 @@ impl<P: EffectPlugin> WgpuEngine<P> {
         };
         let present_mode = resolve_present_mode(requested_present_mode, &supported_present_modes);
         let surface_config = wgpu::SurfaceConfiguration {
+            // wgpu 30: Auto reproduces the pre-30 behaviour.
+            color_space: wgpu::SurfaceColorSpace::Auto,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width.max(1),
@@ -685,7 +688,7 @@ impl<P: EffectPlugin> WgpuEngine<P> {
             }
             if mapped.load(Ordering::SeqCst) {
                 let color = {
-                    let view = buffer.slice(..).get_mapped_range();
+                    let view = buffer.slice(..).get_mapped_range().expect("buffer mapped by map_async");
                     let bytes: &[u8] = &view;
                     if bytes.len() >= 4 {
                         // BGRA8: [b, g, r, a]
@@ -713,7 +716,7 @@ impl<P: EffectPlugin> WgpuEngine<P> {
 
         let pre_present = std::time::Instant::now();
         if let Some(st) = surface_texture {
-            st.present();
+            self.queue.present(st);
         }
         let post_present = std::time::Instant::now();
 

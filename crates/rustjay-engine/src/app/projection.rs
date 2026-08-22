@@ -103,6 +103,8 @@ impl ProjectorOutput {
             );
         }
         let config = wgpu::SurfaceConfiguration {
+            // wgpu 30: Auto reproduces the pre-30 behaviour.
+            color_space: wgpu::SurfaceColorSpace::Auto,
             usage: surface_usage,
             format,
             width: size.width.max(1),
@@ -213,7 +215,7 @@ impl ProjectorOutput {
         let active_count = self.stages.iter().filter(|s| s.is_active()).count();
         if active_count == 0 {
             queue.submit(std::iter::once(encoder.finish()));
-            surface_texture.present();
+            queue.present(surface_texture);
             return;
         }
 
@@ -324,7 +326,7 @@ impl ProjectorOutput {
             }
         }
 
-        surface_texture.present();
+        queue.present(surface_texture);
     }
 
     /// The projector's output manager, lazily created. Hosts the recorder and

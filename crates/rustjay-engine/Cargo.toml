@@ -52,6 +52,9 @@ default = ["webcam"]
 ndi     = ["rustjay-io/ndi", "rustjay-gui/ndi", "rustjay-core/ndi"]
 webcam  = ["rustjay-io/webcam"]
 egui    = ["rustjay-gui/egui"]
+# Dear ImGui renderer backend; see rustjay-gui. Off by default (imgui-wgpu is
+# still on wgpu 29). imgui *tabs* are unaffected either way.
+imgui-renderer = ["rustjay-gui/imgui-renderer"]
 mixer   = ["dep:rustjay-mixer"]
 api     = ["dep:rustjay-api"]
 # Push parameter changes back to an OSC controller (Maschine Mk1 bridge).

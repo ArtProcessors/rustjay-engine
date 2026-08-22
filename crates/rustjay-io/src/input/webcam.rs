@@ -102,7 +102,7 @@ impl WebcamCapture {
                         // YUY2 is 2 bytes per pixel, arranged as: Y0 U Y1 V.
                         // Cameras commonly deliver limited-range BT.601 YUV here,
                         // so expand luma/chroma before converting to RGB.
-                        for chunk in yuyv_data.chunks_exact(4) {
+                        for chunk in yuyv_data.as_chunks::<4>().0 {
                             let y0 = (chunk[0] as f32 - 16.0).max(0.0);
                             let u = chunk[1] as f32 - 128.0;
                             let y1 = (chunk[2] as f32 - 16.0).max(0.0);

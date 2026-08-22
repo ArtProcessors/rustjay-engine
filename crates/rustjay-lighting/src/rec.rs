@@ -101,8 +101,10 @@ pub fn read_rec(path: impl AsRef<Path>) -> io::Result<Vec<RecEvent>> {
     let mut body = Vec::new();
     dec.read_to_end(&mut body)?;
     let mut events = Vec::with_capacity(body.len() / EVENT_LEN);
-    for chunk in body.chunks_exact(EVENT_LEN) {
-        events.push(RecEvent::from_bytes(chunk.try_into().unwrap()));
+    // as_chunks yields &[u8; EVENT_LEN] directly, which is what from_bytes
+    // wants — no fallible conversion that could never actually fail.
+    for chunk in body.as_chunks::<EVENT_LEN>().0 {
+        events.push(RecEvent::from_bytes(chunk));
     }
     Ok(events)
 }

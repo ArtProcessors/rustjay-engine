@@ -253,7 +253,9 @@ pub fn detect_from_rgba(
         )));
     }
     let gray_pixels: Vec<u8> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|px| {
             let r = px[0] as f32;
             let g = px[1] as f32;

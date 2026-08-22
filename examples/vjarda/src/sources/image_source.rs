@@ -147,7 +147,7 @@ impl ImageSource {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[rustjay_core::Vertex::desc()],
+                buffers: &[Some(rustjay_core::Vertex::desc())],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,

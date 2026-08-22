@@ -279,7 +279,9 @@ impl AnyEguiTab for LedMapTab {
 
 /// BGRA8 → Rec.601 luma. Weights 77/150/29 sum to 256 (shift by 8).
 fn bgra_to_luma(bgra: &[u8]) -> Vec<u8> {
-    bgra.chunks_exact(4)
+    bgra.as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| {
             let (b, g, r) = (p[0] as u32, p[1] as u32, p[2] as u32);
             ((r * 77 + g * 150 + b * 29) >> 8) as u8

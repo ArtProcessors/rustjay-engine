@@ -333,7 +333,7 @@ impl HeadlessOutput {
             MAP_READY => {
                 let bytes_per_row = ((self.width * 4).div_ceil(256)) * 256;
                 let slice = self.readback_buffer.slice(..);
-                let data = slice.get_mapped_range();
+                let data = slice.get_mapped_range().expect("buffer mapped by map_async");
                 self.latest_pixels.clear();
                 self.latest_pixels
                     .reserve((self.width * self.height * 4) as usize);
