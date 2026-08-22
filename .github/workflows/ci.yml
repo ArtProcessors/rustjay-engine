@@ -48,6 +48,20 @@ jobs:
       # Snapshots render on lavapipe (mesa-vulkan-drivers above).
       - run: cargo test -p rustjay-gui --features egui
       - run: cargo test -p vjarda --features projection
+      # Snapshot failures are otherwise invisible here: egui_kittest writes the
+      # actual render and a diff next to the committed baseline, and without
+      # this you cannot see what changed, or take the Linux-rendered PNGs when
+      # a baseline legitimately needs updating (an egui version bump, say).
+      - name: Upload snapshot renders
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-renders
+          path: |
+            **/tests/snapshots/*.new.png
+            **/tests/snapshots/*.diff.png
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Validate WGSL shaders
         run: |
           cargo install naga-cli --locked
