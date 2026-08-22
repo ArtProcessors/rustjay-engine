@@ -491,7 +491,7 @@ impl WarpStage {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[WarpVertex::desc()],
+                buffers: &[Some(WarpVertex::desc())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {

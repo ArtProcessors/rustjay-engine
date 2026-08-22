@@ -98,6 +98,7 @@ pub async fn start() -> Result<(), JsValue> {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            ..Default::default()
         })
         .await
         .map_err(|e| JsValue::from_str(&format!("request_adapter failed: {:?}", e)))?;
@@ -137,6 +138,8 @@ pub async fn start() -> Result<(), JsValue> {
         .unwrap_or(surface_caps.formats[0]);
 
     let config = wgpu::SurfaceConfiguration {
+            // wgpu 30: Auto reproduces the pre-30 behaviour.
+            color_space: wgpu::SurfaceColorSpace::Auto,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         format: surface_format,
         width,
@@ -385,7 +388,7 @@ fn render_frame(app: &mut App) {
     );
 
     app.queue.submit(Some(encoder.finish()));
-    surface_texture.present();
+    app.queue.present(surface_texture);
 }
 
 // ---------------------------------------------------------------------------

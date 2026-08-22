@@ -279,7 +279,7 @@ impl LiveSampler {
                         continue;
                     };
                     let slice = buf.slice(..);
-                    let data = slice.get_mapped_range();
+                    let data = slice.get_mapped_range().expect("buffer mapped by map_async");
                     // Strip row padding and swap BGRA→RGBA.
                     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
                     for row in 0..height {

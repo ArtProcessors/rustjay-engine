@@ -37,9 +37,10 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 
 /// Scaled YCoCg → RGB conversion (HAP Q spec — Resolume/FFmpeg HapY files).
 /// Input: BC3/DXT5 where R=Co, G=Cg, B=scale, A=Y.
-/// NOTE: hap-wgpu's *own* encoder currently writes PLAIN YCoCg (no scale plane),
-/// which this does NOT decode — that's a hap-wgpu encoder bug, not a bug here.
-/// See 404_PORT.md §HAP / project memory.
+/// hap-qt writes this same standard layout as of 0.2.0 (blue = (scale-1)*8),
+/// so files produced by our own converter decode correctly here. The older
+/// note about hap-wgpu emitting plain YCoCg without a scale plane described
+/// pre-0.2.0 behaviour and no longer applies.
 fn ycocg_to_rgb(color: vec4<f32>) -> vec3<f32> {
     let scale = (color.b * (255.0 / 8.0)) + 1.0;
     let co = (color.r - (0.5 * 256.0 / 255.0)) / scale;

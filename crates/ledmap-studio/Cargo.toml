@@ -10,7 +10,7 @@ name = "ledmap-studio"
 path = "src/main.rs"
 
 [dependencies]
-eframe           = "0.34"
+eframe           = "0.36"
 nokhwa           = { version = "0.10", features = ["input-native"] }
 rustjay-ledmap   = { workspace = true }
 rustjay-lighting = { workspace = true }

@@ -48,6 +48,8 @@ impl EguiRenderer {
             .ok_or_else(|| anyhow::anyhow!("No surface formats available"))?;
 
         let surface_config = wgpu::SurfaceConfiguration {
+            // wgpu 30: Auto reproduces the pre-30 behaviour.
+            color_space: wgpu::SurfaceColorSpace::Auto,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width.max(1),
@@ -200,14 +202,16 @@ impl EguiRenderer {
     /// Render a frame
     pub fn render_frame<F>(&mut self, mut build_ui: F) -> Result<()>
     where
-        F: FnMut(&egui::Context),
+        F: FnMut(&mut egui::Ui),
     {
         // Prepare frame input
         let raw_input = self.state.take_egui_input(&self.window);
 
         // Run egui
-        let full_output = self.context.run_ui(raw_input, |ctx| {
-            build_ui(ctx);
+        // egui 0.36: run_ui hands out a root Ui rather than the Context;
+        // panels are shown inside it.
+        let full_output = self.context.run_ui(raw_input, |ui| {
+            build_ui(ui);
         });
 
         // Handle platform output (cursor, clipboard, etc.)
@@ -220,9 +224,12 @@ impl EguiRenderer {
             .tessellate(full_output.shapes, full_output.pixels_per_point);
 
         // Update textures
-        for (id, image_delta) in &full_output.textures_delta.set {
-            self.renderer
-                .update_texture(&self.device, &self.queue, *id, image_delta);
+        // egui 0.36 batches deltas: each id now carries a list of them.
+        for (id, image_deltas) in &full_output.textures_delta.set {
+            for image_delta in image_deltas {
+                self.renderer
+                    .update_texture(&self.device, &self.queue, *id, image_delta);
+            }
         }
 
         // Get surface texture
@@ -295,7 +302,7 @@ impl EguiRenderer {
         let mut submissions: Vec<wgpu::CommandBuffer> = extra_cmd_bufs;
         submissions.push(encoder.finish());
         self.queue.submit(submissions);
-        surface_texture.present();
+        self.queue.present(surface_texture);
 
         // Free textures
         for id in &full_output.textures_delta.free {

@@ -45,6 +45,7 @@ fn init_gpu() -> Option<Gpu> {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                ..Default::default()
             })
             .await
             .expect("no wgpu adapter");
@@ -203,7 +204,7 @@ fn render_shader(
         gpu.device.poll(wgpu::PollType::Poll).ok();
         std::thread::yield_now();
     }
-    let data = readback.slice(..).get_mapped_range().to_vec();
+    let data = readback.slice(..).get_mapped_range().expect("buffer mapped by map_async").to_vec();
     Frame {
         bytes_per_row,
         format,

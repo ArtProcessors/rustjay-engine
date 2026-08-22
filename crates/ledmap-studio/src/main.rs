@@ -280,11 +280,13 @@ impl eframe::App for App {
             self.finish();
         }
 
-        #[allow(deprecated)] // egui SidePanel/Panel migration tracked separately
-        egui::SidePanel::left("controls")
-            .default_width(240.0)
-            .show_inside(ui, |ui| self.controls(ui));
-        egui::CentralPanel::default().show_inside(ui, |ui| self.preview(ui));
+        // egui 0.36 folded SidePanel/TopBottomPanel into one `Panel` type and
+        // renamed `show_inside` back to `show`. This is the migration the old
+        // `#[allow(deprecated)]` here was deferring.
+        egui::Panel::left("controls")
+            .default_size(240.0) // side-agnostic in egui 0.36's unified Panel
+            .show(ui, |ui| self.controls(ui));
+        egui::CentralPanel::default().show(ui, |ui| self.preview(ui));
 
         ui.ctx().request_repaint();
     }

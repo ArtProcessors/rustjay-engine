@@ -105,7 +105,7 @@ pub fn create_pipeline(
             module: &shader,
             entry_point: Some("vs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: 16,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[
@@ -120,7 +120,7 @@ pub fn create_pipeline(
                         format: wgpu::VertexFormat::Float32x2,
                     },
                 ],
-            }],
+            })],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,

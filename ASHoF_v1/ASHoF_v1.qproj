@@ -1,0 +1,166 @@
+{
+  "file_format_version": 8,
+  "show_settings": {
+    "title": "Untitled",
+    "description": "",
+    "author": "",
+    "date": "2026-06-26",
+    "audio_latency": 10,
+    "exclusive_mode": false,
+    "channel_offset": 0,
+    "audio_output_driver": "WASAPI",
+    "audio_output_device": "",
+    "osc_nic": "",
+    "osc_rx_port": 9000,
+    "osc_tx_port": 8000,
+    "enable_remote_control": false,
+    "is_remote_host": true,
+    "sync_show_file_on_save": true,
+    "autosave_enabled": true,
+    "node_name": "QPlayer",
+    "remote_nodes": [],
+    "enable_msc": false,
+    "msc_rx_port": 6004,
+    "msc_tx_port": 6004,
+    "msc_rx_device": 112,
+    "msc_tx_device": 113,
+    "msc_executor": -1,
+    "msc_page": -1
+  },
+  "column_widths": [],
+  "cues": [
+    {
+      "$type": "VideoCue",
+      "qid": "1",
+      "colour": {
+        "r": 0.0,
+        "g": 0.0,
+        "b": 0.0,
+        "a": 1.0
+      },
+      "name": "MainProjection",
+      "description": "",
+      "trigger": "Go",
+      "enabled": true,
+      "delay": "00:00:00",
+      "loop_mode": "LoopedInfinite",
+      "loop_count": 1,
+      "remote_node": "",
+      "triggers": {},
+      "retriggerable": false,
+      "path": "/Users/ac/Desktop/ASHoF_v1/Media/After the Rains (the long dry)_DRAFT L1M1.mp4",
+      "start_time": "00:00:00",
+      "duration": "00:00:00",
+      "volume": 1.0,
+      "pan": 0.0,
+      "fade_in": 0.0,
+      "fade_out": 0.0,
+      "fade_type": "Linear",
+      "routing": {
+        "out_pair": 0,
+        "send": 1.0,
+        "crosspoints": []
+      }
+    }
+  ],
+  "projection": {
+    "canvas_width": 3840,
+    "canvas_height": 812,
+    "fit": "Fit",
+    "outputs": [
+      {
+        "name": "Output1",
+        "source_x": 0,
+        "source_y": 0,
+        "source_width": 1444,
+        "source_height": 812,
+        "output_width": 1920,
+        "output_height": 1080,
+        "edge_blend": {
+          "left": {
+            "enabled": false,
+            "width": 0,
+            "gamma": 2.0
+          },
+          "right": {
+            "enabled": true,
+            "width": 327,
+            "gamma": 2.0
+          },
+          "top": {
+            "enabled": false,
+            "width": 0,
+            "gamma": 2.0
+          },
+          "bottom": {
+            "enabled": false,
+            "width": 0,
+            "gamma": 2.0
+          }
+        }
+      },
+      {
+        "name": "Output2",
+        "source_x": 1198,
+        "source_y": 0,
+        "source_width": 1444,
+        "source_height": 812,
+        "output_width": 1920,
+        "output_height": 1080,
+        "edge_blend": {
+          "left": {
+            "enabled": true,
+            "width": 327,
+            "gamma": 2.0
+          },
+          "right": {
+            "enabled": true,
+            "width": 327,
+            "gamma": 2.0
+          },
+          "top": {
+            "enabled": false,
+            "width": 0,
+            "gamma": 2.0
+          },
+          "bottom": {
+            "enabled": false,
+            "width": 0,
+            "gamma": 2.0
+          }
+        }
+      },
+      {
+        "name": "Output3",
+        "source_x": 2396,
+        "source_y": 0,
+        "source_width": 1444,
+        "source_height": 812,
+        "output_width": 1920,
+        "output_height": 1080,
+        "edge_blend": {
+          "left": {
+            "enabled": true,
+            "width": 327,
+            "gamma": 2.0
+          },
+          "right": {
+            "enabled": false,
+            "width": 0,
+            "gamma": 2.0
+          },
+          "top": {
+            "enabled": false,
+            "width": 0,
+            "gamma": 2.0
+          },
+          "bottom": {
+            "enabled": false,
+            "width": 0,
+            "gamma": 2.0
+          }
+        }
+      }
+    ]
+  }
+}

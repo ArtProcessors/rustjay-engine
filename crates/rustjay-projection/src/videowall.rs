@@ -464,7 +464,7 @@ pub fn texture_to_gray_image(
     };
     mapped.map_err(|e| anyhow::anyhow!("buffer map failed: {e:?}"))?;
 
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("buffer mapped by map_async");
     let mut gray = Vec::with_capacity((width * height) as usize);
     for row in 0..height {
         let base = (row * bytes_per_row) as usize;
