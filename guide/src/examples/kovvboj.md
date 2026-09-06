@@ -43,6 +43,27 @@ and MAP modes; everything else opens as windows from the View menu.
   `NDI…` / `Syphon…` / `Spout…` entry so you can build the layer before the
   sender exists — pick the actual server in the inspector, which can also
   re-point a live layer without losing its chain or mappings.
+- **Text layers** — a Text layer draws a string one quad per glyph, out of a
+  font atlas. The atlas is either a TTF/OTF rasterised on load, or an image you
+  drew. A drawn atlas gets its characters from a text file beside it with the
+  same name — one line per row of the grid, so the file's shape *is* the
+  mapping:
+
+  ```text
+  ABCDEFGH
+  IJKLMNOP
+  ```
+
+  Without that sidecar the grid is assumed to be printable ASCII in 16
+  columns; the inspector says which it used and how many characters it mapped,
+  which is the thing to check when the wrong letters come out. Because every
+  glyph is its own quad, Wave, Spin, Explode and Stagger animate letters
+  individually, and Spin carries a perspective divide so a letter turns rather
+  than squashes. Turn and Tilt do the same to the whole string — Turn Rate
+  spins it continuously, in whole revolutions per cycle, so a synced string
+  comes back round on the bar. Speed/Sync/Division drive all of that animation
+  on the same tempo lock clips and shaders use. The copy is settable over OSC at
+  `/rustjay/text/<layer>`, matched on the layer's name or uuid.
 - **FX chains** — two places FX live: per layer, and master. Reorder within a
   chain or move an effect between chains by dragging its chip; click a chip's
   dot to bypass it.

@@ -1,80 +1,82 @@
-//! Text source — rasterises a string with `ab_glyph` and blits it.
+//! Text source — a string laid out from a font atlas and drawn as one quad per
+//! glyph.
 //!
-//! The whole string is rasterised into one texture, and only when something
-//! about the *layout* changes: the text, the font, tracking, line height or
-//! alignment. Size, position, rotation and colour are blit-time uniforms, so
-//! they cost nothing per frame and modulate smoothly.
+//! The quads are rebuilt only when the words or the layout change; size,
+//! position, colour and every animation knob are uniforms, so they cost
+//! nothing per frame and modulate smoothly. Per-glyph animation is keyed off
+//! each glyph's ordinal in the vertex shader — that is what the atlas buys
+//! over drawing the whole string into one texture.
 //!
-//! ponytail: no glyph atlas. One string per layer, re-rasterised on a cue, is
-//! not worth packing and caching glyphs for. An atlas earns its keep when each
-//! letter needs its own transform — that is a mesh path, not this one.
+//! The atlas is either a rasterised TTF/OTF or an image someone drew; see
+//! [`crate::sources::text_atlas`].
 
-use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont};
 use rustjay_core::{
     EffectInput, EffectInstance, EngineState, ParamCategory, ParameterDescriptor, RenderCtx,
     RenderTarget,
 };
 use std::path::{Path, PathBuf};
+use wgpu::util::DeviceExt;
 
-/// Cap height the string is rasterised at. Size is a blit-time scale, so this
-/// only sets how far text can be blown up before it softens.
-const RASTER_PX: f32 = 220.0;
-/// Widest raster we will allocate. A long string is rasterised smaller rather
-/// than refused — it is scaled at blit time anyway.
-const MAX_RASTER_W: u32 = 4096;
-/// Breathing room around the glyphs, for overhang the advance does not cover.
-const PAD: u32 = 8;
+use super::text_atlas::{Atlas, Layout, layout};
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     color: [f32; 4],
-    // Not `target`: that is a reserved word in WGSL, and the shader will not
-    // parse with a field of that name.
+    // Not `target`: a reserved word in WGSL, and the shader will not parse
+    // with a field of that name.
     resolution: [f32; 2],
     center: [f32; 2],
+    block: [f32; 2],
     scale: f32,
-    tex_aspect: f32,
     angle: f32,
-    _pad: f32,
+    time: f32,
+    stagger: f32,
+    wave: f32,
+    spin: f32,
+    explode: f32,
+    colour_atlas: f32,
+    turn: f32,
+    tilt: f32,
 }
 
-/// What the raster depends on. Anything else is a blit-time uniform.
-#[derive(Clone, PartialEq)]
-struct Layout {
-    text: String,
-    tracking: f32,
-    line_height: f32,
-    align: usize,
+/// Per-glyph instance data, matching the vertex layout in `text.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct Instance {
+    rect: [f32; 4],
+    uv: [f32; 4],
+    index: f32,
+    _pad: [f32; 3],
 }
 
-impl Default for Layout {
-    fn default() -> Self {
-        Self {
-            text: "TEXT".to_string(),
-            tracking: 0.0,
-            line_height: 1.2,
-            align: 1,
-        }
-    }
-}
-
-/// Renders a rasterised string, scaled and positioned on the target.
+/// Draws a string from a font atlas, one quad per glyph.
 pub struct TextSource {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: Option<wgpu::BindGroup>,
     uniform_buffer: wgpu::Buffer,
+    /// The unit quad every glyph instances.
+    corners: wgpu::Buffer,
+    instances: Option<wgpu::Buffer>,
+    glyph_count: u32,
     sampler: wgpu::Sampler,
 
-    font: Option<FontVec>,
+    atlas: Option<Atlas>,
     font_path: Option<PathBuf>,
-    /// The layout the current raster was built from; a difference re-rasterises.
+    /// The layout the current quads were built from; a difference rebuilds.
     layout: Layout,
-    /// What the next raster should use. Set by the UI, OSC, or a parameter.
+    /// What the next rebuild should use — set by the UI, OSC or a parameter.
     pending: Layout,
-    tex_size: [u32; 2],
+    block: [f32; 2],
     dirty: bool,
+    /// Set when the atlas itself changed and has to be uploaded again — a
+    /// tracking tweak re-lays the quads but must not re-push the texture.
+    atlas_dirty: bool,
+
+    /// Animation clock, in cycles. Integrated so tempo changes do not jump it.
+    time: f32,
+    last_tick: Option<std::time::Instant>,
 
     param_prefix: String,
 }
@@ -98,12 +100,22 @@ impl TextSource {
             mapped_at_creation: false,
         });
 
+        // Two triangles in 0..1; every glyph is this quad, moved and sized by
+        // its instance.
+        let corners = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Text Quad"),
+            contents: bytemuck::cast_slice(&[
+                0.0_f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0,
+            ]),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Text BGL"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -136,6 +148,16 @@ impl TextSource {
             ..Default::default()
         });
 
+        // Max, not alpha blending: the mixer expects straight alpha, and
+        // src-over would leave the target premultiplied. Taking the greater
+        // coverage is also what overlapping glyphs want — adding them rings at
+        // the joins.
+        let overlap = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Max,
+        };
+
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Text Pipeline"),
             layout: Some(&pipeline_layout),
@@ -143,7 +165,20 @@ impl TextSource {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[Some(rustjay_core::Vertex::desc())],
+                buffers: &[
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: 8,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Instance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![
+                            1 => Float32x4, 2 => Float32x4, 3 => Float32
+                        ],
+                    }),
+                ],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -151,7 +186,7 @@ impl TextSource {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: None,
+                    blend: Some(wgpu::BlendState { color: overlap, alpha: overlap }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -164,6 +199,8 @@ impl TextSource {
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Text Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
@@ -171,28 +208,27 @@ impl TextSource {
         });
 
         let font_path = font.map(Path::to_path_buf).or_else(default_font);
-        let font = font_path.as_deref().and_then(load_font);
-        let layout = Layout {
-            text: text.unwrap_or("TEXT").to_string(),
-            ..Layout::default()
-        };
-
         Self {
             pipeline,
             bind_group_layout,
             bind_group: None,
             uniform_buffer,
+            corners,
+            instances: None,
+            glyph_count: 0,
             sampler,
-            font,
+            atlas: None,
             font_path,
-            // Mismatched on purpose: the first `prepare` rasterises.
-            layout: Layout {
-                text: String::new(),
-                ..layout.clone()
+            layout: Layout::default(),
+            pending: Layout {
+                text: text.unwrap_or("TEXT").to_string(),
+                ..Layout::default()
             },
-            pending: layout,
-            tex_size: [1, 1],
+            block: [1.0, 1.0],
             dirty: true,
+            atlas_dirty: true,
+            time: 0.0,
+            last_tick: None,
             param_prefix: String::new(),
         }
     }
@@ -202,48 +238,121 @@ impl TextSource {
         &self.pending.text
     }
 
-    /// Replace the string. Rasterises on the next `prepare`.
+    /// Replace the string. Rebuilt on the next `prepare`.
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.pending.text = text.into();
     }
 
-    /// The font file in use, if one was found.
+    /// One line about the atlas in use. Whether a drawn atlas found its
+    /// sidecar is the first thing to check when the letters come out wrong,
+    /// and there is nowhere else to see it.
+    pub fn atlas_summary(&self) -> String {
+        match &self.atlas {
+            None => "no atlas — pick a font".to_string(),
+            Some(a) if a.colour => format!(
+                "drawn atlas · {} characters · {}",
+                a.cells.len(),
+                if a.sidecar {
+                    "mapped by its .txt"
+                } else {
+                    "no .txt — assuming ASCII in 16 columns"
+                }
+            ),
+            Some(a) => format!("{} glyphs rasterised", a.cells.len()),
+        }
+    }
+
+    /// The font file or atlas image in use, if one was found.
     pub fn font_path(&self) -> Option<&Path> {
         self.font_path.as_deref()
     }
 
-    /// Load a different font file. A file that will not parse is ignored, so a
-    /// bad pick cannot blank a layer mid-set.
+    /// Point at a different font file or atlas image. A file that will not
+    /// load is ignored, so a bad pick cannot blank a layer mid-set.
     pub fn set_font(&mut self, path: &Path) {
-        if let Some(font) = load_font(path) {
-            self.font = Some(font);
-            self.font_path = Some(path.to_path_buf());
-            self.dirty = true;
-        } else {
-            log::warn!("[Text] could not load font {}", path.display());
-        }
+        self.font_path = Some(path.to_path_buf());
+        self.atlas = None;
+        self.dirty = true;
     }
 
-    /// Rasterise the pending layout into a fresh texture and bind group.
-    fn rasterise(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let Some(font) = &self.font else {
-            return;
+    /// Build the atlas for the current font, if it is not built already or no
+    /// longer covers the text.
+    fn ensure_atlas(&mut self) -> bool {
+        if let Some(atlas) = &self.atlas
+            && atlas.covers(&self.pending.text)
+        {
+            return true;
+        }
+        let Some(path) = self.font_path.clone() else {
+            return false;
         };
-        let (pixels, width, height) = raster(font, &self.pending);
+        self.atlas_dirty = true;
+        self.atlas = if is_font(&path) {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| ab_glyph::FontVec::try_from_vec(bytes).ok())
+                .map(|font| Atlas::from_font(&font, &self.pending.text))
+        } else {
+            Atlas::from_image(&path)
+        };
+        if self.atlas.is_none() {
+            log::warn!("[Text] could not load font {}", path.display());
+        }
+        self.atlas.is_some()
+    }
+
+    /// Upload the atlas and lay the string out into per-glyph instances.
+    fn rebuild(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        // Mark the attempt done before making it: a font that will not load
+        // must not be retried, and re-logged, on every frame.
+        self.dirty = false;
+        self.layout = self.pending.clone();
+        if !self.ensure_atlas() {
+            return;
+        }
+        if self.atlas_dirty || self.bind_group.is_none() {
+            self.upload_atlas(device, queue);
+        }
+        let atlas = self.atlas.as_ref().expect("ensured above");
+        let (quads, block) = layout(atlas, &self.pending);
+        let instances: Vec<Instance> = quads
+            .iter()
+            .map(|q| Instance { rect: q.rect, uv: q.uv, index: q.index, _pad: [0.0; 3] })
+            .collect();
+        self.glyph_count = instances.len() as u32;
+        self.instances = (!instances.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Text Glyphs"),
+                contents: bytemuck::cast_slice(&instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
+        self.block = block;
+    }
+
+    /// Push the atlas to the GPU and rebind. Only when it actually changed.
+    fn upload_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let atlas = self.atlas.as_ref().expect("caller ensures an atlas");
+        let format = if atlas.colour {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::R8Unorm
+        };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Text Texture"),
+            label: Some("Text Atlas"),
             size: wgpu::Extent3d {
-                width,
-                height,
+                width: atlas.width,
+                height: atlas.height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let bytes_per_pixel = if atlas.colour { 4 } else { 1 };
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -251,15 +360,15 @@ impl TextSource {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &pixels,
+            &atlas.pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: Some(height),
+                bytes_per_row: Some(bytes_per_pixel * atlas.width),
+                rows_per_image: Some(atlas.height),
             },
             wgpu::Extent3d {
-                width,
-                height,
+                width: atlas.width,
+                height: atlas.height,
                 depth_or_array_layers: 1,
             },
         );
@@ -286,9 +395,8 @@ impl TextSource {
                 },
             ],
         }));
-        self.tex_size = [width, height];
-        self.layout = self.pending.clone();
-        self.dirty = false;
+
+        self.atlas_dirty = false;
     }
 
     fn param(&self, engine: &EngineState, name: &str, default: f32) -> f32 {
@@ -318,27 +426,50 @@ impl EffectInstance for TextSource {
     fn parameters(&self) -> Vec<ParameterDescriptor> {
         // Bare names — the mixer applies the channel prefix.
         let cat = ParamCategory::Custom("Text".to_string());
-        vec![
-            ParameterDescriptor::float("text_size", "Size", cat.clone(), 0.0, 2.0, 0.4, 0.005),
+        let mut params = vec![
+            ParameterDescriptor::float("text_size", "Size", cat.clone(), 0.0, 2.0, 0.33, 0.005),
             ParameterDescriptor::float("text_x", "X", cat.clone(), -1.0, 2.0, 0.5, 0.005),
             ParameterDescriptor::float("text_y", "Y", cat.clone(), -1.0, 2.0, 0.5, 0.005),
             ParameterDescriptor::float("text_rot", "Rotation", cat.clone(), -180.0, 180.0, 0.0, 1.0),
+            // The whole string in 3D, as opposed to `text_spin`, which turns
+            // each glyph on its own.
+            ParameterDescriptor::float("text_turn", "Turn", cat.clone(), -180.0, 180.0, 0.0, 1.0),
+            ParameterDescriptor::float("text_tilt", "Tilt", cat.clone(), -180.0, 180.0, 0.0, 1.0),
+            ParameterDescriptor::float(
+                "text_turn_rate",
+                "Turn Rate",
+                cat.clone(),
+                -4.0,
+                4.0,
+                0.0,
+                0.01,
+            ),
             ParameterDescriptor::float("text_r", "Red", cat.clone(), 0.0, 1.0, 1.0, 0.01),
             ParameterDescriptor::float("text_g", "Green", cat.clone(), 0.0, 1.0, 1.0, 0.01),
             ParameterDescriptor::float("text_b", "Blue", cat.clone(), 0.0, 1.0, 1.0, 0.01),
             ParameterDescriptor::float("text_a", "Alpha", cat.clone(), 0.0, 1.0, 1.0, 0.01),
-            // Layout: a change here re-rasterises, so these are not the ones to
-            // hang an LFO on.
+            // Per-glyph animation. All of it is uniform work, so an LFO on any
+            // of these is free.
+            ParameterDescriptor::float("text_wave", "Wave", cat.clone(), -1.0, 1.0, 0.0, 0.01),
+            ParameterDescriptor::float("text_spin", "Spin", cat.clone(), -2.0, 2.0, 0.0, 0.01),
+            ParameterDescriptor::float("text_explode", "Explode", cat.clone(), 0.0, 4.0, 0.0, 0.01),
+            ParameterDescriptor::float("text_stagger", "Stagger", cat.clone(), -0.5, 0.5, 0.05, 0.005),
+            // Layout: a change here rebuilds the quads, so these are not the
+            // ones to hang an LFO on.
             ParameterDescriptor::float("text_track", "Tracking", cat.clone(), -0.3, 1.0, 0.0, 0.01),
             ParameterDescriptor::float("text_line", "Line Height", cat.clone(), 0.5, 3.0, 1.2, 0.01),
             ParameterDescriptor::enum_param(
                 "text_align",
                 "Align",
-                cat,
+                cat.clone(),
                 vec!["Left".into(), "Centre".into(), "Right".into()],
                 1,
             ),
-        ]
+            ParameterDescriptor::float("speed", "Speed", cat, 0.0, 4.0, 1.0, 0.01),
+        ];
+        // The same tempo lock clips use: one animation cycle per division.
+        params.extend(super::sync_parameters().into_iter().filter(|p| p.id != "mode"));
+        params
     }
 
     fn prepare(&mut self, engine: &EngineState, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -346,8 +477,21 @@ impl EffectInstance for TextSource {
         self.pending.line_height = self.param(engine, "text_line", 1.2).max(0.1);
         self.pending.align = self.param(engine, "text_align", 1.0).round().clamp(0.0, 2.0) as usize;
         if self.dirty || self.pending != self.layout {
-            self.rasterise(device, queue);
+            self.rebuild(device, queue);
         }
+
+        // One cycle per beat division when synced, one per second when not.
+        let rate = super::clip_speed(
+            self.param(engine, "speed", 1.0),
+            self.param(engine, "sync", 0.0) >= 0.5,
+            self.param(engine, "div", 4.0) as usize,
+            engine.effective_bpm(),
+            1.0,
+        );
+        let now = std::time::Instant::now();
+        let dt = self.last_tick.map(|t| (now - t).as_secs_f32()).unwrap_or(0.0);
+        self.last_tick = Some(now);
+        self.time += dt * rate;
     }
 
     fn render_to(
@@ -357,9 +501,6 @@ impl EffectInstance for TextSource {
         target: RenderTarget<'_>,
         engine: &EngineState,
     ) {
-        let Some(bind_group) = &self.bind_group else {
-            return;
-        };
         let uniforms = Uniforms {
             color: [
                 self.param(engine, "text_r", 1.0),
@@ -372,10 +513,23 @@ impl EffectInstance for TextSource {
                 self.param(engine, "text_x", 0.5),
                 self.param(engine, "text_y", 0.5),
             ],
-            scale: self.param(engine, "text_size", 0.4).max(0.0),
-            tex_aspect: self.tex_size[0] as f32 / self.tex_size[1].max(1) as f32,
+            block: self.block,
+            scale: self.param(engine, "text_size", 0.33).max(0.0),
             angle: self.param(engine, "text_rot", 0.0).to_radians(),
-            _pad: 0.0,
+            time: self.time,
+            stagger: self.param(engine, "text_stagger", 0.05),
+            wave: self.param(engine, "text_wave", 0.0),
+            spin: self.param(engine, "text_spin", 0.0),
+            explode: self.param(engine, "text_explode", 0.0),
+            colour_atlas: f32::from(u8::from(
+                self.atlas.as_ref().is_some_and(|a| a.colour),
+            )),
+            // Turn Rate spins the string on the animation clock — whole
+            // revolutions per cycle, so synced it lands on the beat. The angle
+            // parameter is the offset it spins from.
+            turn: self.param(engine, "text_turn", 0.0).to_radians()
+                + self.time * self.param(engine, "text_turn_rate", 0.0) * std::f32::consts::TAU,
+            tilt: self.param(engine, "text_tilt", 0.0).to_radians(),
         };
         ctx.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -396,21 +550,20 @@ impl EffectInstance for TextSource {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        let (Some(bind_group), Some(instances)) = (&self.bind_group, &self.instances) else {
+            return;
+        };
         pass.set_pipeline(&self.pipeline);
-        pass.set_vertex_buffer(0, ctx.vertex_buffer.slice(..));
         pass.set_bind_group(0, bind_group, &[]);
-        pass.draw(0..6, 0..1);
+        pass.set_vertex_buffer(0, self.corners.slice(..));
+        pass.set_vertex_buffer(1, instances.slice(..));
+        pass.draw(0..6, 0..self.glyph_count);
     }
 }
 
-/// Read a font file, or `None` if it is not one we can parse.
-fn load_font(path: &Path) -> Option<FontVec> {
-    let bytes = std::fs::read(path).ok()?;
-    FontVec::try_from_vec(bytes).ok()
-}
-
-/// Somewhere to start when no font has been picked. The OS font directories are
-/// all we look at — a font shipped with the app would be a licence question.
+/// Somewhere to start when no font has been picked. The OS font directories
+/// are all we look at — a font shipped with the app would be a licence
+/// question.
 pub fn default_font() -> Option<PathBuf> {
     for dir in font_dirs() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -422,14 +575,18 @@ pub fn default_font() -> Option<PathBuf> {
             .filter(|p| is_font(p))
             .collect();
         candidates.sort();
-        if let Some(first) = candidates.into_iter().find(|p| load_font(p).is_some()) {
+        if let Some(first) = candidates.into_iter().find(|p| {
+            std::fs::read(p)
+                .ok()
+                .is_some_and(|b| ab_glyph::FontVec::try_from_vec(b).is_ok())
+        }) {
             return Some(first);
         }
     }
     None
 }
 
-/// Whether a path looks like a font file the rasteriser can open.
+/// Whether a path is a font file to rasterise, as opposed to an atlas image.
 pub fn is_font(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -460,154 +617,14 @@ pub fn font_dirs() -> Vec<PathBuf> {
     dirs.into_iter().flatten().filter(|d| d.is_dir()).collect()
 }
 
-/// One glyph placed in the raster, in pixels from the top-left.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Placed {
-    id: GlyphId,
-    x: f32,
-    y: f32,
-}
-
-/// Lay the string out at [`RASTER_PX`], returning the glyphs and the raster size
-/// they need. Newlines break lines; everything else is one run — no shaping, so
-/// this is Latin-shaped text (see the module docs).
-fn layout(font: &FontVec, l: &Layout) -> (Vec<Placed>, u32, u32) {
-    let scaled = font.as_scaled(PxScale::from(RASTER_PX));
-    let step = (scaled.ascent() - scaled.descent() + scaled.line_gap()) * l.line_height;
-    let tracking = l.tracking * RASTER_PX;
-
-    // Lay each line out from x=0, keeping its width so alignment can shift it.
-    let mut lines: Vec<(Vec<Placed>, f32)> = Vec::new();
-    for (row, line) in l.text.split('\n').enumerate() {
-        let mut placed = Vec::new();
-        let mut x = 0.0_f32;
-        let mut prev: Option<GlyphId> = None;
-        let y = scaled.ascent() + row as f32 * step;
-        for c in line.chars() {
-            let id = scaled.glyph_id(c);
-            if let Some(p) = prev {
-                x += scaled.kern(p, id);
-            }
-            placed.push(Placed { id, x, y });
-            x += scaled.h_advance(id) + tracking;
-            prev = Some(id);
-        }
-        // The trailing tracking is not part of the line.
-        let width = (x - tracking).max(0.0);
-        lines.push((placed, width));
-    }
-
-    let text_w = lines.iter().map(|(_, w)| *w).fold(0.0_f32, f32::max);
-    let rows = lines.len() as f32;
-    let text_h = scaled.ascent() - scaled.descent() + (rows - 1.0) * step;
-
-    let mut glyphs = Vec::new();
-    for (placed, width) in lines {
-        let shift = match l.align {
-            0 => 0.0,
-            2 => text_w - width,
-            _ => (text_w - width) / 2.0,
-        };
-        glyphs.extend(placed.into_iter().map(|p| Placed {
-            x: p.x + shift + PAD as f32,
-            ..p
-        }));
-    }
-
-    let w = (text_w.ceil() as u32 + PAD * 2).clamp(1, MAX_RASTER_W);
-    let h = (text_h.ceil() as u32 + PAD * 2).clamp(1, MAX_RASTER_W);
-    (glyphs, w, h)
-}
-
-/// Rasterise white glyphs with coverage in alpha, so the blit can tint them.
-fn raster(font: &FontVec, l: &Layout) -> (Vec<u8>, u32, u32) {
-    let (glyphs, w, h) = layout(font, l);
-    let mut pixels = vec![0u8; (w * h * 4) as usize];
-    for g in glyphs {
-        let glyph = g
-            .id
-            .with_scale_and_position(RASTER_PX, ab_glyph::point(g.x, g.y + PAD as f32));
-        let Some(outline) = font.outline_glyph(glyph) else {
-            continue;
-        };
-        let bounds = outline.px_bounds();
-        outline.draw(|gx, gy, coverage| {
-            let px = bounds.min.x as i32 + gx as i32;
-            let py = bounds.min.y as i32 + gy as i32;
-            if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
-                return;
-            }
-            let i = ((py as u32 * w + px as u32) * 4) as usize;
-            let a = (coverage * 255.0) as u8;
-            // Glyphs can overlap (tight tracking, accents): keep the strongest
-            // coverage rather than adding, which would ring at the joins.
-            if a > pixels[i + 3] {
-                pixels[i] = 255;
-                pixels[i + 1] = 255;
-                pixels[i + 2] = 255;
-                pixels[i + 3] = a;
-            }
-        });
-    }
-    (pixels, w, h)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// The first font the platform offers, or the test is meaningless.
-    fn a_font() -> Option<FontVec> {
-        default_font().as_deref().and_then(load_font)
-    }
-
     /// A shader that will not parse is a panic inside `create_shader_module`
     /// the first time someone adds a text layer — which is exactly how a field
     /// named `target`, a WGSL reserved word, got in.
     #[test]
-    fn the_blit_shader_parses() {
+    fn the_glyph_shader_parses() {
         wgpu::naga::front::wgsl::parse_str(include_str!("text.wgsl"))
             .expect("text.wgsl must be valid WGSL");
-    }
-
-    #[test]
-    fn a_longer_string_needs_a_wider_raster() {
-        let Some(font) = a_font() else { return };
-        let short = layout(&font, &Layout { text: "A".into(), ..Layout::default() });
-        let long = layout(&font, &Layout { text: "AAAA".into(), ..Layout::default() });
-        assert!(long.1 > short.1, "{} should exceed {}", long.1, short.1);
-        assert_eq!(long.2, short.2, "one line either way");
-        assert_eq!(long.0.len(), 4);
-    }
-
-    #[test]
-    fn every_line_adds_height() {
-        let Some(font) = a_font() else { return };
-        let one = layout(&font, &Layout { text: "A".into(), ..Layout::default() });
-        let two = layout(&font, &Layout { text: "A\nB".into(), ..Layout::default() });
-        assert!(two.2 > one.2);
-        assert_eq!(two.0.len(), 2);
-    }
-
-    /// Centred, a short line sits inside the block; left-aligned it starts at
-    /// the same place as the long one.
-    #[test]
-    fn alignment_shifts_the_short_line() {
-        let Some(font) = a_font() else { return };
-        let text = "AAAA\nA";
-        let centred = layout(&font, &Layout { text: text.into(), align: 1, ..Layout::default() });
-        let left = layout(&font, &Layout { text: text.into(), align: 0, ..Layout::default() });
-        let last = |g: &Vec<Placed>| g.last().unwrap().x;
-        assert!(last(&centred.0) > last(&left.0));
-        assert_eq!(left.0.first().unwrap().x, last(&left.0), "left edge shared");
-    }
-
-    /// An empty string still produces a texture the pipeline can bind.
-    #[test]
-    fn empty_text_still_has_a_raster() {
-        let Some(font) = a_font() else { return };
-        let (pixels, w, h) = raster(&font, &Layout { text: String::new(), ..Layout::default() });
-        assert!(w >= 1 && h >= 1);
-        assert_eq!(pixels.len(), (w * h * 4) as usize);
     }
 }

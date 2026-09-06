@@ -199,6 +199,9 @@ pub struct KovvbojAppState {
     /// `(layer uuid, file)`.
     #[serde(skip)]
     pub pending_clip: std::sync::Arc<std::sync::Mutex<Option<(String, std::path::PathBuf)>>>,
+    /// A font or atlas image picked for a text layer, same shape.
+    #[serde(skip)]
+    pub pending_font: std::sync::Arc<std::sync::Mutex<Option<(String, std::path::PathBuf)>>>,
     /// Finished HAP conversions: `(layer uuid, converted file or error)`. The
     /// layer swaps to the converted clip when one lands.
     #[serde(skip)]
@@ -819,6 +822,7 @@ impl Default for KovvbojAppState {
             pending_source_swaps: Vec::new(),
             pending_text: Vec::new(),
             pending_clip: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pending_font: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_convert: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(feature = "mixer")]
             layer_sources: std::collections::HashMap::new(),
@@ -2229,6 +2233,12 @@ impl EffectPlugin for KovvbojRootPlugin {
                         TextEdit::Font(p) => entry.path = Some(p),
                     }
                 }
+            }
+
+            if let Ok(mut guard) = state.pending_font.lock()
+                && let Some((uuid, path)) = guard.take()
+            {
+                state.pending_text.push((uuid, TextEdit::Font(path)));
             }
 
             // A clip picked in the inspector, or one that finished converting:
