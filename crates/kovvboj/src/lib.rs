@@ -2858,7 +2858,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                         let sender_name = format!("kovvboj — {}", proj.name);
 
                         // ── Disk recording ──────────────────────────────────
-                        let want_rec = matches!(proj.output_type, OutputType::Recording);
+                        // Armed, not just routed: see `KovvbojProjector::recording`.
+                        let want_rec =
+                            matches!(proj.output_type, OutputType::Recording) && proj.recording;
                         if want_rec && !sub.is_projector_recording(idx) {
                             let ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -2991,7 +2993,8 @@ impl EffectPlugin for KovvbojRootPlugin {
                         enabled_idx += 1;
                         let sender_name = format!("kovvboj — {}", hl.name);
 
-                        let want_rec = matches!(hl.output_type, OutputType::Recording);
+                        let want_rec =
+                            matches!(hl.output_type, OutputType::Recording) && hl.recording;
                         if want_rec && !sub.is_headless_recording(idx) {
                             let ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)

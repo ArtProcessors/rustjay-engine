@@ -6283,7 +6283,22 @@ mod egui_impl {
                                     #[cfg(target_os = "linux")]
                                     ui.selectable_value(&mut proj.output_type, OutputType::V4l2, "V4L2");
                                 });
+                            if proj.output_type == crate::stage::OutputType::Recording {
+                                let label = if proj.recording { "⏹ STOP" } else { "⏺ REC" };
+                                if ui
+                                    .button(egui::RichText::new(label).monospace())
+                                    .on_hover_text(if proj.recording {
+                                        "Stop recording"
+                                    } else {
+                                        "Start recording to recordings/"
+                                    })
+                                    .clicked()
+                                {
+                                    proj.recording = !proj.recording;
+                                }
+                            }
                             if proj.output_type != prev_type {
+                                proj.recording = false;
                                 proj_dirty = true;
                             }
                             ui.label("rotate:");
@@ -6496,7 +6511,27 @@ mod egui_impl {
                                     #[cfg(target_os = "linux")]
                                     ui.selectable_value(&mut hl.output_type, OutputType::V4l2, "V4L2");
                                 });
+                            // Recording is armed here and nowhere else — a
+                            // set that reloads does not start rolling.
+                            if hl.output_type == crate::stage::OutputType::Recording {
+                                let label = if hl.recording { "⏹ STOP" } else { "⏺ REC" };
+                                if ui
+                                    .button(egui::RichText::new(label).monospace())
+                                    .on_hover_text(if hl.recording {
+                                        "Stop recording"
+                                    } else {
+                                        "Start recording to recordings/"
+                                    })
+                                    .clicked()
+                                {
+                                    hl.recording = !hl.recording;
+                                }
+                            }
                             if hl.output_type != prev_type {
+                                // Changing where an output goes disarms it, so
+                                // switching back to Recording cannot silently
+                                // resume.
+                                hl.recording = false;
                                 hl_dirty = true;
                             }
                             if ui.button("🗑").clicked() {
@@ -6604,7 +6639,7 @@ mod egui_impl {
                         for (i, proj) in state.stage.projectors.iter().enumerate() {
                             if proj.enabled {
                                 match proj.output_type {
-                                    crate::stage::OutputType::Recording => {
+                                    crate::stage::OutputType::Recording if proj.recording => {
                                         if !sub.is_projector_recording(enabled_idx) {
                                             let path = self.auto_record_path(&format!("projector_{}_{}", i, proj.name));
                                             if let Err(e) = sub.start_projector_recording(enabled_idx, &path, fps, codec) {
@@ -6627,7 +6662,7 @@ mod egui_impl {
                         for (i, hl) in state.stage.headless_outputs.iter().enumerate() {
                             if hl.enabled && hl.pushed {
                                 match hl.output_type {
-                                    crate::stage::OutputType::Recording => {
+                                    crate::stage::OutputType::Recording if hl.recording => {
                                         if !sub.is_headless_recording(enabled_idx) {
                                             let path = self.auto_record_path(&format!("headless_{}_{}", i, hl.name));
                                             if let Err(e) = sub.start_headless_recording(enabled_idx, &path, fps, codec) {
