@@ -24,12 +24,36 @@ pub struct NdiSourceInfo {
     pub url: String,
 }
 
+/// How an [`NdiFrame`]'s bytes are laid out.
+///
+/// We ask senders for their native 4:2:2 and only get BGRA when the source
+/// actually carries alpha, so consumers have to handle both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NdiPixelLayout {
+    /// Tightly packed BGRA, `width * 4` bytes per row.
+    Bgra,
+    /// Packed 4:2:2 (U Y0 V Y1), `width * 2` bytes per row. Upload as a
+    /// half-width RGBA texture and unpack in a shader.
+    Uyvy,
+}
+
+impl NdiPixelLayout {
+    /// Bytes in one tightly-packed row of `width` pixels.
+    pub fn row_bytes(self, width: u32) -> usize {
+        match self {
+            Self::Bgra => width as usize * 4,
+            Self::Uyvy => width as usize * 2,
+        }
+    }
+}
+
 /// A received NDI video frame
 pub struct NdiFrame {
     pub width: u32,
     pub height: u32,
-    /// BGRA pixel data
+    /// Pixel data in `layout`.
     pub data: Vec<u8>,
+    pub layout: NdiPixelLayout,
     pub timestamp: Instant,
 }
 
@@ -153,9 +177,13 @@ impl NdiReceiver {
                 }
             };
 
-            // Create receiver with BGRA format
+            // Ask for the sender's native 4:2:2 (BGRA only when it has alpha).
+            // Requesting BGRA made libndi convert on the CPU via vImage, whose
+            // dispatch_apply left ~14 worker threads spinning in root-queue
+            // contention — 25x more time yielding than converting. The unpack is
+            // a shader's job.
             let options = ReceiverOptions::builder(source)
-                .color(ReceiverColorFormat::BGRX_BGRA)
+                .color(ReceiverColorFormat::UYVY_BGRA)
                 .bandwidth(ReceiverBandwidth::Highest)
                 .build();
 
@@ -178,13 +206,18 @@ impl NdiReceiver {
                         let width = video_frame.width() as u32;
                         let height = video_frame.height() as u32;
                         let frame_data = video_frame.data();
+                        let layout = match video_frame.pixel_format() {
+                            grafton_ndi::PixelFormat::UYVY => NdiPixelLayout::Uyvy,
+                            _ => NdiPixelLayout::Bgra,
+                        };
 
-                        // Strip NDI row stride/padding to produce tightly-packed BGRA
-                        // matching bytes_per_row = width * 4 expected by the GPU upload.
+                        // Strip NDI row stride/padding so bytes_per_row matches
+                        // what the GPU upload expects.
                         let frame = NdiFrame {
                             width,
                             height,
-                            data: strip_stride_bgra(frame_data, width, height),
+                            data: strip_stride(frame_data, width, height, layout),
+                            layout,
                             timestamp: Instant::now(),
                         };
 
@@ -263,11 +296,11 @@ impl Drop for NdiReceiver {
 /// Strip NDI row stride/padding from raw frame data.
 ///
 /// NDI frames may have row-aligned padding (e.g. IOSurface stride alignment on macOS).
-/// This produces tightly-packed BGRA bytes ready to upload to a `Bgra8Unorm` wgpu
-/// texture with `bytes_per_row = width * 4`. No channel swap needed since
-/// `ReceiverColorFormat::BGRX_BGRA` already matches `Bgra8Unorm`.
-fn strip_stride_bgra(data: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let row_bytes = width as usize * 4;
+/// This produces tightly-packed rows ready to upload. BGRA needs no channel
+/// swap — it already matches `Bgra8Unorm` — and UYVY is uploaded as-is for the
+/// shader to unpack.
+fn strip_stride(data: &[u8], width: u32, height: u32, layout: NdiPixelLayout) -> Vec<u8> {
+    let row_bytes = layout.row_bytes(width);
     let mut out = vec![0u8; row_bytes * height as usize];
 
     let actual_stride = if height > 0 {

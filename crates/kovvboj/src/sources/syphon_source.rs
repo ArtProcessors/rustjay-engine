@@ -11,8 +11,14 @@ pub struct SyphonSource {
     server_name: String,
     server_uuid: String,
     initialized: bool,
+    /// When to try connecting again. Retrying every frame costs ~4% of a core
+    /// and floods the log at 60 lines a second while the publisher is down.
+    next_attempt: std::time::Instant,
     pipeline: BlitPipeline,
 }
+
+/// How long to wait between connection attempts while the server is absent.
+const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl SyphonSource {
     pub fn new(
@@ -31,6 +37,7 @@ impl SyphonSource {
             server_name,
             server_uuid,
             initialized: false,
+            next_attempt: std::time::Instant::now(),
             pipeline,
         }
     }
@@ -38,11 +45,12 @@ impl SyphonSource {
 
 impl EffectInstance for SyphonSource {
     fn prepare(&mut self, _engine: &EngineState, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if !self.initialized {
+        if !self.initialized && std::time::Instant::now() >= self.next_attempt {
             match self
                 .receiver
                 .connect_by_uuid(&self.server_uuid, &self.server_name)
             { Err(e) => {
+                self.next_attempt = std::time::Instant::now() + RETRY_INTERVAL;
                 log::warn!("[SyphonSource] Failed to connect: {}", e);
             } _ => {
                 self.initialized = true;

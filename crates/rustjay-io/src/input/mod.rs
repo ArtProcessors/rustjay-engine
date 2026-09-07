@@ -4,17 +4,25 @@ use std::sync::mpsc;
 #[cfg(feature = "ndi")]
 pub mod ndi;
 #[cfg(feature = "ndi")]
-pub use ndi::{list_ndi_sources, NdiReceiver};
+pub use ndi::{list_ndi_sources, NdiPixelLayout, NdiReceiver};
 
 #[cfg(not(feature = "ndi"))]
 #[allow(dead_code)]
 pub struct NdiReceiver;
 #[cfg(not(feature = "ndi"))]
 #[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NdiPixelLayout {
+    Bgra,
+    Uyvy,
+}
+#[cfg(not(feature = "ndi"))]
+#[allow(dead_code)]
 pub struct NdiFrame {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    pub layout: NdiPixelLayout,
 }
 #[cfg(not(feature = "ndi"))]
 #[allow(dead_code)]

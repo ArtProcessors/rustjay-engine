@@ -10,6 +10,8 @@ pub struct BlitPipeline {
     pipeline: wgpu::RenderPipeline,
     /// Same blit, but forcing alpha to 1 — see [`BlitPipeline::blit_opaque`].
     pipeline_opaque: wgpu::RenderPipeline,
+    /// Unpacks packed 4:2:2 — see [`BlitPipeline::blit_uyvy`].
+    pipeline_uyvy: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 }
@@ -45,6 +47,32 @@ impl BlitPipeline {
                 fn fs_opaque(in: VertexOutput) -> @location(0) vec4<f32> {
                     let c = textureSample(source_tex, source_sampler, in.texcoord);
                     return vec4<f32>(c.rgb, 1.0);
+                }
+
+                // Packed 4:2:2. The source texture is half-width RGBA where each
+                // texel holds U, Y0, V, Y1 — so one texel covers two output
+                // pixels and the low bit of x picks which luma to use.
+                // textureLoad, not textureSample: filtering across a texel would
+                // blend two different pixels' luma together.
+                @fragment
+                fn fs_uyvy(in: VertexOutput) -> @location(0) vec4<f32> {
+                    let packed = textureDimensions(source_tex);
+                    let out_w = f32(packed.x) * 2.0;
+                    let px = u32(clamp(in.texcoord.x, 0.0, 0.9999) * out_w);
+                    let py = u32(clamp(in.texcoord.y, 0.0, 0.9999) * f32(packed.y));
+                    let t = textureLoad(source_tex, vec2<u32>(px / 2u, py), 0);
+                    let y = select(t.a, t.g, (px & 1u) == 0u);
+                    let u = t.r - 0.5;
+                    let v = t.b - 0.5;
+                    // BT.709 limited range, staying display-referred like every
+                    // other source in the graph.
+                    let yy = (y - 0.0627451) * 1.164383;
+                    return vec4<f32>(
+                        yy + 1.792741 * v,
+                        yy - 0.213249 * u - 0.532909 * v,
+                        yy + 2.112402 * u,
+                        1.0,
+                    );
                 }
                 "#
                 .into(),
@@ -137,9 +165,36 @@ impl BlitPipeline {
             cache: None,
         });
 
+        let pipeline_uyvy = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Mixer Blit Pipeline (UYVY)"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[Some(Vertex::desc())],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_uyvy"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
             pipeline_opaque,
+            pipeline_uyvy,
             bind_group_layout,
             sampler,
         }
@@ -178,6 +233,30 @@ impl BlitPipeline {
             dest,
             vertex_buffer,
             &self.pipeline_opaque,
+        );
+    }
+
+    /// Copy `source` to `dest`, unpacking packed 4:2:2 on the way.
+    ///
+    /// `source` must be a half-width RGBA texture holding UYVY bytes. Asking a
+    /// sender for its native 4:2:2 rather than BGRA halves the upload and skips
+    /// the CPU colour convert — for NDI that convert was costing far more in
+    /// libdispatch contention than in arithmetic.
+    pub fn blit_uyvy(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::TextureView,
+        dest: &wgpu::TextureView,
+        vertex_buffer: &wgpu::Buffer,
+    ) {
+        self.blit_with(
+            device,
+            encoder,
+            source,
+            dest,
+            vertex_buffer,
+            &self.pipeline_uyvy,
         );
     }
 

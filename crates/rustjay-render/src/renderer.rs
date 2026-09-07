@@ -745,6 +745,9 @@ impl<P: EffectPlugin> WgpuEngine<P> {
             self.fps_current = self.fps_frame_count as f32 / elapsed.as_secs_f32();
             self.fps_frame_count = 0;
             self.fps_last_time = std::time::Instant::now();
+            // Off unless asked for: `RUST_LOG=info,fps=debug`. The UI shows this
+            // number, but a profiling run has no one watching the UI.
+            log::debug!(target: "fps", "{:.1}", self.fps_current);
 
             if let Ok(state) = self.shared_state.lock()
                 && let Ok(mut perf) = state.performance.lock() {

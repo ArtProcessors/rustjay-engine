@@ -594,7 +594,13 @@ mod egui_impl {
     /// A text layer's copy and font. Size, colour and position are ordinary
     /// parameters, so they are drawn with the source's own list; these two are
     /// not numbers and have nowhere else to live.
-    fn text_layer_controls(ui: &mut egui::Ui, state: &mut KovvbojAppState, layer: &str) {
+    fn text_layer_controls(
+        ui: &mut egui::Ui,
+        state: &mut KovvbojAppState,
+        engine: &mut EngineState,
+        layer: &str,
+        full: &str,
+    ) {
         let applied = state
             .layer_sources
             .get(layer)
@@ -631,6 +637,31 @@ mod egui_impl {
         let mut pick: Option<std::path::PathBuf> = None;
         ui.horizontal(|ui| {
             ui.label("Font:");
+            // Anything the atlas builder accepts: a font file to rasterise, or
+            // an image someone drew, which reads its characters from a
+            // same-named .txt beside it.
+            if ui
+                .small_button("…")
+                .on_hover_text("Pick a font file, or an atlas image")
+                .clicked()
+            {
+                let pending = state.pending_font.clone();
+                let ctx = ui.ctx().clone();
+                let layer = layer.to_string();
+                std::thread::spawn(move || {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Font", &["ttf", "otf", "ttc"])
+                        .add_filter("Atlas image", &["png", "jpg", "jpeg"])
+                        .set_title("Pick a font or atlas")
+                        .pick_file()
+                    {
+                        if let Ok(mut guard) = pending.lock() {
+                            *guard = Some((layer, path));
+                        }
+                        ctx.request_repaint();
+                    }
+                });
+            }
             egui::ComboBox::from_id_salt(("font", layer))
                 .width(ui.available_width())
                 .selected_text(selected)
@@ -660,6 +691,29 @@ mod egui_impl {
                     .color(rustjay_gui::egui_theme::colors::ink_3()),
             );
         }
+        // What the atlas actually mapped. A drawn atlas whose sidecar is
+        // missing renders the wrong letters, and this is the only place that
+        // says so.
+        let summary = {
+            let mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
+            mixer
+                .channels
+                .iter()
+                .find(|c| c.uuid == layer)
+                .and_then(|c| c.effect.as_any())
+                .and_then(|a| a.downcast_ref::<crate::sources::TextSource>())
+                .map(|t| t.atlas_summary())
+        };
+        if let Some(summary) = summary {
+            ui.label(
+                egui::RichText::new(summary)
+                    .size(10.0)
+                    .color(rustjay_gui::egui_theme::colors::ink_4()),
+            );
+        }
+        // The animation clock, the same shape as a clip's or a shader's.
+        param_slider(ui, engine, &format!("{full}speed"), "Speed", 0.0, 4.0);
+        tempo_row(ui, engine, &format!("{full}sync"), &format!("{full}div"), None);
     }
 
     /// Parameters the pacing block owns, drawn there rather than in the
@@ -1774,7 +1828,7 @@ mod egui_impl {
                 && let crate::Selection::Layer { layer } = &selection
             {
                 ui.separator();
-                text_layer_controls(ui, state, &layer.clone());
+                text_layer_controls(ui, state, engine, &layer.clone(), &full);
             }
             return;
         }
@@ -1791,7 +1845,7 @@ mod egui_impl {
                     .get(layer)
                     .is_some_and(|e| e.kind == crate::sources::SourceKind::Text)
             {
-                text_layer_controls(ui, state, &layer.clone());
+                text_layer_controls(ui, state, engine, &layer.clone(), &full);
                 ui.separator();
                 any = true;
             }
@@ -6229,7 +6283,22 @@ mod egui_impl {
                                     #[cfg(target_os = "linux")]
                                     ui.selectable_value(&mut proj.output_type, OutputType::V4l2, "V4L2");
                                 });
+                            if proj.output_type == crate::stage::OutputType::Recording {
+                                let label = if proj.recording { "⏹ STOP" } else { "⏺ REC" };
+                                if ui
+                                    .button(egui::RichText::new(label).monospace())
+                                    .on_hover_text(if proj.recording {
+                                        "Stop recording"
+                                    } else {
+                                        "Start recording to recordings/"
+                                    })
+                                    .clicked()
+                                {
+                                    proj.recording = !proj.recording;
+                                }
+                            }
                             if proj.output_type != prev_type {
+                                proj.recording = false;
                                 proj_dirty = true;
                             }
                             ui.label("rotate:");
@@ -6442,7 +6511,27 @@ mod egui_impl {
                                     #[cfg(target_os = "linux")]
                                     ui.selectable_value(&mut hl.output_type, OutputType::V4l2, "V4L2");
                                 });
+                            // Recording is armed here and nowhere else — a
+                            // set that reloads does not start rolling.
+                            if hl.output_type == crate::stage::OutputType::Recording {
+                                let label = if hl.recording { "⏹ STOP" } else { "⏺ REC" };
+                                if ui
+                                    .button(egui::RichText::new(label).monospace())
+                                    .on_hover_text(if hl.recording {
+                                        "Stop recording"
+                                    } else {
+                                        "Start recording to recordings/"
+                                    })
+                                    .clicked()
+                                {
+                                    hl.recording = !hl.recording;
+                                }
+                            }
                             if hl.output_type != prev_type {
+                                // Changing where an output goes disarms it, so
+                                // switching back to Recording cannot silently
+                                // resume.
+                                hl.recording = false;
                                 hl_dirty = true;
                             }
                             if ui.button("🗑").clicked() {
@@ -6550,7 +6639,7 @@ mod egui_impl {
                         for (i, proj) in state.stage.projectors.iter().enumerate() {
                             if proj.enabled {
                                 match proj.output_type {
-                                    crate::stage::OutputType::Recording => {
+                                    crate::stage::OutputType::Recording if proj.recording => {
                                         if !sub.is_projector_recording(enabled_idx) {
                                             let path = self.auto_record_path(&format!("projector_{}_{}", i, proj.name));
                                             if let Err(e) = sub.start_projector_recording(enabled_idx, &path, fps, codec) {
@@ -6573,7 +6662,7 @@ mod egui_impl {
                         for (i, hl) in state.stage.headless_outputs.iter().enumerate() {
                             if hl.enabled && hl.pushed {
                                 match hl.output_type {
-                                    crate::stage::OutputType::Recording => {
+                                    crate::stage::OutputType::Recording if hl.recording => {
                                         if !sub.is_headless_recording(enabled_idx) {
                                             let path = self.auto_record_path(&format!("headless_{}_{}", i, hl.name));
                                             if let Err(e) = sub.start_headless_recording(enabled_idx, &path, fps, codec) {

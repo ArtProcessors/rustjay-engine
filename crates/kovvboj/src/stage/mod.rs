@@ -670,6 +670,12 @@ pub struct KovvbojProjector {
     /// How this output delivers frames.
     #[serde(default)]
     pub output_type: OutputType,
+    /// Whether a `Recording` output is actually rolling. Deliberately not
+    /// persisted: reloading a set restores where the pixels go, it does not
+    /// press record. NDI and Syphon resume on load because publishing a name
+    /// is free and idempotent; a recording creates a file and fills a disk.
+    #[serde(skip)]
+    pub recording: bool,
     /// Use the global warp/dome/edge-blend syncs, or per-projector overrides.
     pub use_global_warp: bool,
     pub use_global_dome: bool,
@@ -704,6 +710,7 @@ impl Default for KovvbojProjector {
             window_id: None,
             rotation: OutputRotation::default(),
             output_type: OutputType::Display,
+            recording: false,
             use_global_warp: true,
             use_global_dome: true,
             use_global_edge_blend: true,
@@ -819,6 +826,12 @@ pub struct KovvbojHeadlessConfig {
     /// How this output delivers frames.
     #[serde(default)]
     pub output_type: OutputType,
+    /// Whether a `Recording` output is actually rolling. Deliberately not
+    /// persisted: reloading a set restores where the pixels go, it does not
+    /// press record. NDI and Syphon resume on load because publishing a name
+    /// is free and idempotent; a recording creates a file and fills a disk.
+    #[serde(skip)]
+    pub recording: bool,
     /// Whether this headless output has already been pushed to the
     /// projection subsystem. Not serialized — reset on app restart.
     #[serde(skip)]
@@ -836,6 +849,7 @@ impl Default for KovvbojHeadlessConfig {
             height: 1080,
             surface_index: None,
             output_type: OutputType::Display,
+            recording: false,
             pushed: false,
         }
     }

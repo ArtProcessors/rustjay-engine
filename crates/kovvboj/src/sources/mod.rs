@@ -129,6 +129,7 @@ mod clip_speed_tests {
         assert_eq!(clip_speed(1.5, false, 4, 120.0, 2.0), 1.5);
     }
 }
+pub mod text_atlas;
 pub mod text_source;
 mod solid_color_source;
 mod watcher;

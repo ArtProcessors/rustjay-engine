@@ -199,6 +199,9 @@ pub struct KovvbojAppState {
     /// `(layer uuid, file)`.
     #[serde(skip)]
     pub pending_clip: std::sync::Arc<std::sync::Mutex<Option<(String, std::path::PathBuf)>>>,
+    /// A font or atlas image picked for a text layer, same shape.
+    #[serde(skip)]
+    pub pending_font: std::sync::Arc<std::sync::Mutex<Option<(String, std::path::PathBuf)>>>,
     /// Finished HAP conversions: `(layer uuid, converted file or error)`. The
     /// layer swaps to the converted clip when one lands.
     #[serde(skip)]
@@ -819,6 +822,7 @@ impl Default for KovvbojAppState {
             pending_source_swaps: Vec::new(),
             pending_text: Vec::new(),
             pending_clip: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pending_font: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_convert: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(feature = "mixer")]
             layer_sources: std::collections::HashMap::new(),
@@ -2231,6 +2235,12 @@ impl EffectPlugin for KovvbojRootPlugin {
                 }
             }
 
+            if let Ok(mut guard) = state.pending_font.lock()
+                && let Some((uuid, path)) = guard.take()
+            {
+                state.pending_text.push((uuid, TextEdit::Font(path)));
+            }
+
             // A clip picked in the inspector, or one that finished converting:
             // both land as a source swap, which keeps the layer's uuid, chain
             // and bindings.
@@ -2848,7 +2858,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                         let sender_name = format!("kovvboj — {}", proj.name);
 
                         // ── Disk recording ──────────────────────────────────
-                        let want_rec = matches!(proj.output_type, OutputType::Recording);
+                        // Armed, not just routed: see `KovvbojProjector::recording`.
+                        let want_rec =
+                            matches!(proj.output_type, OutputType::Recording) && proj.recording;
                         if want_rec && !sub.is_projector_recording(idx) {
                             let ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -2981,7 +2993,8 @@ impl EffectPlugin for KovvbojRootPlugin {
                         enabled_idx += 1;
                         let sender_name = format!("kovvboj — {}", hl.name);
 
-                        let want_rec = matches!(hl.output_type, OutputType::Recording);
+                        let want_rec =
+                            matches!(hl.output_type, OutputType::Recording) && hl.recording;
                         if want_rec && !sub.is_headless_recording(idx) {
                             let ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
