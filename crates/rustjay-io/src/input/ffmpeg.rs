@@ -4,9 +4,10 @@
 //! converts them to RGBA for GPU upload. Supports loop/ping-pong/one-shot,
 //! variable speed, scrubbing, and in/out points.
 //!
+//! Decoding runs on a worker thread and hands frames back as pixels for the
+//! caller to upload; VideoToolbox carries the decode itself on macOS.
+//!
 //! # Known limitations
-//! - Synchronous software decode on the caller thread. High-resolution files
-//!   may drop frames; hardware acceleration is a future optimization.
 //! - Seeking lands on the nearest keyframe before the target, then decodes
 //!   forward. Random-access scrub is usable but not instant.
 
@@ -66,6 +67,12 @@ enum PingPongDir {
     Backward,
 }
 
+/// How many frames `decode_at_position` will decode past on its way to the
+/// wall-clock target before giving up and returning what it has. Long-GOP h264
+/// cannot skip cheaply — reaching frame N means decoding frames 0..N — so the
+/// only defence against falling behind is to stop chasing.
+const MAX_CATCHUP_FRAMES: u32 = 2;
+
 /// ffmpeg-backed video file decoder.
 pub struct FfmpegDecoder {
     path: PathBuf,
@@ -84,12 +91,12 @@ pub struct FfmpegDecoder {
     out_point: f64, // seconds
     ping_pong_dir: PingPongDir,
 
-    // Active decode context (lazy-initialized)
-    context: Option<DecodeContext>,
-
-    // Cached last frame + pts
-    last_frame: Option<VideoFrame>,
-    last_pts: i64,
+    // Decoding, on its own thread. Spawned on first use so opening a file
+    // costs nothing until something asks it to play.
+    worker: Option<DecodeWorker>,
+    /// Set when `position` jumped somewhere the decode cursor cannot be walked
+    /// to; travels with the next request.
+    force_seek: bool,
     last_decode_time: Option<Instant>,
 
     // Frame pacing — wall-clock accumulator so we only decode when enough
@@ -101,7 +108,11 @@ pub struct FfmpegDecoder {
 struct DecodeContext {
     input: ffmpeg::format::context::Input,
     decoder: ffmpeg::codec::decoder::Video,
-    scaler: ffmpeg::software::scaling::Context,
+    /// Built on the first frame and rebuilt if the format changes. It cannot be
+    /// built up front any more: with VideoToolbox the decoder reports an opaque
+    /// hardware format, and the real source format is whatever the download
+    /// hands back (NV12 in practice).
+    scaler: Option<(Pixel, ffmpeg::software::scaling::Context)>,
     stream_index: usize,
     time_base: f64,
     /// Set when the stream declares an identity colourspace, meaning its
@@ -121,13 +132,97 @@ impl DecodeContext {
         if self.identity_gbr {
             return Ok(pack_gbr_planes(decoded));
         }
-        self.scaler.run(decoded, scratch)?;
+        let downloaded = download_if_hardware(decoded)?;
+        let src = downloaded.as_ref().unwrap_or(decoded);
+
+        let format = src.format();
+        if self.scaler.as_ref().is_none_or(|(f, _)| *f != format) {
+            self.scaler = Some((
+                format,
+                Context::get(
+                    format,
+                    src.width(),
+                    src.height(),
+                    Pixel::RGBA,
+                    src.width(),
+                    src.height(),
+                    Flags::BILINEAR,
+                )?,
+            ));
+        }
+        let (_, scaler) = self.scaler.as_mut().expect("just built");
+        scaler.run(src, scratch)?;
         Ok(VideoFrame {
             width: scratch.width(),
             height: scratch.height(),
             data: scratch.data(0).to_vec(),
         })
     }
+}
+
+/// Open a video decoder, on VideoToolbox where the platform offers it.
+///
+/// 4K h264 decoded in software cost ~60% of a core on the render thread and
+/// took the whole app from 48fps to 4. Attaching a hardware device context
+/// before `avcodec_open2` is enough — FFmpeg's default `get_format` picks the
+/// hardware pixel format once `hw_device_ctx` is set. Frames then arrive opaque
+/// and go through `download_if_hardware`.
+///
+/// Falls back to software silently: a codec the hardware cannot handle (or a
+/// machine without it) must still play.
+fn open_video_decoder(
+    context: ffmpeg::codec::context::Context,
+) -> anyhow::Result<ffmpeg::codec::decoder::Video> {
+    #[allow(unused_mut)]
+    let mut decoder = context.decoder();
+
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use ffmpeg::sys::{AVBufferRef, AVHWDeviceType, av_buffer_unref, av_hwdevice_ctx_create};
+        let mut device: *mut AVBufferRef = std::ptr::null_mut();
+        let rc = av_hwdevice_ctx_create(
+            &mut device,
+            AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        );
+        if rc >= 0 && !device.is_null() {
+            // Ownership moves to the codec context, which releases it on close.
+            (*decoder.0.as_mut_ptr()).hw_device_ctx = device;
+        } else {
+            if !device.is_null() {
+                av_buffer_unref(&mut device);
+            }
+            log::warn!("[ffmpeg] VideoToolbox unavailable ({rc}); decoding in software");
+        }
+    }
+
+    Ok(decoder.video()?)
+}
+
+/// Copy a hardware frame into system memory, or `None` if it is already there.
+///
+/// The decoder hands back an opaque `AV_PIX_FMT_VIDEOTOOLBOX` frame wrapping a
+/// CVPixelBuffer; swscale cannot read it. Passing a fresh frame with no format
+/// lets FFmpeg choose the transfer format itself (NV12 here).
+///
+/// ponytail: this download is a full-frame copy off the GPU — the zero-copy
+/// path is to wrap the CVPixelBuffer's IOSurface as a Metal texture and sample
+/// NV12 in the shader. Worth doing when the copy shows up in a profile; the
+/// decode was the expensive half and this already removes it.
+fn download_if_hardware(frame: &Video) -> anyhow::Result<Option<Video>> {
+    if frame.format() != Pixel::VIDEOTOOLBOX {
+        return Ok(None);
+    }
+    let mut sw = Video::empty();
+    unsafe {
+        let rc = ffmpeg::sys::av_hwframe_transfer_data(sw.as_mut_ptr(), frame.as_ptr(), 0);
+        if rc < 0 {
+            return Err(anyhow::anyhow!("hardware frame download failed ({rc})"));
+        }
+    }
+    Ok(Some(sw))
 }
 
 /// Whether this stream's planes are GBR rather than YUV, and can be packed
@@ -236,9 +331,8 @@ impl FfmpegDecoder {
             in_point: 0.0,
             out_point: duration,
             ping_pong_dir: PingPongDir::Forward,
-            context: None,
-            last_frame: None,
-            last_pts: -1,
+            worker: None,
+            force_seek: true,
             last_decode_time: None,
             frame_accumulator: 0.0,
             frame_time,
@@ -266,9 +360,7 @@ impl FfmpegDecoder {
         self.pause();
         self.position = self.in_point;
         self.ping_pong_dir = PingPongDir::Forward;
-        self.last_pts = -1;
-        self.context = None;
-        self.last_frame = None;
+        self.force_seek = true;
         self.frame_accumulator = 0.0;
     }
 
@@ -290,7 +382,7 @@ impl FfmpegDecoder {
         let t = position.clamp(0.0, 1.0);
         let range = self.out_point - self.in_point;
         self.position = self.in_point + t * range;
-        self.last_pts = -1;
+        self.force_seek = true;
         self.frame_accumulator = 0.0;
         // Context will seek on next decode.
     }
@@ -303,7 +395,7 @@ impl FfmpegDecoder {
         }
         if self.position < self.in_point {
             self.position = self.in_point;
-            self.last_pts = -1;
+            self.force_seek = true;
         }
     }
 
@@ -315,7 +407,7 @@ impl FfmpegDecoder {
         }
         if self.position > self.out_point {
             self.position = self.out_point;
-            self.last_pts = -1;
+            self.force_seek = true;
         }
     }
 
@@ -377,19 +469,17 @@ impl FfmpegDecoder {
     /// real time has elapsed for the video frame rate and speed. When
     /// behind, intermediate frames are skipped so the decoder catches up.
     pub fn decode_frame(&mut self) -> Option<VideoFrame> {
-        if self.context.is_none()
-            && let Err(e) = self.init_context()
-        {
-            log::warn!(
-                "FfmpegDecoder failed to init context for {}: {}",
-                self.path.display(),
-                e
-            );
-            return self.last_frame.clone();
-        }
+        let worker = self
+            .worker
+            .get_or_insert_with(|| DecodeWorker::spawn(self.path.clone()));
 
         if !self.playing {
-            return self.last_frame.clone();
+            // Paused still has to serve a seek — scrubbing must show where you
+            // scrubbed to — but nothing else moves.
+            if std::mem::take(&mut self.force_seek) {
+                worker.request(self.position, true);
+            }
+            return worker.take_frame();
         }
 
         let now = Instant::now();
@@ -403,7 +493,9 @@ impl FfmpegDecoder {
             self.frame_accumulator += dt * self.speed.abs() as f64;
             let ftd = (self.frame_accumulator / self.frame_time).floor() as u32;
             if ftd == 0 {
-                return self.last_frame.clone();
+                // No new frame is due, but one asked for earlier may have
+                // landed by now — this is where the pipelining pays off.
+                return worker.take_frame();
             }
             self.frame_accumulator -= ftd as f64 * self.frame_time;
             ftd
@@ -437,7 +529,7 @@ impl FfmpegDecoder {
                         }
                         LoopMode::Loop => {
                             self.position = self.in_point;
-                            self.last_pts = -1;
+                            self.force_seek = true;
                         }
                         LoopMode::PingPong => unreachable!(),
                     }
@@ -449,7 +541,7 @@ impl FfmpegDecoder {
                         }
                         LoopMode::Loop => {
                             self.position = self.out_point;
-                            self.last_pts = -1;
+                            self.force_seek = true;
                         }
                         LoopMode::PingPong => unreachable!(),
                     }
@@ -458,24 +550,19 @@ impl FfmpegDecoder {
         }
         self.last_decode_time = Some(now);
 
-        // Decode the frame at the current position.
-        // When frames_to_decode > 1 we are behind; decode_at_position will
-        // seek (if far) or decode forward (if near) to the target frame,
-        // skipping intermediates.
-        match self.decode_at_position(self.position) {
-            Ok(frame) => {
-                self.last_frame = Some(frame.clone());
-                Some(frame)
-            }
-            Err(e) => {
-                log::warn!("FfmpegDecoder decode error: {}", e);
-                self.last_frame.clone()
-            }
-        }
+        // Post the position and take whatever is ready. The frame collected
+        // here is the answer to an earlier request — one frame of latency,
+        // traded for never blocking the render thread.
+        worker.request(self.position, std::mem::take(&mut self.force_seek));
+        worker.take_frame()
     }
 
-    fn init_context(&mut self) -> anyhow::Result<()> {
-        let ictx = input(&self.path)?;
+}
+
+/// Open `path` and build everything the decode loop needs. Runs on the worker
+/// thread, so a slow file open never stalls a render.
+fn open_decode_context(path: &Path) -> anyhow::Result<DecodeContext> {
+        let ictx = input(path)?;
         let stream = ictx
             .streams()
             .best(Type::Video)
@@ -485,52 +572,47 @@ impl FfmpegDecoder {
         let time_base = time_base.numerator() as f64 / time_base.denominator().max(1) as f64;
 
         let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
-        let decoder = context.decoder().video()?;
-
-        let scaler = Context::get(
-            decoder.format(),
-            decoder.width(),
-            decoder.height(),
-            Pixel::RGBA,
-            decoder.width(),
-            decoder.height(),
-            Flags::BILINEAR,
-        )?;
+        let decoder = open_video_decoder(context)?;
 
         let identity_gbr = is_identity_gbr(decoder.color_space(), decoder.format());
         if matches!(decoder.color_space(), Space::RGB) && !identity_gbr {
             log::warn!(
                 "FfmpegDecoder: {} declares an identity colourspace in {:?}, which swscale will \
                  convert as if it were YUV; colours will be wrong",
-                self.path.display(),
+                path.display(),
                 decoder.format()
             );
         }
 
-        self.context = Some(DecodeContext {
+        Ok(DecodeContext {
             input: ictx,
             decoder,
-            scaler,
+            scaler: None,
             stream_index,
             time_base,
             identity_gbr,
-        });
-        Ok(())
+        })
     }
 
-    fn decode_at_position(&mut self, position_secs: f64) -> anyhow::Result<VideoFrame> {
-        let ctx = self
-            .context
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Decoder not initialized"))?;
+impl DecodeContext {
+    /// Decode the frame covering `position_secs`.
+    ///
+    /// `last_pts` is the decode cursor, owned by the caller so a seek can reset
+    /// it: set it to -1 to force a seek on the next call.
+    fn decode_at_position(
+        &mut self,
+        position_secs: f64,
+        last_pts: &mut i64,
+    ) -> anyhow::Result<VideoFrame> {
+        let ctx = self;
 
         // Convert target position to stream timestamp units.
         let target_ts = (position_secs / ctx.time_base) as i64;
 
         // Seek if we're before the last decoded frame or far ahead.
-        let needs_seek = self.last_pts < 0
-            || target_ts < self.last_pts
-            || target_ts > self.last_pts + (1.0 / ctx.time_base) as i64 * 2;
+        let needs_seek = *last_pts < 0
+            || target_ts < *last_pts
+            || target_ts > *last_pts + (1.0 / ctx.time_base) as i64 * 2;
 
         if needs_seek {
             // Seek to a keyframe at or before the target.
@@ -539,11 +621,20 @@ impl FfmpegDecoder {
                 log::warn!("FfmpegDecoder seek failed: {}", e);
             }
             ctx.decoder.flush();
-            self.last_pts = -1;
+            *last_pts = -1;
         }
 
         let mut decoded = Video::empty();
         let mut rgba_frame = Video::empty();
+        // Frames decoded on the way to the target, and the budget for them.
+        // Chasing a wall-clock position without a bound is a death spiral: a
+        // slow decode makes the next position jump larger, which makes the next
+        // decode slower. A 4K h264 layer took the whole app from 48fps to 4.
+        // With a budget the clip falls behind under load — one heavy layer no
+        // longer sets the frame rate for the other ten. It re-syncs on the next
+        // seek, and in the healthy case (~1 frame wanted per render) it never
+        // binds.
+        let mut skipped = 0u32;
 
         loop {
             let mut packet = ffmpeg::Packet::empty();
@@ -555,17 +646,21 @@ impl FfmpegDecoder {
                     ctx.decoder.send_packet(&packet)?;
                     while ctx.decoder.receive_frame(&mut decoded).is_ok() {
                         let pts = decoded.timestamp().unwrap_or(-1);
-                        if pts >= target_ts || self.last_pts < 0 {
+                        if pts >= target_ts || *last_pts < 0 || skipped >= MAX_CATCHUP_FRAMES {
                             let frame = ctx.convert_to_rgba(&decoded, &mut rgba_frame)?;
-                            self.last_pts = pts;
+                            *last_pts = pts;
                             return Ok(frame);
                         }
-                        self.last_pts = pts;
+                        *last_pts = pts;
+                        skipped += 1;
                     }
                 }
                 Err(ffmpeg::Error::Eof) => {
-                    // End of file: drain decoder.
-                    ctx.decoder.send_eof()?;
+                    // End of file: drain the decoder. A clip whose out point is
+                    // its last frame reaches here once per loop, and a second
+                    // send_eof while already draining fails — expected, not an
+                    // error worth propagating.
+                    let _ = ctx.decoder.send_eof();
                     if ctx.decoder.receive_frame(&mut decoded).is_ok() {
                         return ctx.convert_to_rgba(&decoded, &mut rgba_frame);
                     }
@@ -581,9 +676,149 @@ impl FfmpegDecoder {
     }
 }
 
-impl Drop for FfmpegDecoder {
+
+// ── Decode worker ──────────────────────────────────────────────────────────
+
+/// What the render thread wants next.
+struct DecodeRequest {
+    position: f64,
+    /// Reset the decode cursor first — the position moved somewhere the cursor
+    /// cannot simply be advanced to (a seek, a loop wrap, an in/out edit).
+    force_seek: bool,
+}
+
+/// The two hand-off slots between the render thread and the decode worker.
+///
+/// Both are latest-wins rather than queues: an unread request is replaced, and
+/// so is an uncollected frame. A queue would only build a backlog whose
+/// contents are already stale by the time anyone looks at them, and holding
+/// several 4K frames costs real memory.
+#[derive(Default)]
+struct DecodeShared {
+    request: Option<DecodeRequest>,
+    frame: Option<VideoFrame>,
+    stop: bool,
+}
+
+/// Decoding, moved off the render thread.
+///
+/// Even on VideoToolbox, `receive_frame` blocks until the hardware has a frame
+/// ready — enough to drag a full set from 60fps to 36 with one 4K layer. The
+/// render thread now posts a position and collects whatever is ready, so it
+/// waits for nothing.
+///
+/// The frame is handed back as pixels and uploaded by the caller. Uploading
+/// from the worker was tried for HAP and measured *worse*: `write_texture`
+/// from a second thread contends with the render thread's encoding and keeps
+/// its own staging memory.
+struct DecodeWorker {
+    shared: std::sync::Arc<(std::sync::Mutex<DecodeShared>, std::sync::Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DecodeWorker {
+    fn spawn(path: PathBuf) -> Self {
+        let shared = std::sync::Arc::new((
+            std::sync::Mutex::new(DecodeShared::default()),
+            std::sync::Condvar::new(),
+        ));
+        let worker_shared = shared.clone();
+        let handle = std::thread::Builder::new()
+            .name("ffmpeg-decode".into())
+            .spawn(move || decode_loop(path, worker_shared))
+            .ok();
+        Self { shared, handle }
+    }
+
+    /// Ask for the frame at `position`, replacing any request not yet started.
+    fn request(&self, position: f64, force_seek: bool) {
+        let (lock, cv) = &*self.shared;
+        if let Ok(mut g) = lock.lock() {
+            // A pending force_seek must survive being superseded, or the seek
+            // is silently dropped when two requests land in the same gap.
+            let force_seek = force_seek || g.request.as_ref().is_some_and(|r| r.force_seek);
+            g.request = Some(DecodeRequest {
+                position,
+                force_seek,
+            });
+            cv.notify_one();
+        }
+    }
+
+    /// Collect a decoded frame, or `None` if the worker has not finished one
+    /// since the last call. `None` means "keep showing what you have".
+    fn take_frame(&self) -> Option<VideoFrame> {
+        self.shared.0.lock().ok()?.frame.take()
+    }
+}
+
+impl Drop for DecodeWorker {
     fn drop(&mut self) {
-        // Context drops automatically.
+        {
+            let (lock, cv) = &*self.shared;
+            if let Ok(mut g) = lock.lock() {
+                g.stop = true;
+            }
+            cv.notify_one();
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn decode_loop(
+    path: PathBuf,
+    shared: std::sync::Arc<(std::sync::Mutex<DecodeShared>, std::sync::Condvar)>,
+) {
+    let mut ctx = match open_decode_context(&path) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            log::warn!(
+                "FfmpegDecoder failed to open {}: {}",
+                path.display(),
+                e
+            );
+            return;
+        }
+    };
+    let mut last_pts: i64 = -1;
+    // Reaching EOF while chasing the last frame of a clip is normal — the front
+    // wraps to the in point on the next request — so a single failure is not
+    // worth a line in the log. A run of them means the file really is broken.
+    let mut consecutive_errors = 0u32;
+
+    loop {
+        let request = {
+            let (lock, cv) = &*shared;
+            let Ok(mut g) = lock.lock() else { return };
+            while !g.stop && g.request.is_none() {
+                let Ok(next) = cv.wait(g) else { return };
+                g = next;
+            }
+            if g.stop {
+                return;
+            }
+            g.request.take().expect("woken with a request pending")
+        };
+
+        if request.force_seek {
+            last_pts = -1;
+        }
+        match ctx.decode_at_position(request.position, &mut last_pts) {
+            Ok(frame) => {
+                consecutive_errors = 0;
+                if let Ok(mut g) = shared.0.lock() {
+                    g.frame = Some(frame);
+                }
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors == 10 {
+                    log::warn!("FfmpegDecoder: {} is not decoding: {}", path.display(), e);
+                }
+            }
+        }
     }
 }
 
@@ -688,14 +923,12 @@ impl StreamDecoder {
                         continue;
                     }
                     while ctx.decoder.receive_frame(&mut decoded).is_ok() {
-                        if let Err(e) = ctx.scaler.run(&decoded, &mut rgba_frame) {
-                            log::warn!("StreamDecoder scaler error: {}", e);
-                            continue;
-                        }
-                        let frame = VideoFrame {
-                            width: rgba_frame.width(),
-                            height: rgba_frame.height(),
-                            data: rgba_frame.data(0).to_vec(),
+                        let frame = match ctx.convert_to_rgba(&decoded, &mut rgba_frame) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                log::warn!("StreamDecoder convert error: {}", e);
+                                continue;
+                            }
                         };
                         self.last_frame = Some(frame.clone());
                         return Some(frame);
@@ -704,13 +937,8 @@ impl StreamDecoder {
                 Err(ffmpeg::Error::Eof) => {
                     ctx.decoder.send_eof().ok();
                     if ctx.decoder.receive_frame(&mut decoded).is_ok()
-                        && ctx.scaler.run(&decoded, &mut rgba_frame).is_ok()
+                        && let Ok(frame) = ctx.convert_to_rgba(&decoded, &mut rgba_frame)
                     {
-                        let frame = VideoFrame {
-                            width: rgba_frame.width(),
-                            height: rgba_frame.height(),
-                            data: rgba_frame.data(0).to_vec(),
-                        };
                         self.last_frame = Some(frame.clone());
                         return Some(frame);
                     }
@@ -737,17 +965,7 @@ impl StreamDecoder {
         let time_base = time_base.numerator() as f64 / time_base.denominator().max(1) as f64;
 
         let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
-        let decoder = context.decoder().video()?;
-
-        let scaler = Context::get(
-            decoder.format(),
-            decoder.width(),
-            decoder.height(),
-            Pixel::RGBA,
-            decoder.width(),
-            decoder.height(),
-            Flags::BILINEAR,
-        )?;
+        let decoder = open_video_decoder(context)?;
 
         let identity_gbr = is_identity_gbr(decoder.color_space(), decoder.format());
         if matches!(decoder.color_space(), Space::RGB) && !identity_gbr {
@@ -762,7 +980,7 @@ impl StreamDecoder {
         self.context = Some(DecodeContext {
             input: ictx,
             decoder,
-            scaler,
+            scaler: None,
             stream_index,
             time_base,
             identity_gbr,
