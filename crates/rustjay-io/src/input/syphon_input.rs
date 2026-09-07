@@ -47,7 +47,6 @@ impl SyphonInputReceiver {
 
     /// Connect to a Syphon server by name.
     /// Returns an error if `initialize()` has not been called.
-    #[allow(dead_code)] // part of the Syphon input surface; not wired into the engine yet
     pub fn connect(&mut self, server_name: impl Into<String>) -> anyhow::Result<()> {
         let server_name = server_name.into();
 
@@ -105,14 +104,23 @@ impl SyphonInputReceiver {
                 bundle_id: String::new(),
             };
 
-            inner.connect_by_info(&info).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to connect to '{}' (uuid={}): {:?}",
-                    server_name,
-                    server_uuid,
-                    e
-                )
-            })?;
+            // A Syphon UUID belongs to one *run* of a publisher, so a saved
+            // layer stops matching the moment that app restarts. The name
+            // survives, so fall back to it rather than losing the source.
+            if inner.connect_by_info(&info).is_err() {
+                inner.connect(&server_name).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to connect to '{}' (uuid={}): {:?}",
+                        server_name,
+                        server_uuid,
+                        e
+                    )
+                })?;
+                log::info!(
+                    "[Syphon Input] '{}' has a new UUID since it was saved — matched by name",
+                    server_name
+                );
+            }
         }
 
         self.server_name = Some(server_name);
