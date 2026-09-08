@@ -47,6 +47,12 @@ ffmpeg-next = { version = "9.0", optional = true, default-features = false, feat
 [target.'cfg(target_os = "macos")'.dependencies]
 syphon-core = { workspace = true }
 syphon-wgpu = { workspace = true }
+# Zero-copy VideoToolbox import. Versions must match the ones wgpu-hal builds
+# against or the MTLTexture types are different types and will not unify.
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLTexture", "MTLPixelFormat", "MTLResource"] }
+objc2-io-surface = "0.3"
+wgpu-hal = { version = "30.0", features = ["metal"] }
 cocoa            = "0.26"
 objc             = "0.2"
 core-foundation  = "0.10"

@@ -12,6 +12,10 @@ pub struct BlitPipeline {
     pipeline_opaque: wgpu::RenderPipeline,
     /// Unpacks packed 4:2:2 — see [`BlitPipeline::blit_uyvy`].
     pipeline_uyvy: wgpu::RenderPipeline,
+    /// Combines two NV12 planes — see [`BlitPipeline::blit_nv12`].
+    pipeline_nv12: wgpu::RenderPipeline,
+    /// Two-texture layout for the NV12 pipeline.
+    nv12_layout: wgpu::BindGroupLayout,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 }
@@ -47,6 +51,27 @@ impl BlitPipeline {
                 fn fs_opaque(in: VertexOutput) -> @location(0) vec4<f32> {
                     let c = textureSample(source_tex, source_sampler, in.texcoord);
                     return vec4<f32>(c.rgb, 1.0);
+                }
+
+                @group(0) @binding(2) var chroma_tex: texture_2d<f32>;
+
+                // Biplanar NV12, as VideoToolbox hands it back: a full-size
+                // luma plane and a half-size plane of interleaved Cb/Cr.
+                // Chroma is sampled, not loaded — bilinear across the
+                // half-resolution plane is the interpolation you want.
+                @fragment
+                fn fs_nv12(in: VertexOutput) -> @location(0) vec4<f32> {
+                    let y = textureSample(source_tex, source_sampler, in.texcoord).r;
+                    let cbcr = textureSample(chroma_tex, source_sampler, in.texcoord).rg;
+                    let u = cbcr.r - 0.5;
+                    let v = cbcr.g - 0.5;
+                    let yy = (y - 0.0627451) * 1.164383;
+                    return vec4<f32>(
+                        yy + 1.792741 * v,
+                        yy - 0.213249 * u - 0.532909 * v,
+                        yy + 2.112402 * u,
+                        1.0,
+                    );
                 }
 
                 // Packed 4:2:2. The source texture is half-width RGBA where each
@@ -191,10 +216,67 @@ impl BlitPipeline {
             cache: None,
         });
 
+        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let nv12_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Mixer Blit NV12 BGL"),
+            entries: &[
+                texture_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                texture_entry(2),
+            ],
+        });
+        let nv12_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Mixer Blit NV12 Pipeline Layout"),
+                bind_group_layouts: &[Some(&nv12_layout)],
+                ..Default::default()
+            });
+        let pipeline_nv12 = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Mixer Blit Pipeline (NV12)"),
+            layout: Some(&nv12_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[Some(Vertex::desc())],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_nv12"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
             pipeline_opaque,
             pipeline_uyvy,
+            pipeline_nv12,
+            nv12_layout,
             bind_group_layout,
             sampler,
         }
@@ -258,6 +340,60 @@ impl BlitPipeline {
             vertex_buffer,
             &self.pipeline_uyvy,
         );
+    }
+
+    /// Combine an NV12 luma and chroma plane into `dest`.
+    ///
+    /// The two planes are the surface a hardware decoder wrote into, imported
+    /// rather than copied, so this is where the pixels are read for the first
+    /// time since VideoToolbox produced them.
+    pub fn blit_nv12(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        luma: &wgpu::TextureView,
+        chroma: &wgpu::TextureView,
+        dest: &wgpu::TextureView,
+        vertex_buffer: &wgpu::Buffer,
+    ) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Mixer Blit NV12 Bind Group"),
+            layout: &self.nv12_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(luma),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(chroma),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Mixer Blit NV12 Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: dest,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipeline_nv12);
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..6, 0..1);
     }
 
     fn blit_with(
