@@ -36,15 +36,21 @@ use ffmpeg::software::scaling::{context::Context, flag::Flags};
 use ffmpeg::util::frame::video::Video;
 use ffmpeg_next as ffmpeg;
 
-/// One decoded RGBA frame.
+/// One decoded frame, either as pixels or as a texture the GPU already holds.
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
     /// Frame width in pixels.
     pub width: u32,
     /// Frame height in pixels.
     pub height: u32,
-    /// RGBA pixel data, row-major.
+    /// RGBA pixel data, row-major. **Empty when `hardware` is set** — there are
+    /// no pixels on this side of the bus to give you.
     pub data: Vec<u8>,
+    /// Set when the frame never left the GPU. Import it with
+    /// [`HardwareFrame::import_planes`] and sample NV12 rather than reading
+    /// `data`.
+    #[cfg(target_os = "macos")]
+    pub hardware: Option<super::videotoolbox::HardwareFrame>,
 }
 
 /// How playback behaves when it reaches the out point.
@@ -118,6 +124,9 @@ struct DecodeContext {
     /// Set when the stream declares an identity colourspace, meaning its
     /// "YUV" planes are really GBR and swscale must not touch them.
     identity_gbr: bool,
+    /// Hand hardware frames straight through instead of downloading them.
+    /// Off for live streams, whose consumer still wants pixels.
+    zero_copy: bool,
 }
 
 impl DecodeContext {
@@ -132,6 +141,23 @@ impl DecodeContext {
         if self.identity_gbr {
             return Ok(pack_gbr_planes(decoded));
         }
+
+        // A hardware frame is already in GPU memory. Pass the surface along and
+        // let the render thread wrap it as a texture — downloading it only to
+        // convert it and upload it again is three trips across the bus to end
+        // up where it started.
+        #[cfg(target_os = "macos")]
+        if self.zero_copy
+            && let Some(hardware) = super::videotoolbox::HardwareFrame::from_av_frame(decoded)
+        {
+            return Ok(VideoFrame {
+                width: hardware.width,
+                height: hardware.height,
+                data: Vec::new(),
+                hardware: Some(hardware),
+            });
+        }
+
         let downloaded = download_if_hardware(decoded)?;
         let src = downloaded.as_ref().unwrap_or(decoded);
 
@@ -156,6 +182,8 @@ impl DecodeContext {
             width: scratch.width(),
             height: scratch.height(),
             data: scratch.data(0).to_vec(),
+            #[cfg(target_os = "macos")]
+            hardware: None,
         })
     }
 }
@@ -268,6 +296,8 @@ fn pack_gbr_planes(frame: &Video) -> VideoFrame {
         width: w as u32,
         height: h as u32,
         data: out,
+        #[cfg(target_os = "macos")]
+        hardware: None,
     }
 }
 
@@ -561,7 +591,7 @@ impl FfmpegDecoder {
 
 /// Open `path` and build everything the decode loop needs. Runs on the worker
 /// thread, so a slow file open never stalls a render.
-fn open_decode_context(path: &Path) -> anyhow::Result<DecodeContext> {
+fn open_decode_context(path: &Path, zero_copy: bool) -> anyhow::Result<DecodeContext> {
         let ictx = input(path)?;
         let stream = ictx
             .streams()
@@ -584,6 +614,29 @@ fn open_decode_context(path: &Path) -> anyhow::Result<DecodeContext> {
             );
         }
 
+        // The zero-copy path converts YUV in a shader that knows exactly one
+        // matrix: BT.709, limited range. swscale reads each stream's real
+        // metadata, so anything else keeps going through it — correct colour
+        // beats a saved copy. Unspecified is BT.709 for HD by convention, and
+        // BT.601 below it.
+        let bt709 = match decoder.color_space() {
+            Space::BT709 => true,
+            // Unspecified means BT.709 at HD sizes and BT.601 below, by convention.
+            Space::Unspecified => decoder.height() >= 720,
+            _ => false,
+        };
+        let limited = decoder.color_range() != ffmpeg::color::Range::JPEG;
+        let zero_copy = zero_copy && !identity_gbr && bt709 && limited;
+        if !zero_copy {
+            log::debug!(
+                "FfmpegDecoder: {} is {:?}/{:?}, decoding through swscale rather than the \
+                 BT.709 shader path",
+                path.display(),
+                decoder.color_space(),
+                decoder.color_range()
+            );
+        }
+
         Ok(DecodeContext {
             input: ictx,
             decoder,
@@ -591,6 +644,7 @@ fn open_decode_context(path: &Path) -> anyhow::Result<DecodeContext> {
             stream_index,
             time_base,
             identity_gbr,
+            zero_copy,
         })
     }
 
@@ -771,7 +825,7 @@ fn decode_loop(
     path: PathBuf,
     shared: std::sync::Arc<(std::sync::Mutex<DecodeShared>, std::sync::Condvar)>,
 ) {
-    let mut ctx = match open_decode_context(&path) {
+    let mut ctx = match open_decode_context(&path, true) {
         Ok(ctx) => ctx,
         Err(e) => {
             log::warn!(
@@ -984,6 +1038,8 @@ impl StreamDecoder {
             stream_index,
             time_base,
             identity_gbr,
+            // A live stream's consumer still uploads pixels itself.
+            zero_copy: false,
         });
         Ok(())
     }

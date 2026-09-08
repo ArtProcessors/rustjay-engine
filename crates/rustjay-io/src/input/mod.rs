@@ -37,6 +37,8 @@ pub use webcam::{list_cameras, WebcamCapture, WebcamFrame};
 
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg;
+#[cfg(all(feature = "ffmpeg", target_os = "macos"))]
+pub mod videotoolbox;
 #[cfg(feature = "ffmpeg")]
 #[allow(unused_imports)]
 pub use ffmpeg::{detect_hap_codec, FfmpegDecoder, LoopMode, VideoFrame};

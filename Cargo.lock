@@ -5563,6 +5563,9 @@ dependencies = [
  "log",
  "nokhwa",
  "objc",
+ "objc2 0.6.4",
+ "objc2-io-surface",
+ "objc2-metal 0.3.2",
  "rayon",
  "rustjay-core",
  "rustjay-ledmap",
@@ -5574,6 +5577,7 @@ dependencies = [
  "tokio",
  "v4l",
  "wgpu",
+ "wgpu-hal",
  "windows 0.62.2",
 ]
 

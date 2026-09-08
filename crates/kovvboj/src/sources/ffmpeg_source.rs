@@ -49,6 +49,13 @@ pub struct FfmpegSource {
     last_out_point: f32,
     /// Forces a one-time sync of all playback params on the first prepare().
     needs_sync: bool,
+    /// Luma and chroma views of a hardware frame's surface, when the decoder
+    /// hands one over. Set means this frame is drawn straight from the memory
+    /// VideoToolbox decoded into, never copied.
+    #[cfg(target_os = "macos")]
+    plane_views: Option<(wgpu::TextureView, wgpu::TextureView)>,
+    #[cfg(target_os = "macos")]
+    nv12_blit: rustjay_mixer::BlitPipeline,
 }
 
 impl FfmpegSource {
@@ -176,6 +183,10 @@ impl FfmpegSource {
             last_in_point: 0.0,
             last_out_point: 1.0,
             needs_sync: true,
+            #[cfg(target_os = "macos")]
+            plane_views: None,
+            #[cfg(target_os = "macos")]
+            nv12_blit: rustjay_mixer::BlitPipeline::new(device, rustjay_core::working_format()),
         })
     }
 
@@ -382,6 +393,25 @@ impl EffectInstance for FfmpegSource {
 
         // Decode and upload.
         if let Some(frame) = self.decoder.decode_frame() {
+            #[cfg(target_os = "macos")]
+            if let Some(hardware) = frame.hardware.as_ref() {
+                // Nothing to upload — wrap the decoder's own surface. If the
+                // wrap fails, hold the previous frame rather than uploading
+                // `frame.data`, which is empty for a hardware frame.
+                if let Some((luma, chroma)) = hardware.import_planes(device) {
+                    self.width = frame.width;
+                    self.height = frame.height;
+                    self.plane_views = Some((
+                        luma.create_view(&wgpu::TextureViewDescriptor::default()),
+                        chroma.create_view(&wgpu::TextureViewDescriptor::default()),
+                    ));
+                }
+                return;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                self.plane_views = None;
+            }
             self.ensure_texture(device, frame.width, frame.height);
             if let Some(ref texture) = self.texture {
                 queue.write_texture(
@@ -414,6 +444,21 @@ impl EffectInstance for FfmpegSource {
         target: RenderTarget<'_>,
         _engine: &EngineState,
     ) {
+        #[cfg(target_os = "macos")]
+        if self.visible
+            && let Some((luma, chroma)) = self.plane_views.as_ref()
+        {
+            self.nv12_blit.blit_nv12(
+                ctx.device,
+                ctx.encoder,
+                luma,
+                chroma,
+                target.view,
+                ctx.vertex_buffer,
+            );
+            return;
+        }
+
         if let Some(ref bind_group) = self.bind_group {
             let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("FfmpegSource Pass"),
