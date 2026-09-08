@@ -311,7 +311,7 @@ mod egui_impl {
     /// combo popup redraws every frame it stays open, so an uncached scan would
     /// be hundreds of `open()`s a second. Loopback nodes appear when someone
     /// runs `modprobe`, never mid-frame, so a stale list for a moment is fine.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "projection"))]
     fn v4l2_output_devices() -> Vec<rustjay_io::V4l2DeviceInfo> {
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
@@ -335,7 +335,7 @@ mod egui_impl {
     /// A path already in the config that is no longer present still shows as the
     /// selection, so a set loaded on a machine without that node reads honestly
     /// instead of silently snapping to a device it is not using.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "projection"))]
     fn v4l2_device_picker(
         ui: &mut egui::Ui,
         id_salt: impl std::hash::Hash + std::fmt::Debug,
