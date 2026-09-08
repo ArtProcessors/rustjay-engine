@@ -206,8 +206,15 @@ impl ReadbackPool {
     fn drain(&mut self, device: &wgpu::Device) {
         for slot in &mut self.slots {
             if matches!(slot, SlotState::Pending { .. }) {
-                // Poll once to let the GPU finish, then discard.
-                device.poll(wgpu::PollType::wait_indefinitely()).ok();
+                // Poll once to let the GPU finish, then discard. Bounded: this
+                // runs on shutdown, and an unbounded wait against a wedged GPU
+                // submission path leaves the process unkillable in exit state.
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: Some(std::time::Duration::from_millis(250)),
+                    })
+                    .ok();
                 if let SlotState::Pending { buffer, .. } =
                     std::mem::replace(slot, SlotState::Available { cached: None })
                 {

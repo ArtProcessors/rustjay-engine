@@ -6277,9 +6277,9 @@ dependencies = [
 
 [[package]]
 name = "syphon-wgpu"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1e83c3722c0a933fd00d6951f9b2c39b177da8d13583f7701bf2a9192c3b0e9"
+checksum = "65dac5287492e2ba7fdea29c5a9f122898e97de24bc08f50c1575835b084e712"
 dependencies = [
  "bytemuck",
  "log",

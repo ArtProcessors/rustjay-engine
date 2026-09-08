@@ -66,3 +66,9 @@ tasks/
 # (and so redistributed) just because they were copied in to try out.
 # To bundle one on purpose: git add -f <path>
 crates/kovvboj/shaders/*.fs
+
+# Runtime state the apps write into the repo root on exit. stage.json in
+# particular replays whatever was recording when it was saved.
+/keymap.json
+/scene.json
+/stage.json
