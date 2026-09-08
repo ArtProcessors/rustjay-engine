@@ -34,4 +34,4 @@ pub use input::{SpoutDiscovery, SpoutInputReceiver};
 pub use output::recorder::{list_audio_devices, Recorder, RecorderCodec};
 pub use output::OutputManager;
 #[cfg(target_os = "linux")]
-pub use v4l2_devices::V4l2DeviceInfo;
+pub use v4l2_devices::{V4l2DeviceInfo, list_output_devices};

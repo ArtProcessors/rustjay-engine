@@ -304,6 +304,68 @@ mod egui_impl {
     use rustjay_engine::prelude::*;
     use rustjay_mixer::BlendMode;
 
+    /// The `v4l2loopback` nodes we can write into, rescanned at most every two
+    /// seconds.
+    ///
+    /// Scanning opens every `/dev/video*` node to read its capabilities, and a
+    /// combo popup redraws every frame it stays open, so an uncached scan would
+    /// be hundreds of `open()`s a second. Loopback nodes appear when someone
+    /// runs `modprobe`, never mid-frame, so a stale list for a moment is fine.
+    #[cfg(target_os = "linux")]
+    fn v4l2_output_devices() -> Vec<rustjay_io::V4l2DeviceInfo> {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        static CACHE: Mutex<Option<(Instant, Vec<rustjay_io::V4l2DeviceInfo>)>> = Mutex::new(None);
+
+        let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((scanned_at, devices)) = cache.as_ref()
+            && scanned_at.elapsed() < Duration::from_secs(2)
+        {
+            return devices.clone();
+        }
+        let devices = rustjay_io::list_output_devices();
+        *cache = Some((Instant::now(), devices.clone()));
+        devices
+    }
+
+    /// Pick which `v4l2loopback` node an output writes to. Blank means the
+    /// per-output default built from `default_index`.
+    ///
+    /// A path already in the config that is no longer present still shows as the
+    /// selection, so a set loaded on a machine without that node reads honestly
+    /// instead of silently snapping to a device it is not using.
+    #[cfg(target_os = "linux")]
+    fn v4l2_device_picker(
+        ui: &mut egui::Ui,
+        id_salt: impl std::hash::Hash + std::fmt::Debug,
+        device: &mut String,
+        default_index: usize,
+    ) {
+        let default_path = crate::stage::v4l2_device_path("", default_index);
+        let default_label = format!("{default_path} (default)");
+        let selected = if device.trim().is_empty() {
+            default_label.clone()
+        } else {
+            device.clone()
+        };
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(selected)
+            .width(190.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(device, String::new(), &default_label);
+                for dev in v4l2_output_devices() {
+                    ui.selectable_value(device, dev.path.clone(), dev.display_name());
+                }
+            })
+            .response
+            .on_hover_text(
+                "v4l2loopback node to write to. The list is every /dev/video* node \
+                 reporting VIDEO_OUTPUT — if it is empty, load the module with \
+                 `modprobe v4l2loopback`.",
+            );
+    }
+
     /// Helper: draw a blend-mode combo bound to a canonical engine param key.
     /// Blend picker sized for the deck row.
     ///
@@ -6285,14 +6347,7 @@ mod egui_impl {
                                 });
                             #[cfg(target_os = "linux")]
                             if proj.output_type == crate::stage::OutputType::V4l2 {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut proj.v4l2_device)
-                                        .desired_width(110.0)
-                                        .hint_text(format!("/dev/video{}", 10 + i)),
-                                )
-                                .on_hover_text(
-                                    "v4l2loopback node to write to. Blank uses the default shown.",
-                                );
+                                v4l2_device_picker(ui, ("proj_v4l2", i), &mut proj.v4l2_device, 10 + i);
                             }
                             if proj.output_type == crate::stage::OutputType::Recording {
                                 let label = if proj.recording { "⏹ STOP" } else { "⏺ REC" };
@@ -6524,14 +6579,7 @@ mod egui_impl {
                                 });
                             #[cfg(target_os = "linux")]
                             if hl.output_type == crate::stage::OutputType::V4l2 {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut hl.v4l2_device)
-                                        .desired_width(110.0)
-                                        .hint_text(format!("/dev/video{}", 20 + i)),
-                                )
-                                .on_hover_text(
-                                    "v4l2loopback node to write to. Blank uses the default shown.",
-                                );
+                                v4l2_device_picker(ui, ("hl_v4l2", i), &mut hl.v4l2_device, 20 + i);
                             }
                             // Recording is armed here and nowhere else — a
                             // set that reloads does not start rolling.
