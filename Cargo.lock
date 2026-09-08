@@ -6261,9 +6261,9 @@ dependencies = [
 
 [[package]]
 name = "syphon-metal"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bd6d5a51594957986547f9e03c1f509f7b8725cab34a7451230436e3117ac06"
+checksum = "325e791609c9d77b1976dbbf4971c5e211ef7ba0afaaef10b0247800b43054c3"
 dependencies = [
  "log",
  "objc2 0.6.4",
@@ -6277,9 +6277,9 @@ dependencies = [
 
 [[package]]
 name = "syphon-wgpu"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65dac5287492e2ba7fdea29c5a9f122898e97de24bc08f50c1575835b084e712"
+checksum = "467136212fd9c805c5848e092fff6d0f0d44fa0cd59303d404f05781457f952a"
 dependencies = [
  "bytemuck",
  "log",
