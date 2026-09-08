@@ -676,6 +676,12 @@ pub struct KovvbojProjector {
     /// is free and idempotent; a recording creates a file and fills a disk.
     #[serde(skip)]
     pub recording: bool,
+    /// Which `v4l2loopback` node an `OutputType::V4l2` output writes to.
+    /// Empty = the default in `v4l2_device_path`. Kept on every platform, not
+    /// behind `cfg(linux)`, so a set saved on Linux round-trips through macOS
+    /// and Windows with the path intact.
+    #[serde(default)]
+    pub v4l2_device: String,
     /// Use the global warp/dome/edge-blend syncs, or per-projector overrides.
     pub use_global_warp: bool,
     pub use_global_dome: bool,
@@ -711,6 +717,7 @@ impl Default for KovvbojProjector {
             rotation: OutputRotation::default(),
             output_type: OutputType::Display,
             recording: false,
+            v4l2_device: String::new(),
             use_global_warp: true,
             use_global_dome: true,
             use_global_edge_blend: true,
@@ -814,6 +821,18 @@ impl OutputType {
     }
 }
 
+/// Resolve which `v4l2loopback` node an output writes to.
+///
+/// The devices themselves are created out-of-band (`modprobe v4l2loopback`),
+/// so all this does is honour an explicit path and otherwise hand back a
+/// default that does not collide with the other outputs.
+pub fn v4l2_device_path(configured: &str, default_index: usize) -> String {
+    match configured.trim() {
+        "" => format!("/dev/video{default_index}"),
+        path => path.to_string(),
+    }
+}
+
 /// Configuration for a headless (offscreen) output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KovvbojHeadlessConfig {
@@ -832,6 +851,12 @@ pub struct KovvbojHeadlessConfig {
     /// is free and idempotent; a recording creates a file and fills a disk.
     #[serde(skip)]
     pub recording: bool,
+    /// Which `v4l2loopback` node an `OutputType::V4l2` output writes to.
+    /// Empty = the default in `v4l2_device_path`. Kept on every platform, not
+    /// behind `cfg(linux)`, so a set saved on Linux round-trips through macOS
+    /// and Windows with the path intact.
+    #[serde(default)]
+    pub v4l2_device: String,
     /// Whether this headless output has already been pushed to the
     /// projection subsystem. Not serialized — reset on app restart.
     #[serde(skip)]
@@ -850,6 +875,7 @@ impl Default for KovvbojHeadlessConfig {
             surface_index: None,
             output_type: OutputType::Display,
             recording: false,
+            v4l2_device: String::new(),
             pushed: false,
         }
     }
@@ -1603,5 +1629,13 @@ mod tests {
 
         led.translate(-0.5, 0.0); // already flush at the left
         assert_eq!(led.quad[3], [0.0, 1.0]);
+    }
+
+    #[test]
+    fn v4l2_path_defaults_only_when_blank() {
+        assert_eq!(super::v4l2_device_path("", 10), "/dev/video10");
+        assert_eq!(super::v4l2_device_path("   ", 20), "/dev/video20");
+        assert_eq!(super::v4l2_device_path("/dev/video3", 10), "/dev/video3");
+        assert_eq!(super::v4l2_device_path("  /dev/video3 ", 10), "/dev/video3");
     }
 }
