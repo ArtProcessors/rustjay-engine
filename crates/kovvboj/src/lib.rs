@@ -2944,8 +2944,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                         {
                             let want_v4l2 = matches!(proj.output_type, OutputType::V4l2);
                             // Loopback devices must be pre-created (v4l2loopback);
-                            // default to /dev/video{10+idx} per projector.
-                            let dev = format!("/dev/video{}", 10 + idx);
+                            // a blank field means /dev/video{10+idx} per projector.
+                            let dev =
+                                crate::stage::v4l2_device_path(&proj.v4l2_device, 10 + idx);
                             if want_v4l2 && !sub.is_projector_v4l2(idx) {
                                 match sub.start_projector_v4l2(idx, &dev) {
                                     Ok(_) => engine.notify(
@@ -3068,7 +3069,7 @@ impl EffectPlugin for KovvbojRootPlugin {
                         #[cfg(target_os = "linux")]
                         {
                             let want_v4l2 = matches!(hl.output_type, OutputType::V4l2);
-                            let dev = format!("/dev/video{}", 20 + idx);
+                            let dev = crate::stage::v4l2_device_path(&hl.v4l2_device, 20 + idx);
                             if want_v4l2 && !sub.is_headless_v4l2(idx) {
                                 if let Err(e) = sub.start_headless_v4l2(idx, &dev) {
                                     engine.notify(

@@ -6283,6 +6283,17 @@ mod egui_impl {
                                     #[cfg(target_os = "linux")]
                                     ui.selectable_value(&mut proj.output_type, OutputType::V4l2, "V4L2");
                                 });
+                            #[cfg(target_os = "linux")]
+                            if proj.output_type == crate::stage::OutputType::V4l2 {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut proj.v4l2_device)
+                                        .desired_width(110.0)
+                                        .hint_text(format!("/dev/video{}", 10 + i)),
+                                )
+                                .on_hover_text(
+                                    "v4l2loopback node to write to. Blank uses the default shown.",
+                                );
+                            }
                             if proj.output_type == crate::stage::OutputType::Recording {
                                 let label = if proj.recording { "⏹ STOP" } else { "⏺ REC" };
                                 if ui
@@ -6511,6 +6522,17 @@ mod egui_impl {
                                     #[cfg(target_os = "linux")]
                                     ui.selectable_value(&mut hl.output_type, OutputType::V4l2, "V4L2");
                                 });
+                            #[cfg(target_os = "linux")]
+                            if hl.output_type == crate::stage::OutputType::V4l2 {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut hl.v4l2_device)
+                                        .desired_width(110.0)
+                                        .hint_text(format!("/dev/video{}", 20 + i)),
+                                )
+                                .on_hover_text(
+                                    "v4l2loopback node to write to. Blank uses the default shown.",
+                                );
+                            }
                             // Recording is armed here and nowhere else — a
                             // set that reloads does not start rolling.
                             if hl.output_type == crate::stage::OutputType::Recording {
