@@ -108,8 +108,8 @@ rustjay-projection = { path = "crates/rustjay-projection", version = "0.1.0" }
 rustjay-lighting   = { path = "crates/rustjay-lighting",   version = "0.1.0" }
 rustjay-ledmap     = { path = "crates/rustjay-ledmap",     version = "0.1.0" }
 syphon-core     = "0.4.0"
-syphon-metal    = "0.4.1"
-syphon-wgpu     = "0.4.2"
+syphon-metal    = "0.4.2"
+syphon-wgpu     = "0.4.3"
 
 [patch.crates-io]
 wgpu-hal = { path = "vendor/wgpu-hal" }
