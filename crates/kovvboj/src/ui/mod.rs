@@ -88,7 +88,11 @@ pub struct EffectsTab {
     /// Lazily parsed once per file; the shader watcher re-scans on change.
     isf_filters: std::collections::HashMap<std::path::PathBuf, bool>,
     /// Async result from the native folder picker (library folders).
-    pending_folder: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    /// Path to content-hash memo, so a library row does not re-read and
+    /// re-hash its shader every frame. Same lifetime as `isf_filters`.
+    previs_keys: std::collections::HashMap<std::path::PathBuf, String>,
+    /// `library_generation` the memo above was built against.
+    previs_keys_generation: u64,
     /// Library filter box. Matches entry names, case-insensitively.
     search: String,
 }
@@ -101,7 +105,8 @@ impl Default for EffectsTab {
             stream_name: String::new(),
             pending_effect: std::sync::Arc::new(std::sync::Mutex::new(None)),
             isf_filters: std::collections::HashMap::new(),
-            pending_folder: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            previs_keys: std::collections::HashMap::new(),
+            previs_keys_generation: 0,
             search: String::new(),
         }
     }
@@ -318,7 +323,9 @@ mod egui_impl {
 
         static CACHE: Mutex<Option<(Instant, Vec<rustjay_io::V4l2DeviceInfo>)>> = Mutex::new(None);
 
-        let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some((scanned_at, devices)) = cache.as_ref()
             && scanned_at.elapsed() < Duration::from_secs(2)
         {
@@ -448,10 +455,7 @@ mod egui_impl {
         layer: &str,
         full: &str,
     ) {
-        let current = state
-            .layer_sources
-            .get(layer)
-            .and_then(|e| e.path.clone());
+        let current = state.layer_sources.get(layer).and_then(|e| e.path.clone());
         ui.horizontal(|ui| {
             if ui
                 .button("File…")
@@ -518,7 +522,13 @@ mod egui_impl {
         play_button(ui, engine, &format!("{full}playing"), mode);
         trigger_combo(ui, engine, &format!("{full}mode"));
         param_slider(ui, engine, &format!("{full}speed"), "Speed", -5.0, 5.0);
-        tempo_row(ui, engine, &format!("{full}sync"), &format!("{full}div"), None);
+        tempo_row(
+            ui,
+            engine,
+            &format!("{full}sync"),
+            &format!("{full}div"),
+            None,
+        );
         loop_combo(ui, engine, &format!("{full}loop"), "Loop");
         param_slider(ui, engine, &format!("{full}position"), "Position", 0.0, 1.0);
         if engine.param_index(&format!("{full}in_point")).is_some() {
@@ -672,7 +682,9 @@ mod egui_impl {
         // once `prepare` has run, and reading it back every frame would fight the
         // cursor. Same shape as the layer rename field above.
         let id = ui.make_persistent_id(("text_body", layer));
-        let mut draft: String = ui.data(|d| d.get_temp(id)).unwrap_or_else(|| applied.clone());
+        let mut draft: String = ui
+            .data(|d| d.get_temp(id))
+            .unwrap_or_else(|| applied.clone());
         if !ui.memory(|m| m.has_focus(id)) && draft != applied {
             draft = applied.clone();
         }
@@ -775,7 +787,13 @@ mod egui_impl {
         }
         // The animation clock, the same shape as a clip's or a shader's.
         param_slider(ui, engine, &format!("{full}speed"), "Speed", 0.0, 4.0);
-        tempo_row(ui, engine, &format!("{full}sync"), &format!("{full}div"), None);
+        tempo_row(
+            ui,
+            engine,
+            &format!("{full}sync"),
+            &format!("{full}div"),
+            None,
+        );
     }
 
     /// Parameters the pacing block owns, drawn there rather than in the
@@ -889,8 +907,17 @@ mod egui_impl {
     /// Deck control params already shown by dedicated widgets — excluded from the
     /// generic source-parameter list so they aren't drawn twice.
     const DECK_CONTROL_KEYS: &[&str] = &[
-        "opacity", "blend", "playing", "speed", "loop", "position", "mode", "sync", "div",
-        "in_point", "out_point",
+        "opacity",
+        "blend",
+        "playing",
+        "speed",
+        "loop",
+        "position",
+        "mode",
+        "sync",
+        "div",
+        "in_point",
+        "out_point",
     ];
 
     /// One parameter control. Reads/writes the **base** value (not base+mod) so
@@ -973,7 +1000,11 @@ mod egui_impl {
         let galley = ui.painter().layout_no_wrap(
             label.to_string(),
             font.clone(),
-            if enabled == Some(false) { ink_4() } else { ink() },
+            if enabled == Some(false) {
+                ink_4()
+            } else {
+                ink()
+            },
         );
         // Room for the enable dot when the node can be bypassed.
         let dot_w = if enabled.is_some() { 12.0 } else { 0.0 };
@@ -1028,10 +1059,7 @@ mod egui_impl {
         if enabled == Some(false) {
             let y = rect.center().y;
             p.line_segment(
-                [
-                    egui::pos2(text_x, y),
-                    egui::pos2(rect.right() - pad.x, y),
-                ],
+                [egui::pos2(text_x, y), egui::pos2(rect.right() - pad.x, y)],
                 egui::Stroke::new(1.0, ink_4()),
             );
         }
@@ -1058,7 +1086,10 @@ mod egui_impl {
     #[derive(Clone)]
     enum ChainDrag {
         /// An FX slot already in a chain — reorder or cross-chain move.
-        Fx { chain: crate::ChainRef, slot: String },
+        Fx {
+            chain: crate::ChainRef,
+            slot: String,
+        },
         /// A library ISF filter, inserted at the drop gap.
         LibraryIsf { path: std::path::PathBuf },
     }
@@ -1257,8 +1288,7 @@ mod egui_impl {
                     // need one here — they go through `pending_effects`, which
                     // `prepare()` already snapshots before draining.
                     let before = crate::scene::Topology::from_mixer(mixer, layer_sources);
-                    if !crate::move_effect(mixer, engine, &chain, &slot, &drop.target, drop.index)
-                    {
+                    if !crate::move_effect(mixer, engine, &chain, &slot, &drop.target, drop.index) {
                         continue;
                     }
                     undo.get_or_insert(before);
@@ -1273,8 +1303,7 @@ mod egui_impl {
                         crate::Selection::MasterFx { fx }
                             if chain == crate::ChainRef::Master && *fx == slot
                     );
-                    if moved_selection
-                    {
+                    if moved_selection {
                         *selection = drop.target.selection_for(&slot);
                     }
                 }
@@ -1321,10 +1350,12 @@ mod egui_impl {
                 if map_mode {
                     let scope = ui.scope(|ui| {
                         ui.disable();
-                        ui.add(egui::Slider::new(&mut v, desc.min..=desc.max).text(short_param_name(desc, owner)));
+                        ui.add(
+                            egui::Slider::new(&mut v, desc.min..=desc.max)
+                                .text(short_param_name(desc, owner)),
+                        );
                     });
-                    let midi_path =
-                        format!("{}/{}", desc.category.name().to_lowercase(), desc.id);
+                    let midi_path = format!("{}/{}", desc.category.name().to_lowercase(), desc.id);
                     apply_param_map_overlay(
                         ui,
                         engine,
@@ -1361,8 +1392,7 @@ mod egui_impl {
                                 .text(short_param_name(desc, owner)),
                         );
                     });
-                    let midi_path =
-                        format!("{}/{}", desc.category.name().to_lowercase(), desc.id);
+                    let midi_path = format!("{}/{}", desc.category.name().to_lowercase(), desc.id);
                     apply_param_map_overlay(
                         ui,
                         engine,
@@ -1385,7 +1415,10 @@ mod egui_impl {
             }
             ParamType::Bool => {
                 let mut on = current >= 0.5;
-                if ui.checkbox(&mut on, short_param_name(desc, owner)).changed() {
+                if ui
+                    .checkbox(&mut on, short_param_name(desc, owner))
+                    .changed()
+                {
                     engine.set_param_base(&desc.id, if on { 1.0 } else { 0.0 });
                 }
             }
@@ -1517,9 +1550,8 @@ mod egui_impl {
                 let name = self.chain_name.trim().to_string();
                 let named = !name.is_empty();
                 // Enter saves, so naming and saving is one gesture.
-                let entered = entry.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    && named;
+                let entered =
+                    entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && named;
                 let clicked = ui
                     .add_enabled(named, egui::Button::new("💾 Save chain").small())
                     .on_hover_text("Keep this master chain, with its settings, to reuse later")
@@ -1744,8 +1776,7 @@ mod egui_impl {
                             .font(egui::TextStyle::Monospace),
                     );
                     ui.data_mut(|d| d.insert_temp(id, draft.clone()));
-                    let done = resp.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let done = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let trimmed = draft.trim().to_string();
                     (done && !trimmed.is_empty() && trimmed != name)
                         .then_some((selection.clone(), trimmed))
@@ -1851,7 +1882,10 @@ mod egui_impl {
                     .selected_text(if current.is_empty() { "--" } else { &current })
                     .show_ui(ui, |ui| {
                         for entry in &options {
-                            if ui.selectable_label(entry.name == current, &entry.name).clicked() {
+                            if ui
+                                .selectable_label(entry.name == current, &entry.name)
+                                .clicked()
+                            {
                                 state.pending_source_swaps.push(crate::PendingSourceSwap {
                                     layer_uuid: layer.clone(),
                                     source: entry.clone(),
@@ -1939,7 +1973,11 @@ mod egui_impl {
             let mut any = pacing_block(ui, engine, &prefix, &heading);
             let descriptors = engine.param_descriptors.clone();
             for desc in descriptors.iter().filter(|d| d.id.starts_with(&prefix)) {
-                if desc.id.strip_prefix(prefix.as_str()).is_some_and(is_pacing_param) {
+                if desc
+                    .id
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(is_pacing_param)
+                {
                     continue; // drawn by the pacing block above
                 }
                 draw_param(ui, engine, desc, &heading);
@@ -2073,32 +2111,33 @@ mod egui_impl {
         });
 
         // The group's own chain: what every member passes through together.
-        strip_scroll(ui, ("groupstrip", &uuid))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let out = fx_strip(
-                        ui,
-                        &mixer.groups[gi].chain,
-                        &crate::ChainRef::Group { group: uuid.clone() },
-                        None,
-                        &std::sync::Arc::new(std::sync::Mutex::new(None)),
-                    );
-                    if let Some(i) = out.toggle {
-                        let on = mixer.groups[gi].chain[i].enabled;
-                        mixer.groups[gi].chain[i].enabled = !on;
-                    }
-                    if let Some(i) = out.remove {
-                        let slot = mixer.groups[gi].chain[i].uuid.clone();
-                        acts.remove_fx = Some((uuid.clone(), slot));
-                    }
-                    if let Some(fx) = out.select {
-                        acts.select_fx = Some(fx);
-                    }
-                    for (index, payload) in out.drops {
-                        acts.drops.push((uuid.clone(), index, payload));
-                    }
-                });
+        strip_scroll(ui, ("groupstrip", &uuid)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let out = fx_strip(
+                    ui,
+                    &mixer.groups[gi].chain,
+                    &crate::ChainRef::Group {
+                        group: uuid.clone(),
+                    },
+                    None,
+                    &std::sync::Arc::new(std::sync::Mutex::new(None)),
+                );
+                if let Some(i) = out.toggle {
+                    let on = mixer.groups[gi].chain[i].enabled;
+                    mixer.groups[gi].chain[i].enabled = !on;
+                }
+                if let Some(i) = out.remove {
+                    let slot = mixer.groups[gi].chain[i].uuid.clone();
+                    acts.remove_fx = Some((uuid.clone(), slot));
+                }
+                if let Some(fx) = out.select {
+                    acts.select_fx = Some(fx);
+                }
+                for (index, payload) in out.drops {
+                    acts.drops.push((uuid.clone(), index, payload));
+                }
             });
+        });
     }
 
     /// The layer stack: top of the list composites over the bottom.
@@ -2144,8 +2183,12 @@ mod egui_impl {
                 let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
 
                 // Drawn top-first so the list reads the way it composites.
-                let order: Vec<String> =
-                    mixer.channels.iter().rev().map(|c| c.uuid.clone()).collect();
+                let order: Vec<String> = mixer
+                    .channels
+                    .iter()
+                    .rev()
+                    .map(|c| c.uuid.clone())
+                    .collect();
 
                 for uuid in order.iter() {
                     let Some(idx) = mixer.channels.iter().position(|c| c.uuid == *uuid) else {
@@ -2175,10 +2218,7 @@ mod egui_impl {
                     // Members sit inside a rail drawn down the left, so a group
                     // reads as one block rather than rows that happen to be
                     // adjacent.
-                    let in_group_uuid = mixer
-                        .channels
-                        .get(idx)
-                        .and_then(|c| c.group.clone());
+                    let in_group_uuid = mixer.channels.get(idx).and_then(|c| c.group.clone());
                     let _ = idx;
                     let Some(idx) = mixer.channels.iter().position(|c| c.uuid == *uuid) else {
                         continue;
@@ -2207,110 +2247,119 @@ mod egui_impl {
                         let (_, dropped) =
                             ui.dnd_drop_zone::<LayerDrag, _>(egui::Frame::NONE, |ui| {
                                 ui.add_space(indent);
-                        ui.group(|ui| {
-                            // ── Row 1: restack, identity, mix ────────────────
-                            ui.horizontal(|ui| {
-                                // Dragging the handle carries the layer's uuid;
-                                // the drop lands on whichever row it is released
-                                // over. Reading `dragged()` directly would fire
-                                // every frame of the hold and walk the layer down
-                                // the stack.
-                                ui.dnd_drag_source(
-                                    ui.id().with(("layerdrag", uuid)),
-                                    LayerDrag(uuid.clone()),
-                                    |ui| {
-                                        ui.label("≡");
-                                    },
-                                )
-                                .response
-                                .on_hover_text("Drag to restack");
+                                ui.group(|ui| {
+                                    // ── Row 1: restack, identity, mix ────────────────
+                                    ui.horizontal(|ui| {
+                                        // Dragging the handle carries the layer's uuid;
+                                        // the drop lands on whichever row it is released
+                                        // over. Reading `dragged()` directly would fire
+                                        // every frame of the hold and walk the layer down
+                                        // the stack.
+                                        ui.dnd_drag_source(
+                                            ui.id().with(("layerdrag", uuid)),
+                                            LayerDrag(uuid.clone()),
+                                            |ui| {
+                                                ui.label("≡");
+                                            },
+                                        )
+                                        .response
+                                        .on_hover_text("Drag to restack");
 
-                                // What the layer is actually putting out. Absent
-                                // for the first frame of a new layer, and while a
-                                // layer has no source at all.
-                                let thumb_h = 22.0;
-                                let thumb_size =
-                                    egui::vec2(thumb_h * crate::thumbs::ASPECT, thumb_h);
-                                match thumb_ids.get(uuid) {
-                                    Some(id) => {
-                                        if ui
-                                            .add(
-                                                egui::Image::new((*id, thumb_size))
-                                                    .fit_to_exact_size(thumb_size)
-                                                    .corner_radius(2.0)
-                                                    .sense(egui::Sense::click()),
-                                            )
-                                            .on_hover_text("Layer output")
-                                            .clicked()
-                                        {
-                                            new_selection = Some(crate::Selection::Layer {
-                                                layer: uuid.clone(),
-                                            });
+                                        // What the layer is actually putting out. Absent
+                                        // for the first frame of a new layer, and while a
+                                        // layer has no source at all.
+                                        let thumb_h = 22.0;
+                                        let thumb_size =
+                                            egui::vec2(thumb_h * crate::thumbs::ASPECT, thumb_h);
+                                        match thumb_ids.get(uuid) {
+                                            Some(id) => {
+                                                if ui
+                                                    .add(
+                                                        egui::Image::new((*id, thumb_size))
+                                                            .fit_to_exact_size(thumb_size)
+                                                            .corner_radius(2.0)
+                                                            .sense(egui::Sense::click()),
+                                                    )
+                                                    .on_hover_text("Layer output")
+                                                    .clicked()
+                                                {
+                                                    new_selection = Some(crate::Selection::Layer {
+                                                        layer: uuid.clone(),
+                                                    });
+                                                }
+                                            }
+                                            None => {
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    thumb_size,
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(
+                                                    rect,
+                                                    2.0,
+                                                    rustjay_gui::egui_theme::colors::bg_widget(),
+                                                );
+                                            }
                                         }
-                                    }
-                                    None => {
-                                        let (rect, _) =
-                                            ui.allocate_exact_size(thumb_size, egui::Sense::hover());
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            2.0,
-                                            rustjay_gui::egui_theme::colors::bg_widget(),
-                                        );
-                                    }
-                                }
 
-                                let name = mixer.channels[idx].name.clone();
-                                // The control group on the right (✖, blend,
-                                // slider at minimum, M, S + gaps) needs about
-                                // this much room; the name gets what's left and
-                                // ellipsizes rather than shoving the controls
-                                // off the panel on narrow widths.
-                                let controls_w =
-                                    14.0 + 84.0 + 24.0 + 40.0 + 5.0 * ui.spacing().item_spacing.x;
-                                let name_w = (ui.available_width() - controls_w).max(20.0);
-                                let name_rect = egui::Rect::from_min_size(
-                                    ui.cursor().min,
-                                    egui::vec2(name_w, ui.available_height()),
-                                );
-                                let multi = picked.contains(uuid);
-                                let resp = ui
-                                    .scope_builder(
-                                        egui::UiBuilder::new().max_rect(name_rect).layout(
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                        ),
-                                        |ui| {
-                                            ui.add(
-                                                egui::Button::selectable(
-                                                    layer_selected || multi,
-                                                    &name,
-                                                )
-                                                .truncate(),
+                                        let name = mixer.channels[idx].name.clone();
+                                        // The control group on the right (✖, blend,
+                                        // slider at minimum, M, S + gaps) needs about
+                                        // this much room; the name gets what's left and
+                                        // ellipsizes rather than shoving the controls
+                                        // off the panel on narrow widths.
+                                        let controls_w = 14.0
+                                            + 84.0
+                                            + 24.0
+                                            + 40.0
+                                            + 5.0 * ui.spacing().item_spacing.x;
+                                        let name_w = (ui.available_width() - controls_w).max(20.0);
+                                        let name_rect = egui::Rect::from_min_size(
+                                            ui.cursor().min,
+                                            egui::vec2(name_w, ui.available_height()),
+                                        );
+                                        let multi = picked.contains(uuid);
+                                        let resp = ui
+                                            .scope_builder(
+                                                egui::UiBuilder::new().max_rect(name_rect).layout(
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
+                                                    ),
+                                                ),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Button::selectable(
+                                                            layer_selected || multi,
+                                                            &name,
+                                                        )
+                                                        .truncate(),
+                                                    )
+                                                },
                                             )
-                                        },
-                                    )
-                                    .inner;
-                                if resp.clicked() {
-                                    // Cmd/ctrl or shift extends the pick; a plain
-                                    // click starts a new one.
-                                    if ui.input(|i| i.modifiers.command || i.modifiers.shift) {
-                                        toggle_pick = Some(uuid.clone());
-                                    } else {
-                                        // Clearing and *then* picking this one:
-                                        // a plain click starts a pick of one,
-                                        // it does not leave the pick empty. The
-                                        // layer you start from belongs in the
-                                        // group you are about to make.
-                                        clear_picks = true;
-                                        toggle_pick = Some(uuid.clone());
-                                        new_selection = Some(crate::Selection::Layer {
-                                            layer: uuid.clone(),
-                                        });
-                                    }
-                                }
-                                let in_group = mixer.group_of(idx).is_some();
-                                resp.context_menu(|ui| {
-                                    let n = picked.len();
-                                    if ui
+                                            .inner;
+                                        if resp.clicked() {
+                                            // Cmd/ctrl or shift extends the pick; a plain
+                                            // click starts a new one.
+                                            if ui
+                                                .input(|i| i.modifiers.command || i.modifiers.shift)
+                                            {
+                                                toggle_pick = Some(uuid.clone());
+                                            } else {
+                                                // Clearing and *then* picking this one:
+                                                // a plain click starts a pick of one,
+                                                // it does not leave the pick empty. The
+                                                // layer you start from belongs in the
+                                                // group you are about to make.
+                                                clear_picks = true;
+                                                toggle_pick = Some(uuid.clone());
+                                                new_selection = Some(crate::Selection::Layer {
+                                                    layer: uuid.clone(),
+                                                });
+                                            }
+                                        }
+                                        let in_group = mixer.group_of(idx).is_some();
+                                        resp.context_menu(|ui| {
+                                            let n = picked.len();
+                                            if ui
                                         .add_enabled(
                                             n > 1,
                                             egui::Button::new(format!("Group {n} layers")),
@@ -2323,178 +2372,185 @@ mod egui_impl {
                                         want_group = true;
                                         ui.close();
                                     }
-                                    if in_group {
-                                        if ui
-                                            .button("Remove from group")
-                                            .on_hover_text("Take just this layer out")
-                                            .clicked()
-                                        {
-                                            leave_group = Some(uuid.clone());
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .button("Ungroup")
-                                            .on_hover_text("Dissolve the group; every layer stays")
-                                            .clicked()
-                                        {
-                                            ungroup_at = Some(uuid.clone());
-                                            ui.close();
-                                        }
-                                    }
-                                });
+                                            if in_group {
+                                                if ui
+                                                    .button("Remove from group")
+                                                    .on_hover_text("Take just this layer out")
+                                                    .clicked()
+                                                {
+                                                    leave_group = Some(uuid.clone());
+                                                    ui.close();
+                                                }
+                                                if ui
+                                                    .button("Ungroup")
+                                                    .on_hover_text(
+                                                        "Dissolve the group; every layer stays",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    ungroup_at = Some(uuid.clone());
+                                                    ui.close();
+                                                }
+                                            }
+                                        });
 
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    egui::RichText::new("✖").size(9.0),
-                                                )
-                                                .min_size(egui::vec2(14.0, 14.0)),
-                                            )
-                                            .on_hover_text("Remove layer")
-                                            .clicked()
-                                        {
-                                            removals.push(crate::PendingRemoval {
-                                                layer_uuid: uuid.clone(),
-                                            });
-                                        }
-                                        blend_combo_compact(
-                                            ui,
-                                            engine,
-                                            &format!("ch_{uuid}_blend"),
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new("✖").size(9.0),
+                                                        )
+                                                        .min_size(egui::vec2(14.0, 14.0)),
+                                                    )
+                                                    .on_hover_text("Remove layer")
+                                                    .clicked()
+                                                {
+                                                    removals.push(crate::PendingRemoval {
+                                                        layer_uuid: uuid.clone(),
+                                                    });
+                                                }
+                                                blend_combo_compact(
+                                                    ui,
+                                                    engine,
+                                                    &format!("ch_{uuid}_blend"),
+                                                );
+                                                let opacity_key = format!("ch_{uuid}_opacity");
+                                                let mut op = engine
+                                                    .get_param_base(&opacity_key)
+                                                    .unwrap_or(1.0);
+                                                // M and S are placed after the slider (to
+                                                // its left in this right-to-left row), so
+                                                // reserve their width and let the slider
+                                                // take the rest: on a narrow panel the
+                                                // slider squashes before the buttons creep
+                                                // over the layer name. This has to go
+                                                // through `spacing.slider_width` — a
+                                                // `Slider` always allocates that width
+                                                // and ignores `add_sized`.
+                                                let slider_w = (ui.available_width()
+                                                    - 2.0 * (20.0 + ui.spacing().item_spacing.x))
+                                                    .clamp(24.0, 96.0);
+                                                ui.spacing_mut().slider_width = slider_w;
+                                                if ui
+                                                    .add(
+                                                        egui::Slider::new(&mut op, 0.0..=1.0)
+                                                            .show_value(false),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    engine.set_param_base(&opacity_key, op);
+                                                }
+                                                let mut mute = mixer.channels[idx].mute;
+                                                if ui
+                                                    .selectable_label(mute, "M")
+                                                    .on_hover_text("Mute")
+                                                    .clicked()
+                                                {
+                                                    mute = !mute;
+                                                    mixer.channels[idx].mute = mute;
+                                                }
+                                                let mut solo = mixer.channels[idx].solo;
+                                                if ui
+                                                    .selectable_label(solo, "S")
+                                                    .on_hover_text("Solo")
+                                                    .clicked()
+                                                {
+                                                    solo = !solo;
+                                                    mixer.channels[idx].solo = solo;
+                                                }
+                                            },
                                         );
-                                        let opacity_key = format!("ch_{uuid}_opacity");
-                                        let mut op =
-                                            engine.get_param_base(&opacity_key).unwrap_or(1.0);
-                                        // M and S are placed after the slider (to
-                                        // its left in this right-to-left row), so
-                                        // reserve their width and let the slider
-                                        // take the rest: on a narrow panel the
-                                        // slider squashes before the buttons creep
-                                        // over the layer name. This has to go
-                                        // through `spacing.slider_width` — a
-                                        // `Slider` always allocates that width
-                                        // and ignores `add_sized`.
-                                        let slider_w = (ui.available_width()
-                                            - 2.0 * (20.0 + ui.spacing().item_spacing.x))
-                                            .clamp(24.0, 96.0);
-                                        ui.spacing_mut().slider_width = slider_w;
-                                        if ui
-                                            .add(
-                                                egui::Slider::new(&mut op, 0.0..=1.0)
-                                                    .show_value(false),
-                                            )
-                                            .changed()
-                                        {
-                                            engine.set_param_base(&opacity_key, op);
-                                        }
-                                        let mut mute = mixer.channels[idx].mute;
-                                        if ui.selectable_label(mute, "M").on_hover_text("Mute").clicked() {
-                                            mute = !mute;
-                                            mixer.channels[idx].mute = mute;
-                                        }
-                                        let mut solo = mixer.channels[idx].solo;
-                                        if ui.selectable_label(solo, "S").on_hover_text("Solo").clicked() {
-                                            solo = !solo;
-                                            mixer.channels[idx].solo = solo;
-                                        }
-                                    },
-                                );
-                            });
+                                    });
 
-                            // ── Row 2: the signal strip ──────────────────────
-                            let mut strip = strip_scroll(ui, "strip").show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    let kind = state
-                                        .layer_sources
-                                        .get(uuid)
-                                        .map(|e| e.kind)
-                                        .unwrap_or(crate::sources::SourceKind::SolidColor);
-                                    let label = format!(
-                                        "{} {}",
-                                        source_icon(kind),
-                                        mixer.channels[idx].name
-                                    );
-                                    let (resp, _) = chip(
-                                        ui,
-                                        ui.id().with(("srcchip", uuid)),
-                                        &label,
-                                        source_selected,
-                                        None,
-                                    );
-                                    if resp.clicked() {
-                                        new_selection = Some(crate::Selection::Source {
-                                            layer: uuid.clone(),
-                                        });
-                                    }
+                                    // ── Row 2: the signal strip ──────────────────────
+                                    let mut strip = strip_scroll(ui, "strip").show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let kind = state
+                                                .layer_sources
+                                                .get(uuid)
+                                                .map(|e| e.kind)
+                                                .unwrap_or(crate::sources::SourceKind::SolidColor);
+                                            let label = format!(
+                                                "{} {}",
+                                                source_icon(kind),
+                                                mixer.channels[idx].name
+                                            );
+                                            let (resp, _) = chip(
+                                                ui,
+                                                ui.id().with(("srcchip", uuid)),
+                                                &label,
+                                                source_selected,
+                                                None,
+                                            );
+                                            if resp.clicked() {
+                                                new_selection = Some(crate::Selection::Source {
+                                                    layer: uuid.clone(),
+                                                });
+                                            }
 
-                                    let out = fx_strip(
-                                        ui,
-                                        &mixer.channels[idx].chain,
-                                        &chain_ref,
-                                        selected_fx,
-                                        &self.pending_effect,
-                                    );
-                                    if let Some(i) = out.toggle {
-                                        let on = mixer.channels[idx].chain[i].enabled;
-                                        mixer.channels[idx].chain[i].enabled = !on;
-                                    }
-                                    if let Some(i) = out.remove {
-                                        fx_removals.push(crate::PendingFxRemoval {
-                                            chain: chain_ref.clone(),
-                                            slot: mixer.channels[idx].chain[i].uuid.clone(),
+                                            let out = fx_strip(
+                                                ui,
+                                                &mixer.channels[idx].chain,
+                                                &chain_ref,
+                                                selected_fx,
+                                                &self.pending_effect,
+                                            );
+                                            if let Some(i) = out.toggle {
+                                                let on = mixer.channels[idx].chain[i].enabled;
+                                                mixer.channels[idx].chain[i].enabled = !on;
+                                            }
+                                            if let Some(i) = out.remove {
+                                                fx_removals.push(crate::PendingFxRemoval {
+                                                    chain: chain_ref.clone(),
+                                                    slot: mixer.channels[idx].chain[i].uuid.clone(),
+                                                });
+                                            }
+                                            if let Some(fx) = out.select {
+                                                new_selection = Some(crate::Selection::LayerFx {
+                                                    layer: uuid.clone(),
+                                                    fx,
+                                                });
+                                            }
+                                            for (index, payload) in out.drops {
+                                                drops.push(ChainDrop {
+                                                    target: chain_ref.clone(),
+                                                    index,
+                                                    payload,
+                                                });
+                                            }
                                         });
-                                    }
-                                    if let Some(fx) = out.select {
-                                        new_selection = Some(crate::Selection::LayerFx {
-                                            layer: uuid.clone(),
-                                            fx,
-                                        });
-                                    }
-                                    for (index, payload) in out.drops {
-                                        drops.push(ChainDrop {
-                                            target: chain_ref.clone(),
-                                            index,
-                                            payload,
-                                        });
+                                    });
+                                    // While a chip/library drag is in flight, hovering
+                                    // the left/right edge scrolls the strip, so
+                                    // off-screen gaps stay reachable as drop targets.
+                                    if egui::DragAndDrop::has_payload_of_type::<ChainDrag>(ui.ctx())
+                                        && let Some(pos) = ui.ctx().pointer_interact_pos()
+                                        && strip.inner_rect.contains(pos)
+                                    {
+                                        let delta = crate::ui::drag_edge_scroll_delta(
+                                            pos.x,
+                                            strip.inner_rect.left(),
+                                            strip.inner_rect.right(),
+                                        );
+                                        if delta != 0.0 {
+                                            strip.state.offset.x += delta;
+                                            strip.state.store(ui.ctx(), strip.id);
+                                            ui.ctx().request_repaint();
+                                        }
                                     }
                                 });
-                            });
-                            // While a chip/library drag is in flight, hovering
-                            // the left/right edge scrolls the strip, so
-                            // off-screen gaps stay reachable as drop targets.
-                            if egui::DragAndDrop::has_payload_of_type::<ChainDrag>(ui.ctx())
-                                && let Some(pos) = ui.ctx().pointer_interact_pos()
-                                && strip.inner_rect.contains(pos)
-                            {
-                                let delta = crate::ui::drag_edge_scroll_delta(
-                                    pos.x,
-                                    strip.inner_rect.left(),
-                                    strip.inner_rect.right(),
-                                );
-                                if delta != 0.0 {
-                                    strip.state.offset.x += delta;
-                                    strip.state.store(ui.ctx(), strip.id);
-                                    ui.ctx().request_repaint();
-                                }
-                            }
-                        });
                             });
                         if let Some(gid) = &in_group_uuid {
                             let _ = gid;
                             let rect = ui.min_rect();
                             let x = rect.left() + 8.0;
                             ui.painter().line_segment(
-                                [
-                                    egui::pos2(x, row_top),
-                                    egui::pos2(x, rect.bottom()),
-                                ],
+                                [egui::pos2(x, row_top), egui::pos2(x, rect.bottom())],
                                 egui::Stroke::new(
                                     3.0,
-                                    rustjay_gui::egui_theme::colors::amber()
-                                        .gamma_multiply(0.7),
+                                    rustjay_gui::egui_theme::colors::amber().gamma_multiply(0.7),
                                 ),
                             );
                         }
@@ -2556,7 +2612,10 @@ mod egui_impl {
                     state.params_dirty_request = true;
                 }
                 if let Some(fx) = group_acts.select_fx.take()
-                    && let Some(g) = mixer.groups.iter().find(|g| g.chain.iter().any(|s| s.uuid == fx))
+                    && let Some(g) = mixer
+                        .groups
+                        .iter()
+                        .find(|g| g.chain.iter().any(|s| s.uuid == fx))
                 {
                     new_selection = Some(crate::Selection::GroupFx {
                         group: g.uuid.clone(),
@@ -2666,7 +2725,6 @@ mod egui_impl {
         }
     }
 
-
     // ─────────────────────────────────────────────────────────────────────────
     // EffectsTab
     // ─────────────────────────────────────────────────────────────────────────
@@ -2691,7 +2749,6 @@ mod egui_impl {
             {
                 state.pending_effects.push(req);
             }
-
 
             // No target selector: a source's ➕ makes a new layer, and an
             // effect's ➕ goes to the selected one.
@@ -2768,10 +2825,14 @@ mod egui_impl {
                     let mut queue_saved: Option<crate::PendingLayer> = None;
                     let mut toggle_fav_saved: Option<String> = None;
                     #[cfg(feature = "mixer")]
-                    let mut queue_chain_recall: Option<crate::scene::SavedChain> = None;
+                    let mut queue_chain_recall: Option<
+                        crate::scene::SavedChain,
+                    > = None;
                     let mut queue_chain_delete: Option<String> = None;
                     #[cfg(feature = "mixer")]
-                    let mut queue_group_recall: Option<crate::scene::SavedGroup> = None;
+                    let mut queue_group_recall: Option<
+                        crate::scene::SavedGroup,
+                    > = None;
                     let mut queue_group_delete: Option<String> = None;
                     // One library row: label (optionally a drag source for FX
                     // strips) plus the "➕ new deck" button.
@@ -2780,6 +2841,51 @@ mod egui_impl {
                     // into a chain — a filter has no input as a layer source,
                     // which is what used to produce a black, source-less layer.
                     let pending_file = self.pending_file.clone();
+                    // Weight and compile status per shader, resolved once for
+                    // the whole frame. The path-to-hash memo means a row costs
+                    // a map lookup rather than re-reading and re-hashing its
+                    // file every frame.
+                    // Bands are a share of the frame budget, so they follow
+                    // whatever frame rate is actually being targeted: the same
+                    // shader is judged harder at 120fps than at 60.
+                    let target_fps = if engine.target_fps > 0 {
+                        engine.target_fps as f32
+                    } else {
+                        60.0
+                    };
+                    if self.previs_keys_generation != state.library_generation {
+                        self.previs_keys.clear();
+                        self.previs_keys_generation = state.library_generation;
+                    }
+                    let mut bands: std::collections::HashMap<
+                        std::path::PathBuf,
+                        (crate::previs::Band, Option<f32>, Option<String>),
+                    > = std::collections::HashMap::new();
+                    for entry in &state.registry.shaders {
+                        let Some(path) = entry.path.as_ref() else {
+                            continue;
+                        };
+                        let key = match self.previs_keys.get(path) {
+                            Some(k) => k.clone(),
+                            None => {
+                                let Ok(src) = std::fs::read_to_string(path) else {
+                                    continue;
+                                };
+                                let k = crate::previs::hash_source(&src);
+                                self.previs_keys.insert(path.clone(), k.clone());
+                                k
+                            }
+                        };
+                        let record = state.previs.get(&key);
+                        let band = crate::previs::Band::of(record, target_fps);
+                        let ms = record.and_then(|r| r.ms);
+                        let err = record.and_then(|r| match &r.status {
+                            crate::previs::Status::Failed(e) => Some(e.clone()),
+                            crate::previs::Status::Ok => None,
+                        });
+                        bands.insert(path.clone(), (band, ms, err));
+                    }
+
                     let mut row = |ui: &mut egui::Ui,
                                    entry: &crate::sources::SourceEntry,
                                    is_effect: bool| {
@@ -2889,9 +2995,12 @@ mod egui_impl {
                                         }
                                     }
 
-                                    // Whatever width is left goes to the name,
-                                    // filled and left-aligned so short names do
-                                    // not float over against the button.
+                                    // Weight dot, then the name. A shader that
+                                    // does not compile is greyed and struck
+                                    // through: until now it looked identical to
+                                    // a working one and only revealed itself by
+                                    // rendering nothing once loaded.
+                                    let previs = entry.path.as_ref().and_then(|p| bands.get(p));
                                     let text =
                                         format!("{} {}", source_icon(entry.kind), entry.name);
                                     let size = egui::vec2(
@@ -2902,6 +3011,34 @@ mod egui_impl {
                                         size,
                                         egui::Layout::left_to_right(egui::Align::Center),
                                         |ui| {
+                                            if let Some((band, ms, err)) = previs {
+                                                let [r, g, b] = band.colour();
+                                                let (rect, resp) = ui.allocate_exact_size(
+                                                    egui::vec2(9.0, ui.available_height()),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().circle_filled(
+                                                    rect.center(),
+                                                    3.5,
+                                                    egui::Color32::from_rgb(r, g, b),
+                                                );
+                                                let tip = match err {
+                                                    Some(e) => {
+                                                        format!("{}\n{e}", band.describe(*ms))
+                                                    }
+                                                    None => band.describe(*ms),
+                                                };
+                                                resp.on_hover_text(tip);
+                                            }
+                                            let broken = matches!(
+                                                previs,
+                                                Some((crate::previs::Band::Broken, _, _))
+                                            );
+                                            let text = if broken {
+                                                egui::RichText::new(text).strikethrough().weak()
+                                            } else {
+                                                egui::RichText::new(text)
+                                            };
                                             let label = egui::Label::new(text).truncate();
                                             match (is_effect, &entry.path) {
                                                 (true, Some(path)) => {
@@ -3173,7 +3310,9 @@ mod egui_impl {
                                         }
                                         if ui
                                             .small_button("➕")
-                                            .on_hover_text("Load into the master chain, replacing it")
+                                            .on_hover_text(
+                                                "Load into the master chain, replacing it",
+                                            )
                                             .clicked()
                                         {
                                             queue_chain_recall = Some((*chain).clone());
@@ -3271,17 +3410,15 @@ mod egui_impl {
                     // EFFECTS — filters, which need something to filter.
                     ui.add_space(4.0);
                     let open = heading(ui, "EFFECTS", "➕ to selected layer");
-                    for entry in
-                        starred_first(
-                            state
-                                .registry
-                                .shaders
-                                .iter()
-                                .filter(|e| is_effect(e) && open && hit(&e.name))
-                                .collect(),
-                            &favourites,
-                        )
-                    {
+                    for entry in starred_first(
+                        state
+                            .registry
+                            .shaders
+                            .iter()
+                            .filter(|e| is_effect(e) && open && hit(&e.name))
+                            .collect(),
+                        &favourites,
+                    ) {
                         row(ui, entry, true);
                     }
 
@@ -3357,7 +3494,10 @@ mod egui_impl {
                 // A shader picked from anywhere is copied into the library, so
                 // adding it once is enough: it is in the list next launch, and
                 // hot-reload watches the copy the layer is actually using.
-                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("fs")) {
+                if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("fs"))
+                {
                     match crate::sources::registry::install_shader(&path, &crate::shaders_dir()) {
                         Ok(installed) => path = installed,
                         Err(e) => log::warn!(
@@ -3396,10 +3536,7 @@ mod egui_impl {
                     });
                 }
             }
-            if ui
-                .button("Add file\u{2026}")
-                .clicked()
-            {
+            if ui.button("Add file\u{2026}").clicked() {
                 let pending = self.pending_file.clone();
                 let ctx = ui.ctx().clone();
                 std::thread::spawn(move || {
@@ -3419,8 +3556,14 @@ mod egui_impl {
 
             // Folders the library scans, on top of the two bundled ones. Down
             // here with the other management UI rather than in the list itself.
-            if let Ok(mut guard) = self.pending_folder.lock()
-                && let Some(dir) = guard.take()
+            // Taken out of the mutex first: the guard borrows `state`, and
+            // adding the folder needs it mutably.
+            let picked = state
+                .pending_library_folder
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take());
+            if let Some(dir) = picked
                 && !state.library_folders.contains(&dir)
             {
                 state.library_folders.push(dir);
@@ -3462,7 +3605,7 @@ mod egui_impl {
                     .on_hover_text("Scan a folder for shaders, images and videos")
                     .clicked()
                 {
-                    let pending = self.pending_folder.clone();
+                    let pending = state.pending_library_folder.clone();
                     let ctx = ui.ctx().clone();
                     std::thread::spawn(move || {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
@@ -3497,19 +3640,16 @@ mod egui_impl {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
                 let can_add = !self.stream_url.trim().is_empty() && url_error.is_none();
-                if ui.add_enabled(can_add, egui::Button::new("Add Stream")).clicked()
-                    && queue_stream_deck(
-                        state,
-                        engine,
-                        &self.stream_name,
-                        &self.stream_url,
-                    ).is_ok() {
+                if ui
+                    .add_enabled(can_add, egui::Button::new("Add Stream"))
+                    .clicked()
+                    && queue_stream_deck(state, engine, &self.stream_name, &self.stream_url).is_ok()
+                {
                     self.stream_url.clear();
                     self.stream_name.clear();
                 }
             });
             ui.separator();
-
         }
     }
 
@@ -3588,9 +3728,10 @@ mod egui_impl {
                     // anything below the fold.
                     match self.layer {
                         StageLayer::Lighting => {
-                            ui.label(egui::RichText::new("Lighting").heading()).on_hover_text(
-                                "sACN / Art-Net outputs, segments and fixture profiles",
-                            );
+                            ui.label(egui::RichText::new("Lighting").heading())
+                                .on_hover_text(
+                                    "sACN / Art-Net outputs, segments and fixture profiles",
+                                );
                         }
                         StageLayer::Lasers => {
                             ui.label(egui::RichText::new("Lasers").heading())
@@ -3646,7 +3787,6 @@ mod egui_impl {
                     }
                     (None, false) => {}
                 }
-
             }
 
             #[cfg(not(feature = "projection"))]
@@ -3659,9 +3799,18 @@ mod egui_impl {
     /// Bilinear map of `(u,v)` across a placement quad `[TL, TR, BR, BL]`.
     #[cfg(feature = "projection")]
     fn led_bilerp(q: &[[f32; 2]; 4], u: f32, v: f32) -> (f32, f32) {
-        let top = [q[0][0] + (q[1][0] - q[0][0]) * u, q[0][1] + (q[1][1] - q[0][1]) * u];
-        let bot = [q[3][0] + (q[2][0] - q[3][0]) * u, q[3][1] + (q[2][1] - q[3][1]) * u];
-        (top[0] + (bot[0] - top[0]) * v, top[1] + (bot[1] - top[1]) * v)
+        let top = [
+            q[0][0] + (q[1][0] - q[0][0]) * u,
+            q[0][1] + (q[1][1] - q[0][1]) * u,
+        ];
+        let bot = [
+            q[3][0] + (q[2][0] - q[3][0]) * u,
+            q[3][1] + (q[2][1] - q[3][1]) * u,
+        ];
+        (
+            top[0] + (bot[0] - top[0]) * v,
+            top[1] + (bot[1] - top[1]) * v,
+        )
     }
 
     #[cfg(feature = "projection")]
@@ -3733,25 +3882,37 @@ mod egui_impl {
         let mut mesh = egui::Mesh::default();
         for step in 0..=STEPS {
             let t = step as f32 / STEPS as f32;
-            let alpha = ((1.0 - rustjay_projection::blend_alpha(t, gamma.max(0.01))) * 150.0)
-                .round() as u8;
+            let alpha =
+                ((1.0 - rustjay_projection::blend_alpha(t, gamma.max(0.01))) * 150.0).round() as u8;
             let color = egui::Color32::from_rgba_unmultiplied(255, 120, 40, alpha);
             let [a, b] = match edge {
                 CanvasEdge::Left => {
                     let x = band.min.x + band.width() * t;
-                    [egui::Pos2::new(x, band.min.y), egui::Pos2::new(x, band.max.y)]
+                    [
+                        egui::Pos2::new(x, band.min.y),
+                        egui::Pos2::new(x, band.max.y),
+                    ]
                 }
                 CanvasEdge::Right => {
                     let x = band.max.x - band.width() * t;
-                    [egui::Pos2::new(x, band.min.y), egui::Pos2::new(x, band.max.y)]
+                    [
+                        egui::Pos2::new(x, band.min.y),
+                        egui::Pos2::new(x, band.max.y),
+                    ]
                 }
                 CanvasEdge::Top => {
                     let y = band.min.y + band.height() * t;
-                    [egui::Pos2::new(band.min.x, y), egui::Pos2::new(band.max.x, y)]
+                    [
+                        egui::Pos2::new(band.min.x, y),
+                        egui::Pos2::new(band.max.x, y),
+                    ]
                 }
                 CanvasEdge::Bottom => {
                     let y = band.max.y - band.height() * t;
-                    [egui::Pos2::new(band.min.x, y), egui::Pos2::new(band.max.x, y)]
+                    [
+                        egui::Pos2::new(band.min.x, y),
+                        egui::Pos2::new(band.max.x, y),
+                    ]
                 }
             };
             mesh.colored_vertex(a, color);
@@ -3795,10 +3956,7 @@ mod egui_impl {
 
             assert_eq!(
                 blend_band_rect(canvas, CanvasEdge::Left, 0.25),
-                egui::Rect::from_min_max(
-                    egui::Pos2::new(10.0, 20.0),
-                    egui::Pos2::new(60.0, 120.0),
-                )
+                egui::Rect::from_min_max(egui::Pos2::new(10.0, 20.0), egui::Pos2::new(60.0, 120.0),)
             );
             assert_eq!(
                 blend_band_rect(canvas, CanvasEdge::Right, 0.25),
@@ -3809,10 +3967,7 @@ mod egui_impl {
             );
             assert_eq!(
                 blend_band_rect(canvas, CanvasEdge::Top, 0.25),
-                egui::Rect::from_min_max(
-                    egui::Pos2::new(10.0, 20.0),
-                    egui::Pos2::new(210.0, 45.0),
-                )
+                egui::Rect::from_min_max(egui::Pos2::new(10.0, 20.0), egui::Pos2::new(210.0, 45.0),)
             );
             assert_eq!(
                 blend_band_rect(canvas, CanvasEdge::Bottom, 0.25),
@@ -3838,7 +3993,7 @@ mod egui_impl {
             // they actually occupy, which is what clipped the canvas.
             region: egui::Rect,
         ) {
-            use crate::stage::{ContentMapping, SurfaceSource, KovvbojSurface};
+            use crate::stage::{ContentMapping, KovvbojSurface, SurfaceSource};
             use egui::{Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
 
             // Disjoint field borrows so the closures below can capture each
@@ -3908,7 +4063,13 @@ mod egui_impl {
                                 } else {
                                     egui::RichText::new(&surf.name)
                                 };
-                                if ui.selectable_label(i == state.stage.selected_surface_index, label).clicked() {
+                                if ui
+                                    .selectable_label(
+                                        i == state.stage.selected_surface_index,
+                                        label,
+                                    )
+                                    .clicked()
+                                {
                                     state.stage.selected_surface_index = i;
                                 }
                                 if ui.small_button("✖").clicked() {
@@ -3920,6 +4081,10 @@ mod egui_impl {
                             // Repoints projectors and headless outputs; a bare
                             // `Vec::remove` slides them onto the wrong surface.
                             state.stage.remove_surface(i);
+                            // The projector holds the last warp it was handed,
+                            // so a delete has to republish or the dead
+                            // surface's geometry stays on the output.
+                            warp_dirty = true;
                         }
 
                         if ui.button("+ Add Rectangle").clicked() {
@@ -3928,6 +4093,7 @@ mod egui_impl {
                                 format!("Surface {}", idx),
                                 format!("surf{}", idx),
                             ));
+                            warp_dirty = true;
                         }
                         if ui.button("+ Add Circle").clicked() {
                             let idx = state.stage.next_surface_number("Circle");
@@ -3937,12 +4103,14 @@ mod egui_impl {
                                 [0.5, 0.5],
                                 0.25,
                             ));
+                            warp_dirty = true;
                         }
                         ui.separator();
                         ui.label("Import:");
                         ui.horizontal(|ui| {
                             ui.add(
-                                egui::TextEdit::singleline(import_path).hint_text("Path to SVG/DXF..."),
+                                egui::TextEdit::singleline(import_path)
+                                    .hint_text("Path to SVG/DXF..."),
                             );
                             if ui.button("Import").clicked() && !import_path.is_empty() {
                                 let path = std::path::Path::new(&*import_path);
@@ -3976,7 +4144,8 @@ mod egui_impl {
                                             // Multi-contour import: largest = primary, rest = extra_contours
                                             let primary = &result.contours[0];
                                             let s = primary.to_surface(0);
-                                            let extra_contours: Vec<Vec<[f32; 2]>> = result.contours[1..]
+                                            let extra_contours: Vec<Vec<[f32; 2]>> = result
+                                                .contours[1..]
                                                 .iter()
                                                 .map(|c| c.vertices.clone())
                                                 .collect();
@@ -4042,9 +4211,7 @@ mod egui_impl {
                             *canvas_zoom = 1.0;
                         }
                         if *show_stage_preview && preview_tex.is_none() {
-                            ui.label(
-                                egui::RichText::new("(live preview unavailable)").weak(),
-                            );
+                            ui.label(egui::RichText::new("(live preview unavailable)").weak());
                         }
                     });
                     ui.separator();
@@ -4076,1032 +4243,1189 @@ mod egui_impl {
                         .max_width(aw)
                         .max_height(ah)
                         .show(ui, |ui| {
-                    // The 16:9 frame is aspect-fit, so on a narrow column it is
-                    // width-limited and leaves the height unused. Claim the full
-                    // area anyway and letterbox the frame inside it: the editor
-                    // fills its panel instead of sitting in a strip with dead
-                    // space under it, and the surround is somewhere to pan into
-                    // when zoomed.
-                    let outer_dims =
-                        Vec2::new(canvas_dims.x.max(aw), canvas_dims.y.max(ah));
-                    let (outer_rect, response) =
-                        ui.allocate_exact_size(outer_dims, egui::Sense::click_and_drag());
-                    let canvas_rect = Rect::from_center_size(outer_rect.center(), canvas_dims);
-                    let painter = ui.painter_at(outer_rect);
-                    // Surround, so the letterbox reads as canvas rather than gap.
-                    painter.rect_filled(outer_rect, CornerRadius::ZERO, Color32::from_gray(10));
-
-                    // Background: the live master output, dimmed so the whole
-                    // frame stays visible as context. Each surface then redraws
-                    // the region it samples at full brightness below, so its
-                    // position/size visibly select (crop) part of the master.
-                    if let Some(tex) = preview_tex {
-                        painter.image(
-                            tex,
-                            canvas_rect,
-                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                            Color32::from_gray(80), // tint < 255 dims the image
-                        );
-                    } else {
-                        painter.rect_filled(canvas_rect, CornerRadius::ZERO, Color32::from_gray(18));
-                    }
-                    painter.rect_stroke(
-                        canvas_rect,
-                        CornerRadius::ZERO,
-                        Stroke::new(1.0, Color32::from_gray(80)),
-                        egui::StrokeKind::Inside,
-                    );
-
-                    // Grid
-                for i in 0..=10 {
-                    let t = i as f32 / 10.0;
-                    let x = canvas_rect.min.x + t * canvas_rect.width();
-                    let y = canvas_rect.min.y + t * canvas_rect.height();
-                    painter.line_segment(
-                        [
-                            Pos2::new(x, canvas_rect.min.y),
-                            Pos2::new(x, canvas_rect.max.y),
-                        ],
-                        Stroke::new(0.5, Color32::from_gray(50)),
-                    );
-                    painter.line_segment(
-                        [
-                            Pos2::new(canvas_rect.min.x, y),
-                            Pos2::new(canvas_rect.max.x, y),
-                        ],
-                        Stroke::new(0.5, Color32::from_gray(50)),
-                    );
-                }
-
-                // ── Surface content: each Master surface's crop region
-                // (`uv_crop_rect`) — which is the same rectangle as its
-                // position/size box — is redrawn from the master at full
-                // brightness in place. So moving/resizing a surface selects
-                // (crops) a region of the live master, visibly, and matches what
-                // the projector outputs.
-                if let Some(tex) = preview_tex {
-                    for surf in state.stage.surfaces.iter() {
-                        if surf.source != SurfaceSource::Master || surf.is_circular {
-                            continue;
-                        }
-                        let [u0, v0, u1, v1] = surf.uv_crop_rect;
-                        let dst = Rect::from_min_max(
-                            Pos2::new(
-                                canvas_rect.min.x + u0 * canvas_rect.width(),
-                                canvas_rect.min.y + v0 * canvas_rect.height(),
-                            ),
-                            Pos2::new(
-                                canvas_rect.min.x + u1 * canvas_rect.width(),
-                                canvas_rect.min.y + v1 * canvas_rect.height(),
-                            ),
-                        );
-                        painter.image(
-                            tex,
-                            dst,
-                            Rect::from_min_max(Pos2::new(u0, v0), Pos2::new(u1, v1)),
-                            Color32::WHITE,
-                        );
-                    }
-                }
-
-                // Edge-blend preview follows the normalized projector-output
-                // edges. The warm ramp is intentionally an overlay aid: its
-                // width and gamma mirror the live config without changing the
-                // projection render path.
-                if state
-                    .stage
-                    .surfaces
-                    .get(state.stage.selected_surface_index)
-                    .is_some()
-                    && let Some(config) = state
-                        .stage
-                        .edge_blend_sync
-                        .as_ref()
-                        .and_then(|sync| sync.lock().ok().map(|guard| guard.config))
-                {
-                    for (edge, blend) in [
-                        (CanvasEdge::Left, config.left),
-                        (CanvasEdge::Right, config.right),
-                        (CanvasEdge::Top, config.top),
-                        (CanvasEdge::Bottom, config.bottom),
-                    ] {
-                        if blend.enabled {
-                            paint_blend_band(
-                                &painter,
-                                canvas_rect,
-                                edge,
-                                blend.width,
-                                blend.gamma,
+                            // The 16:9 frame is aspect-fit, so on a narrow column it is
+                            // width-limited and leaves the height unused. Claim the full
+                            // area anyway and letterbox the frame inside it: the editor
+                            // fills its panel instead of sitting in a strip with dead
+                            // space under it, and the surround is somewhere to pan into
+                            // when zoomed.
+                            let outer_dims =
+                                Vec2::new(canvas_dims.x.max(aw), canvas_dims.y.max(ah));
+                            let (outer_rect, response) =
+                                ui.allocate_exact_size(outer_dims, egui::Sense::click_and_drag());
+                            let canvas_rect =
+                                Rect::from_center_size(outer_rect.center(), canvas_dims);
+                            let painter = ui.painter_at(outer_rect);
+                            // Surround, so the letterbox reads as canvas rather than gap.
+                            painter.rect_filled(
+                                outer_rect,
+                                CornerRadius::ZERO,
+                                Color32::from_gray(10),
                             );
-                        }
-                    }
-                }
 
-                // Draw surfaces
-                for (i, surf) in state.stage.surfaces.iter().enumerate() {
-                    let is_selected = i == state.stage.selected_surface_index;
-                    let color = if is_selected {
-                        Color32::from_rgb(100, 150, 255)
-                    } else {
-                        Color32::from_rgb(200, 100, 100)
-                    };
+                            // Background: the live master output, dimmed so the whole
+                            // frame stays visible as context. Each surface then redraws
+                            // the region it samples at full brightness below, so its
+                            // position/size visibly select (crop) part of the master.
+                            if let Some(tex) = preview_tex {
+                                painter.image(
+                                    tex,
+                                    canvas_rect,
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    Color32::from_gray(80), // tint < 255 dims the image
+                                );
+                            } else {
+                                painter.rect_filled(
+                                    canvas_rect,
+                                    CornerRadius::ZERO,
+                                    Color32::from_gray(18),
+                                );
+                            }
+                            painter.rect_stroke(
+                                canvas_rect,
+                                CornerRadius::ZERO,
+                                Stroke::new(1.0, Color32::from_gray(80)),
+                                egui::StrokeKind::Inside,
+                            );
 
-                    if surf.is_circular && !surf.vertices.is_empty() {
-                        let center = surf.vertices[0];
-                        let cx = canvas_rect.min.x + center[0] * canvas_rect.width();
-                        let cy = canvas_rect.min.y + center[1] * canvas_rect.height();
-                        let r = surf.radius * canvas_rect.width();
-                        painter.circle_stroke(Pos2::new(cx, cy), r, Stroke::new(2.0, color));
-                        painter.text(
-                            Pos2::new(cx, cy),
-                            egui::Align2::CENTER_CENTER,
-                            &surf.name,
-                            egui::FontId::proportional(12.0),
-                            Color32::WHITE,
-                        );
-                    } else if surf.vertices.len() >= 3 {
-                        let points: Vec<Pos2> = surf
-                            .vertices
-                            .iter()
-                            .map(|v| {
-                                Pos2::new(
-                                    canvas_rect.min.x + v[0] * canvas_rect.width(),
-                                    canvas_rect.min.y + v[1] * canvas_rect.height(),
-                                )
-                            })
-                            .collect();
-                        // Outline only — the surface content is drawn above, so a
-                        // filled overlay would tint it. Selected surfaces get a
-                        // faint tint for feedback.
-                        let fill = if is_selected {
-                            color.linear_multiply(0.12)
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-                        painter.add(egui::Shape::convex_polygon(
-                            points.clone(),
-                            fill,
-                            Stroke::new(if is_selected { 3.0 } else { 2.0 }, color),
-                        ));
-                        // Label at centroid
-                        let centroid_x: f32 = surf.vertices.iter().map(|v| v[0]).sum::<f32>()
-                            / surf.vertices.len() as f32;
-                        let centroid_y: f32 = surf.vertices.iter().map(|v| v[1]).sum::<f32>()
-                            / surf.vertices.len() as f32;
-                        painter.text(
-                            Pos2::new(
-                                canvas_rect.min.x + centroid_x * canvas_rect.width(),
-                                canvas_rect.min.y + centroid_y * canvas_rect.height(),
-                            ),
-                            egui::Align2::CENTER_CENTER,
-                            &surf.name,
-                            egui::FontId::proportional(12.0),
-                            Color32::WHITE,
-                        );
-                    }
+                            // Grid
+                            for i in 0..=10 {
+                                let t = i as f32 / 10.0;
+                                let x = canvas_rect.min.x + t * canvas_rect.width();
+                                let y = canvas_rect.min.y + t * canvas_rect.height();
+                                painter.line_segment(
+                                    [
+                                        Pos2::new(x, canvas_rect.min.y),
+                                        Pos2::new(x, canvas_rect.max.y),
+                                    ],
+                                    Stroke::new(0.5, Color32::from_gray(50)),
+                                );
+                                painter.line_segment(
+                                    [
+                                        Pos2::new(canvas_rect.min.x, y),
+                                        Pos2::new(canvas_rect.max.x, y),
+                                    ],
+                                    Stroke::new(0.5, Color32::from_gray(50)),
+                                );
+                            }
 
-                    // Extra contours: dashed outlines
-                    if is_selected {
-                        for contour in &surf.extra_contours {
-                            if contour.len() >= 2 {
-                                let pts: Vec<Pos2> = contour
-                                    .iter()
-                                    .map(|v| {
-                                        Pos2::new(
-                                            canvas_rect.min.x + v[0] * canvas_rect.width(),
-                                            canvas_rect.min.y + v[1] * canvas_rect.height(),
-                                        )
-                                    })
-                                    .collect();
-                                // Draw dashed polyline
-                                let dash_len = 6.0;
-                                let gap_len = 3.0;
-                                let dash_color = Color32::from_rgb(180, 180, 180);
-                                for seg in pts.windows(2) {
-                                    let a = seg[0];
-                                    let b = seg[1];
-                                    let dx = b.x - a.x;
-                                    let dy = b.y - a.y;
-                                    let len = (dx * dx + dy * dy).sqrt();
-                                    if len < 0.1 {
+                            // ── Surface content: each Master surface's crop region
+                            // (`uv_crop_rect`) — which is the same rectangle as its
+                            // position/size box — is redrawn from the master at full
+                            // brightness in place. So moving/resizing a surface selects
+                            // (crops) a region of the live master, visibly, and matches what
+                            // the projector outputs.
+                            if let Some(tex) = preview_tex {
+                                for surf in state.stage.surfaces.iter() {
+                                    if surf.source != SurfaceSource::Master || surf.is_circular {
                                         continue;
                                     }
-                                    let steps = (len / (dash_len + gap_len)).ceil() as usize;
-                                    for s in 0..steps {
-                                        let t0 = (s as f32 * (dash_len + gap_len)).min(len) / len;
-                                        let t1 = (s as f32 * (dash_len + gap_len) + dash_len).min(len) / len;
-                                        painter.line_segment(
-                                            [Pos2::new(a.x + dx * t0, a.y + dy * t0), Pos2::new(a.x + dx * t1, a.y + dy * t1)],
-                                            Stroke::new(1.5, dash_color),
+                                    let [u0, v0, u1, v1] = surf.uv_crop_rect;
+                                    let dst = Rect::from_min_max(
+                                        Pos2::new(
+                                            canvas_rect.min.x + u0 * canvas_rect.width(),
+                                            canvas_rect.min.y + v0 * canvas_rect.height(),
+                                        ),
+                                        Pos2::new(
+                                            canvas_rect.min.x + u1 * canvas_rect.width(),
+                                            canvas_rect.min.y + v1 * canvas_rect.height(),
+                                        ),
+                                    );
+                                    painter.image(
+                                        tex,
+                                        dst,
+                                        Rect::from_min_max(Pos2::new(u0, v0), Pos2::new(u1, v1)),
+                                        Color32::WHITE,
+                                    );
+                                }
+                            }
+
+                            // Edge-blend preview follows the normalized projector-output
+                            // edges. The warm ramp is intentionally an overlay aid: its
+                            // width and gamma mirror the live config without changing the
+                            // projection render path.
+                            if state
+                                .stage
+                                .surfaces
+                                .get(state.stage.selected_surface_index)
+                                .is_some()
+                                && let Some(config) = state
+                                    .stage
+                                    .edge_blend_sync
+                                    .as_ref()
+                                    .and_then(|sync| sync.lock().ok().map(|guard| guard.config))
+                            {
+                                for (edge, blend) in [
+                                    (CanvasEdge::Left, config.left),
+                                    (CanvasEdge::Right, config.right),
+                                    (CanvasEdge::Top, config.top),
+                                    (CanvasEdge::Bottom, config.bottom),
+                                ] {
+                                    if blend.enabled {
+                                        paint_blend_band(
+                                            &painter,
+                                            canvas_rect,
+                                            edge,
+                                            blend.width,
+                                            blend.gamma,
                                         );
                                     }
                                 }
-                                // Close the contour with a dashed line
-                                if let (Some(first), Some(last)) = (pts.first(), pts.last()) {
-                                    let a = *last;
-                                    let b = *first;
-                                    let dx = b.x - a.x;
-                                    let dy = b.y - a.y;
-                                    let len = (dx * dx + dy * dy).sqrt();
-                                    if len >= 0.1 {
-                                        let steps = (len / (dash_len + gap_len)).ceil() as usize;
-                                        for s in 0..steps {
-                                            let t0 = (s as f32 * (dash_len + gap_len)).min(len) / len;
-                                            let t1 = (s as f32 * (dash_len + gap_len) + dash_len).min(len) / len;
+                            }
+
+                            // Draw surfaces
+                            for (i, surf) in state.stage.surfaces.iter().enumerate() {
+                                let is_selected = i == state.stage.selected_surface_index;
+                                let color = if is_selected {
+                                    Color32::from_rgb(100, 150, 255)
+                                } else {
+                                    Color32::from_rgb(200, 100, 100)
+                                };
+
+                                if surf.is_circular && !surf.vertices.is_empty() {
+                                    let center = surf.vertices[0];
+                                    let cx = canvas_rect.min.x + center[0] * canvas_rect.width();
+                                    let cy = canvas_rect.min.y + center[1] * canvas_rect.height();
+                                    let r = surf.radius * canvas_rect.width();
+                                    painter.circle_stroke(
+                                        Pos2::new(cx, cy),
+                                        r,
+                                        Stroke::new(2.0, color),
+                                    );
+                                    painter.text(
+                                        Pos2::new(cx, cy),
+                                        egui::Align2::CENTER_CENTER,
+                                        &surf.name,
+                                        egui::FontId::proportional(12.0),
+                                        Color32::WHITE,
+                                    );
+                                } else if surf.vertices.len() >= 3 {
+                                    let points: Vec<Pos2> = surf
+                                        .vertices
+                                        .iter()
+                                        .map(|v| {
+                                            Pos2::new(
+                                                canvas_rect.min.x + v[0] * canvas_rect.width(),
+                                                canvas_rect.min.y + v[1] * canvas_rect.height(),
+                                            )
+                                        })
+                                        .collect();
+                                    // Outline only — the surface content is drawn above, so a
+                                    // filled overlay would tint it. Selected surfaces get a
+                                    // faint tint for feedback.
+                                    let fill = if is_selected {
+                                        color.linear_multiply(0.12)
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    };
+                                    painter.add(egui::Shape::convex_polygon(
+                                        points.clone(),
+                                        fill,
+                                        Stroke::new(if is_selected { 3.0 } else { 2.0 }, color),
+                                    ));
+                                    // Label at centroid
+                                    let centroid_x: f32 =
+                                        surf.vertices.iter().map(|v| v[0]).sum::<f32>()
+                                            / surf.vertices.len() as f32;
+                                    let centroid_y: f32 =
+                                        surf.vertices.iter().map(|v| v[1]).sum::<f32>()
+                                            / surf.vertices.len() as f32;
+                                    painter.text(
+                                        Pos2::new(
+                                            canvas_rect.min.x + centroid_x * canvas_rect.width(),
+                                            canvas_rect.min.y + centroid_y * canvas_rect.height(),
+                                        ),
+                                        egui::Align2::CENTER_CENTER,
+                                        &surf.name,
+                                        egui::FontId::proportional(12.0),
+                                        Color32::WHITE,
+                                    );
+                                }
+
+                                // Extra contours: dashed outlines
+                                if is_selected {
+                                    for contour in &surf.extra_contours {
+                                        if contour.len() >= 2 {
+                                            let pts: Vec<Pos2> = contour
+                                                .iter()
+                                                .map(|v| {
+                                                    Pos2::new(
+                                                        canvas_rect.min.x
+                                                            + v[0] * canvas_rect.width(),
+                                                        canvas_rect.min.y
+                                                            + v[1] * canvas_rect.height(),
+                                                    )
+                                                })
+                                                .collect();
+                                            // Draw dashed polyline
+                                            let dash_len = 6.0;
+                                            let gap_len = 3.0;
+                                            let dash_color = Color32::from_rgb(180, 180, 180);
+                                            for seg in pts.windows(2) {
+                                                let a = seg[0];
+                                                let b = seg[1];
+                                                let dx = b.x - a.x;
+                                                let dy = b.y - a.y;
+                                                let len = (dx * dx + dy * dy).sqrt();
+                                                if len < 0.1 {
+                                                    continue;
+                                                }
+                                                let steps =
+                                                    (len / (dash_len + gap_len)).ceil() as usize;
+                                                for s in 0..steps {
+                                                    let t0 = (s as f32 * (dash_len + gap_len))
+                                                        .min(len)
+                                                        / len;
+                                                    let t1 = (s as f32 * (dash_len + gap_len)
+                                                        + dash_len)
+                                                        .min(len)
+                                                        / len;
+                                                    painter.line_segment(
+                                                        [
+                                                            Pos2::new(a.x + dx * t0, a.y + dy * t0),
+                                                            Pos2::new(a.x + dx * t1, a.y + dy * t1),
+                                                        ],
+                                                        Stroke::new(1.5, dash_color),
+                                                    );
+                                                }
+                                            }
+                                            // Close the contour with a dashed line
+                                            if let (Some(first), Some(last)) =
+                                                (pts.first(), pts.last())
+                                            {
+                                                let a = *last;
+                                                let b = *first;
+                                                let dx = b.x - a.x;
+                                                let dy = b.y - a.y;
+                                                let len = (dx * dx + dy * dy).sqrt();
+                                                if len >= 0.1 {
+                                                    let steps = (len / (dash_len + gap_len)).ceil()
+                                                        as usize;
+                                                    for s in 0..steps {
+                                                        let t0 = (s as f32 * (dash_len + gap_len))
+                                                            .min(len)
+                                                            / len;
+                                                        let t1 = (s as f32 * (dash_len + gap_len)
+                                                            + dash_len)
+                                                            .min(len)
+                                                            / len;
+                                                        painter.line_segment(
+                                                            [
+                                                                Pos2::new(
+                                                                    a.x + dx * t0,
+                                                                    a.y + dy * t0,
+                                                                ),
+                                                                Pos2::new(
+                                                                    a.x + dx * t1,
+                                                                    a.y + dy * t1,
+                                                                ),
+                                                            ],
+                                                            Stroke::new(1.5, dash_color),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ── UV crop drag handles ───────────────────────────────────
+                            // Corner handles on the stage canvas now control the UV sampling
+                            // region (which part of the source texture is shown), not the
+                            // output warp. Warp modes draw their own distinct handles below.
+                            let mut handle_dragged = false;
+
+                            // Every surface handle — UV crop, corner-pin, mesh — hangs off
+                            // these two bindings, so the layer gate goes here rather than on
+                            // each drag site.
+                            let surfaces_live = *layer == StageLayer::Surfaces;
+
+                            let uv_handles: Option<[[f32; 2]; 4]> = state
+                                .stage
+                                .surfaces
+                                .get(state.stage.selected_surface_index)
+                                .filter(|_| surfaces_live)
+                                .map(|s| {
+                                    let [min_u, min_v, max_u, max_v] = s.uv_crop_rect;
+                                    [
+                                        [min_u, min_v], // TL
+                                        [max_u, min_v], // TR
+                                        [max_u, max_v], // BR
+                                        [min_u, max_v], // BL
+                                    ]
+                                });
+
+                            let selected_warp = state
+                                .stage
+                                .surfaces
+                                .get(state.stage.selected_surface_index)
+                                .filter(|_| surfaces_live)
+                                .map(|surface| surface.warp.clone());
+
+                            // Draw UV crop handles and connecting rectangle
+                            if let Some(corners) = uv_handles {
+                                let handle_labels = ["TL", "TR", "BR", "BL"];
+                                let mut positions = [Pos2::ZERO; 4];
+                                for (i, corner) in corners.iter().enumerate() {
+                                    let pos = Pos2::new(
+                                        canvas_rect.min.x + corner[0] * canvas_rect.width(),
+                                        canvas_rect.min.y + corner[1] * canvas_rect.height(),
+                                    );
+                                    positions[i] = pos;
+                                    let handle_rect =
+                                        Rect::from_center_size(pos, Vec2::splat(18.0));
+                                    let handle_id = ui.id().with(("uv_crop_handle", i));
+                                    let handle_response =
+                                        ui.interact(handle_rect, handle_id, egui::Sense::drag());
+
+                                    let handle_color = if handle_response.dragged() {
+                                        Color32::from_rgb(255, 200, 0) // amber for UV crop
+                                    } else if handle_response.hovered() {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(220, 160, 20)
+                                    };
+                                    painter.circle_filled(pos, 7.0, Color32::from_black_alpha(140));
+                                    painter.circle_stroke(
+                                        pos,
+                                        7.0,
+                                        Stroke::new(2.0_f32, handle_color),
+                                    );
+
+                                    // Label
+                                    painter.text(
+                                        pos - Vec2::new(0.0, 8.0),
+                                        egui::Align2::CENTER_BOTTOM,
+                                        handle_labels[i],
+                                        egui::FontId::proportional(9.0),
+                                        Color32::from_rgb(200, 200, 200),
+                                    );
+
+                                    if handle_response.dragged() {
+                                        handle_dragged = true;
+                                        let dx =
+                                            handle_response.drag_delta().x / canvas_rect.width();
+                                        let dy =
+                                            handle_response.drag_delta().y / canvas_rect.height();
+                                        if let Some(surf) = state
+                                            .stage
+                                            .surfaces
+                                            .get_mut(state.stage.selected_surface_index)
+                                        {
+                                            let [min_u, min_v, max_u, max_v] =
+                                                &mut surf.uv_crop_rect;
+                                            match i {
+                                                0 => {
+                                                    // TL
+                                                    *min_u = (*min_u + dx).clamp(0.0, 1.0);
+                                                    *min_v = (*min_v + dy).clamp(0.0, 1.0);
+                                                }
+                                                1 => {
+                                                    // TR
+                                                    *max_u = (*max_u + dx).clamp(0.0, 1.0);
+                                                    *min_v = (*min_v + dy).clamp(0.0, 1.0);
+                                                }
+                                                2 => {
+                                                    // BR
+                                                    *max_u = (*max_u + dx).clamp(0.0, 1.0);
+                                                    *max_v = (*max_v + dy).clamp(0.0, 1.0);
+                                                }
+                                                3 => {
+                                                    // BL
+                                                    *min_u = (*min_u + dx).clamp(0.0, 1.0);
+                                                    *max_v = (*max_v + dy).clamp(0.0, 1.0);
+                                                }
+                                                _ => {}
+                                            }
+                                            // Ensure min <= max
+                                            if *min_u > *max_u {
+                                                std::mem::swap(min_u, max_u);
+                                            }
+                                            if *min_v > *max_v {
+                                                std::mem::swap(min_v, max_v);
+                                            }
+                                            // Keep a simple rectangle surface's box in sync
+                                            // with the crop, so the outline tracks the crop.
+                                            let crop = surf.uv_crop_rect;
+                                            if !surf.is_circular && surf.vertices.len() == 4 {
+                                                surf.vertices = vec![
+                                                    [crop[0], crop[1]],
+                                                    [crop[2], crop[1]],
+                                                    [crop[2], crop[3]],
+                                                    [crop[0], crop[3]],
+                                                ];
+                                            }
+                                        }
+                                        warp_dirty = true;
+                                    }
+                                }
+                                // Draw connecting lines to show crop rect
+                                let crop_line_color =
+                                    Color32::from_rgba_premultiplied(255, 200, 0, 80);
+                                for i in 0..4 {
+                                    let j = (i + 1) % 4;
+                                    painter.line_segment(
+                                        [positions[i], positions[j]],
+                                        egui::Stroke::new(1.0, crop_line_color),
+                                    );
+                                }
+                            }
+
+                            // Draw the selected warp topology and its draggable handles.
+                            match selected_warp {
+                                Some(rustjay_projection::WarpMode::CornerPin { corners }) => {
+                                    let positions = corners.map(|corner| {
+                                        Pos2::new(
+                                            canvas_rect.min.x + corner[0] * canvas_rect.width(),
+                                            canvas_rect.min.y + corner[1] * canvas_rect.height(),
+                                        )
+                                    });
+                                    let line_color =
+                                        Color32::from_rgba_unmultiplied(40, 220, 255, 150);
+                                    for i in 0..4 {
+                                        painter.line_segment(
+                                            [positions[i], positions[(i + 1) % 4]],
+                                            Stroke::new(1.25_f32, line_color),
+                                        );
+                                    }
+
+                                    let label_alignments = [
+                                        (Vec2::new(8.0, 8.0), egui::Align2::LEFT_TOP),
+                                        (Vec2::new(-8.0, 8.0), egui::Align2::RIGHT_TOP),
+                                        (Vec2::new(-8.0, -8.0), egui::Align2::RIGHT_BOTTOM),
+                                        (Vec2::new(8.0, -8.0), egui::Align2::LEFT_BOTTOM),
+                                    ];
+                                    for (i, pos) in positions.into_iter().enumerate() {
+                                        let handle_response = ui.interact(
+                                            Rect::from_center_size(pos, Vec2::splat(10.0)),
+                                            ui.id().with(("corner_pin_handle", i)),
+                                            egui::Sense::drag(),
+                                        );
+                                        let handle_color = if handle_response.dragged() {
+                                            Color32::YELLOW
+                                        } else if handle_response.hovered() {
+                                            Color32::WHITE
+                                        } else {
+                                            Color32::from_rgb(40, 220, 255)
+                                        };
+                                        painter.add(egui::Shape::convex_polygon(
+                                            vec![
+                                                pos + Vec2::new(0.0, -6.0),
+                                                pos + Vec2::new(6.0, 0.0),
+                                                pos + Vec2::new(0.0, 6.0),
+                                                pos + Vec2::new(-6.0, 0.0),
+                                            ],
+                                            handle_color,
+                                            Stroke::new(1.0_f32, Color32::from_black_alpha(180)),
+                                        ));
+                                        let (label_offset, label_alignment) = label_alignments[i];
+                                        painter.text(
+                                            pos + label_offset,
+                                            label_alignment,
+                                            ["TL", "TR", "BR", "BL"][i],
+                                            egui::FontId::proportional(9.0),
+                                            handle_color,
+                                        );
+
+                                        if handle_response.dragged()
+                                            && let Some(pointer_pos) =
+                                                handle_response.interact_pointer_pos()
+                                            && let Some(surf) = state
+                                                .stage
+                                                .surfaces
+                                                .get_mut(state.stage.selected_surface_index)
+                                            && let rustjay_projection::WarpMode::CornerPin {
+                                                corners,
+                                            } = &mut surf.warp
+                                        {
+                                            handle_dragged = true;
+                                            corners[i] =
+                                                canvas_normalized_point(pointer_pos, canvas_rect);
+                                            warp_dirty = true;
+                                        }
+                                    }
+                                }
+                                Some(rustjay_projection::WarpMode::Mesh(mesh)) => {
+                                    let cols = mesh.cols as usize;
+                                    let rows = mesh.rows as usize;
+                                    let mesh_stroke = Stroke::new(
+                                        1.0_f32,
+                                        Color32::from_rgba_unmultiplied(200, 200, 200, 100),
+                                    );
+                                    for row in 0..rows {
+                                        for col in 0..cols.saturating_sub(1) {
+                                            let left = mesh.points.get(row * cols + col);
+                                            let right = mesh.points.get(row * cols + col + 1);
+                                            if let (Some(left), Some(right)) = (left, right) {
+                                                painter.line_segment(
+                                                    [
+                                                        Pos2::new(
+                                                            canvas_rect.min.x
+                                                                + left.position[0]
+                                                                    * canvas_rect.width(),
+                                                            canvas_rect.min.y
+                                                                + left.position[1]
+                                                                    * canvas_rect.height(),
+                                                        ),
+                                                        Pos2::new(
+                                                            canvas_rect.min.x
+                                                                + right.position[0]
+                                                                    * canvas_rect.width(),
+                                                            canvas_rect.min.y
+                                                                + right.position[1]
+                                                                    * canvas_rect.height(),
+                                                        ),
+                                                    ],
+                                                    mesh_stroke,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    for col in 0..cols {
+                                        for row in 0..rows.saturating_sub(1) {
+                                            let top = mesh.points.get(row * cols + col);
+                                            let bottom = mesh.points.get((row + 1) * cols + col);
+                                            if let (Some(top), Some(bottom)) = (top, bottom) {
+                                                painter.line_segment(
+                                                    [
+                                                        Pos2::new(
+                                                            canvas_rect.min.x
+                                                                + top.position[0]
+                                                                    * canvas_rect.width(),
+                                                            canvas_rect.min.y
+                                                                + top.position[1]
+                                                                    * canvas_rect.height(),
+                                                        ),
+                                                        Pos2::new(
+                                                            canvas_rect.min.x
+                                                                + bottom.position[0]
+                                                                    * canvas_rect.width(),
+                                                            canvas_rect.min.y
+                                                                + bottom.position[1]
+                                                                    * canvas_rect.height(),
+                                                        ),
+                                                    ],
+                                                    mesh_stroke,
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    for (i, point) in mesh.points.iter().enumerate() {
+                                        let pos_norm = point.position;
+                                        let pos = Pos2::new(
+                                            canvas_rect.min.x + pos_norm[0] * canvas_rect.width(),
+                                            canvas_rect.min.y + pos_norm[1] * canvas_rect.height(),
+                                        );
+                                        let handle_rect =
+                                            Rect::from_center_size(pos, Vec2::splat(8.0));
+                                        let handle_id = ui.id().with(("mesh_handle", i));
+                                        let handle_response = ui.interact(
+                                            handle_rect,
+                                            handle_id,
+                                            egui::Sense::drag(),
+                                        );
+
+                                        let handle_color = if handle_response.dragged() {
+                                            Color32::YELLOW
+                                        } else if handle_response.hovered() {
+                                            Color32::WHITE
+                                        } else {
+                                            Color32::from_rgb(200, 200, 200)
+                                        };
+                                        painter.circle_filled(pos, 3.0, handle_color);
+
+                                        if handle_response.dragged()
+                                            && let Some(pointer_pos) =
+                                                handle_response.interact_pointer_pos()
+                                            && let Some(surf) = state
+                                                .stage
+                                                .surfaces
+                                                .get_mut(state.stage.selected_surface_index)
+                                            && let rustjay_projection::WarpMode::Mesh(mesh) =
+                                                &mut surf.warp
+                                        {
+                                            handle_dragged = true;
+                                            mesh.points[i].position =
+                                                canvas_normalized_point(pointer_pos, canvas_rect);
+                                            warp_dirty = true;
+                                        }
+                                    }
+                                }
+                                None => {}
+                            }
+
+                            // ── LED surface overlay: dots at placed positions + quad handles ──
+                            // Visible from either layer so surfaces can be placed against
+                            // the strip, but only draggable from LIGHTING — a stray drag
+                            // while reaching for a surface used to move the whole map.
+                            let lighting_live = *layer == StageLayer::Lighting;
+                            let mut led_moved = false;
+                            if let Some(led) = state.stage.led_surface.as_mut() {
+                                let dot = if lighting_live {
+                                    Color32::from_rgb(0, 255, 120)
+                                } else {
+                                    Color32::from_rgb(0, 255, 120).gamma_multiply(0.35)
+                                };
+                                for uv in &led.points {
+                                    let (cu, cv) = led_bilerp(&led.quad, uv[0], uv[1]);
+                                    painter.circle_filled(
+                                        Pos2::new(
+                                            canvas_rect.min.x + cu * canvas_rect.width(),
+                                            canvas_rect.min.y + cv * canvas_rect.height(),
+                                        ),
+                                        2.0,
+                                        dot,
+                                    );
+                                }
+                                let mut corners = [Pos2::ZERO; 4];
+                                for (i, corner) in corners.iter_mut().enumerate() {
+                                    let pos = Pos2::new(
+                                        canvas_rect.min.x + led.quad[i][0] * canvas_rect.width(),
+                                        canvas_rect.min.y + led.quad[i][1] * canvas_rect.height(),
+                                    );
+                                    *corner = pos;
+                                    if !lighting_live {
+                                        continue;
+                                    }
+                                    let hr = ui.interact(
+                                        Rect::from_center_size(pos, Vec2::splat(12.0)),
+                                        ui.id().with(("led_quad_handle", i)),
+                                        egui::Sense::drag(),
+                                    );
+                                    let col = if hr.dragged() {
+                                        Color32::from_rgb(0, 255, 120)
+                                    } else if hr.hovered() {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(120, 220, 160)
+                                    };
+                                    painter.circle_filled(pos, 5.0, col);
+                                    if hr.dragged() {
+                                        handle_dragged = true;
+                                        led.quad[i][0] = (led.quad[i][0]
+                                            + hr.drag_delta().x / canvas_rect.width())
+                                        .clamp(0.0, 1.0);
+                                        led.quad[i][1] = (led.quad[i][1]
+                                            + hr.drag_delta().y / canvas_rect.height())
+                                        .clamp(0.0, 1.0);
+                                    }
+                                }
+                                for i in 0..4 {
+                                    let j = (i + 1) % 4;
+                                    painter.line_segment(
+                                        [corners[i], corners[j]],
+                                        egui::Stroke::new(1.0, Color32::from_rgb(0, 180, 90)),
+                                    );
+                                }
+
+                                // ── Drag the LED quad by its body ───────────────────────
+                                // Same bargain as a surface: corners warp it, the middle
+                                // moves it. Latched on drag start so a fast drag cannot
+                                // slip off the shape and stop mid-gesture.
+                                if lighting_live {
+                                    let norm = |pos: Pos2| {
+                                        [
+                                            (pos.x - canvas_rect.min.x) / canvas_rect.width(),
+                                            (pos.y - canvas_rect.min.y) / canvas_rect.height(),
+                                        ]
+                                    };
+                                    if let Some(pos) = response.hover_pos()
+                                        && !handle_dragged
+                                        && led.contains(norm(pos))
+                                    {
+                                        ui.ctx().set_cursor_icon(if *self_drag_led_slot {
+                                            egui::CursorIcon::Grabbing
+                                        } else {
+                                            egui::CursorIcon::Grab
+                                        });
+                                    }
+                                    if response.drag_started() && !handle_dragged {
+                                        *self_drag_led_slot = response
+                                            .interact_pointer_pos()
+                                            .is_some_and(|pos| led.contains(norm(pos)));
+                                    }
+                                    if *self_drag_led_slot && response.dragged() {
+                                        let d = response.drag_delta();
+                                        led.translate(
+                                            d.x / canvas_rect.width(),
+                                            d.y / canvas_rect.height(),
+                                        );
+                                        handle_dragged = true;
+                                    }
+                                    if response.drag_stopped() && std::mem::take(self_drag_led_slot)
+                                    {
+                                        led_moved = true;
+                                    }
+                                }
+                            }
+
+                            if led_moved {
+                                state.save_workspace();
+                            }
+
+                            let hits = |surf: &KovvbojSurface, pos: Pos2| -> bool {
+                                let nx = (pos.x - canvas_rect.min.x) / canvas_rect.width();
+                                let ny = (pos.y - canvas_rect.min.y) / canvas_rect.height();
+                                let [min_x, min_y, max_x, max_y] = surf.bounding_box(stage_aspect);
+                                nx >= min_x && nx <= max_x && ny >= min_y && ny <= max_y
+                            };
+
+                            // Top-most surface whose box contains a canvas point, if any.
+                            let surface_at =
+                                |state: &KovvbojAppState, pos: Pos2| -> Option<usize> {
+                                    state
+                                        .stage
+                                        .surfaces
+                                        .iter()
+                                        .enumerate()
+                                        .rev()
+                                        .find_map(|(i, surf)| hits(surf, pos).then_some(i))
+                                };
+
+                            // What a drag grabs. The selected surface wins wherever it is
+                            // under the pointer, even with another stacked on top of it:
+                            // you already said which one you meant by selecting it.
+                            //
+                            // Click-select deliberately does *not* do this — it takes the
+                            // top-most, or a surface lying over the selected one could never
+                            // be reached with the mouse.
+                            let grab_at = |state: &KovvbojAppState, pos: Pos2| -> Option<usize> {
+                                let sel = state.stage.selected_surface_index;
+                                if state.stage.surfaces.get(sel).is_some_and(|s| hits(s, pos)) {
+                                    return Some(sel);
+                                }
+                                surface_at(state, pos)
+                            };
+
+                            // Surface selection via canvas click (skip if a handle is being
+                            // dragged, or if another layer owns the canvas).
+                            if *layer == StageLayer::Surfaces
+                                && !handle_dragged
+                                && response.clicked_by(egui::PointerButton::Primary)
+                                && let Some(pos) = response.interact_pointer_pos()
+                                && let Some(i) = surface_at(state, pos)
+                            {
+                                state.stage.selected_surface_index = i;
+                            }
+
+                            if *layer == StageLayer::Surfaces
+                                && !handle_dragged
+                                && let Some(pos) = response.hover_pos()
+                                && grab_at(state, pos).is_some()
+                            {
+                                ui.ctx().set_cursor_icon(if response.dragged() {
+                                    egui::CursorIcon::Grabbing
+                                } else {
+                                    egui::CursorIcon::Grab
+                                });
+                            }
+
+                            // ── Drag a surface by its body ──────────────────────────────
+                            // Corner handles resize and warp; grabbing the middle moves the
+                            // whole thing. The surface is latched on drag start so a fast
+                            // drag that outruns the pointer does not hop to a neighbour.
+                            if *layer == StageLayer::Surfaces {
+                                if response.drag_started() && !handle_dragged {
+                                    *self_drag_surface_slot = response
+                                        .interact_pointer_pos()
+                                        .and_then(|pos| grab_at(state, pos));
+                                    if let Some(i) = *self_drag_surface_slot {
+                                        state.stage.selected_surface_index = i;
+                                    }
+                                }
+                                if let Some(i) = *self_drag_surface_slot
+                                    && response.dragged()
+                                    && let Some(surf) = state.stage.surfaces.get_mut(i)
+                                {
+                                    let d = response.drag_delta();
+                                    surf.translate(
+                                        d.x / canvas_rect.width(),
+                                        d.y / canvas_rect.height(),
+                                        stage_aspect,
+                                    );
+                                    warp_dirty = true;
+                                }
+                                if response.drag_stopped()
+                                    && self_drag_surface_slot.take().is_some()
+                                {
+                                    state.save_workspace();
+                                }
+                            }
+
+                            // ── Laser scan region ───────────────────────────────────────
+                            // Visible from every layer, because the point of drawing it on
+                            // the video canvas at all is to see the beam against the
+                            // surfaces it plays over. Draggable only from LASERS.
+                            let lasers_live = *layer == StageLayer::Lasers;
+                            let mut laser_moved = false;
+                            if let Some(place) = state.stage.laser_placement.as_mut() {
+                                let to_screen = |p: [f32; 2]| {
+                                    Pos2::new(
+                                        canvas_rect.min.x + p[0] * canvas_rect.width(),
+                                        canvas_rect.min.y + p[1] * canvas_rect.height(),
+                                    )
+                                };
+                                let dim = |c: Color32| {
+                                    if lasers_live {
+                                        c
+                                    } else {
+                                        c.gamma_multiply(0.35)
+                                    }
+                                };
+
+                                // The live path, drawn where it would land. Blanked points
+                                // are the beam travelling, not drawing, so they are skipped
+                                // — showing them here would draw a cage the laser does not.
+                                #[cfg(feature = "laser")]
+                                if place.show_path {
+                                    let quad = place.quad;
+                                    state.laser.with_preview(|frame| {
+                                        for w in frame.points.windows(2) {
+                                            if w[0].is_blank() || w[0].shape != w[1].shape {
+                                                continue;
+                                            }
                                             painter.line_segment(
-                                                [Pos2::new(a.x + dx * t0, a.y + dy * t0), Pos2::new(a.x + dx * t1, a.y + dy * t1)],
-                                                Stroke::new(1.5, dash_color),
+                                                [
+                                                    to_screen(crate::stage::quad_map(
+                                                        &quad, w[0].x, w[0].y,
+                                                    )),
+                                                    to_screen(crate::stage::quad_map(
+                                                        &quad, w[1].x, w[1].y,
+                                                    )),
+                                                ],
+                                                Stroke::new(
+                                                    1.0,
+                                                    dim(Color32::from_rgb(
+                                                        (w[0].r * 255.0) as u8,
+                                                        (w[0].g * 255.0) as u8,
+                                                        (w[0].b * 255.0) as u8,
+                                                    )),
+                                                ),
+                                            );
+                                        }
+                                    });
+                                }
+
+                                let outline = dim(Color32::from_rgb(255, 90, 160));
+                                let corners: [Pos2; 4] =
+                                    std::array::from_fn(|i| to_screen(place.quad[i]));
+                                for i in 0..4 {
+                                    painter.line_segment(
+                                        [corners[i], corners[(i + 1) % 4]],
+                                        Stroke::new(1.0, outline),
+                                    );
+                                }
+                                painter.text(
+                                    corners[0] + Vec2::new(4.0, 4.0),
+                                    egui::Align2::LEFT_TOP,
+                                    "LASER",
+                                    egui::FontId::proportional(10.0),
+                                    outline,
+                                );
+
+                                if lasers_live {
+                                    for (i, pos) in corners.into_iter().enumerate() {
+                                        let hr = ui.interact(
+                                            Rect::from_center_size(pos, Vec2::splat(12.0)),
+                                            ui.id().with(("laser_quad_handle", i)),
+                                            egui::Sense::drag(),
+                                        );
+                                        let col = if hr.dragged() {
+                                            Color32::from_rgb(255, 90, 160)
+                                        } else if hr.hovered() {
+                                            Color32::WHITE
+                                        } else {
+                                            Color32::from_rgb(220, 130, 175)
+                                        };
+                                        painter.circle_filled(pos, 5.0, col);
+                                        if hr.dragged() {
+                                            handle_dragged = true;
+                                            place.quad[i][0] = (place.quad[i][0]
+                                                + hr.drag_delta().x / canvas_rect.width())
+                                            .clamp(0.0, 1.0);
+                                            place.quad[i][1] = (place.quad[i][1]
+                                                + hr.drag_delta().y / canvas_rect.height())
+                                            .clamp(0.0, 1.0);
+                                        }
+                                    }
+
+                                    let norm = |pos: Pos2| {
+                                        [
+                                            (pos.x - canvas_rect.min.x) / canvas_rect.width(),
+                                            (pos.y - canvas_rect.min.y) / canvas_rect.height(),
+                                        ]
+                                    };
+                                    if let Some(pos) = response.hover_pos()
+                                        && !handle_dragged
+                                        && place.contains(norm(pos))
+                                    {
+                                        ui.ctx().set_cursor_icon(if *self_drag_laser_slot {
+                                            egui::CursorIcon::Grabbing
+                                        } else {
+                                            egui::CursorIcon::Grab
+                                        });
+                                    }
+                                    if response.drag_started() && !handle_dragged {
+                                        *self_drag_laser_slot = response
+                                            .interact_pointer_pos()
+                                            .is_some_and(|pos| place.contains(norm(pos)));
+                                    }
+                                    if *self_drag_laser_slot && response.dragged() {
+                                        let d = response.drag_delta();
+                                        place.translate(
+                                            d.x / canvas_rect.width(),
+                                            d.y / canvas_rect.height(),
+                                        );
+                                    }
+                                    if response.drag_stopped()
+                                        && std::mem::take(self_drag_laser_slot)
+                                    {
+                                        laser_moved = true;
+                                    }
+                                }
+                            }
+                            if laser_moved {
+                                state.save_workspace();
+                            }
+
+                            // ── Lighting region overlay ──────────────────────────────────
+                            if *layer == StageLayer::Lighting {
+                                let mut light_region_dragged = false;
+                                // Draw all segment regions first, then handles on top of the selected one.
+                                for (oi, light) in state.stage.lighting_outputs.iter().enumerate() {
+                                    if !light.enabled {
+                                        continue;
+                                    }
+                                    let color = egui::Color32::from_rgb(
+                                        ((oi * 73) % 200 + 55) as u8,
+                                        ((oi * 137) % 200 + 55) as u8,
+                                        ((oi * 211) % 200 + 55) as u8,
+                                    );
+                                    for (si, seg) in light.segments.iter().enumerate() {
+                                        if !seg.enabled {
+                                            continue;
+                                        }
+                                        let [u0, v0, u1, v1] = seg.region;
+                                        let min = egui::Pos2::new(
+                                            canvas_rect.min.x + u0 * canvas_rect.width(),
+                                            canvas_rect.min.y + v0 * canvas_rect.height(),
+                                        );
+                                        let max = egui::Pos2::new(
+                                            canvas_rect.min.x + u1 * canvas_rect.width(),
+                                            canvas_rect.min.y + v1 * canvas_rect.height(),
+                                        );
+                                        let rect = egui::Rect::from_min_max(min, max);
+                                        let is_selected = selected_light_segment == &Some((oi, si));
+                                        let stroke_width = if is_selected { 3.0 } else { 1.5 };
+                                        painter.rect_stroke(
+                                            rect,
+                                            egui::CornerRadius::ZERO,
+                                            egui::Stroke::new(stroke_width, color),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        if is_selected {
+                                            painter.rect_filled(
+                                                rect,
+                                                egui::CornerRadius::ZERO,
+                                                color.linear_multiply(0.12),
+                                            );
+                                        }
+                                        let label = format!("{} / {}", light.name, seg.name);
+                                        painter.text(
+                                            min + egui::Vec2::new(4.0, 2.0),
+                                            egui::Align2::LEFT_TOP,
+                                            label,
+                                            egui::FontId::proportional(11.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
+                                }
+
+                                // Drag handles for the selected segment.
+                                if let Some((sel_oi, sel_si)) = *selected_light_segment {
+                                    let handle_labels = ["TL", "TR", "BR", "BL"];
+                                    let mut handle_positions = [egui::Pos2::ZERO; 4];
+                                    let mut corners_opt: Option<[[f32; 2]; 4]> = None;
+                                    if let Some(light) = state.stage.lighting_outputs.get(sel_oi)
+                                        && let Some(seg) = light.segments.get(sel_si)
+                                    {
+                                        let [u0, v0, u1, v1] = seg.region;
+                                        corners_opt =
+                                            Some([[u0, v0], [u1, v0], [u1, v1], [u0, v1]]);
+                                    }
+                                    if let Some(corners) = corners_opt {
+                                        for (hi, corner) in corners.iter().enumerate() {
+                                            let pos = egui::Pos2::new(
+                                                canvas_rect.min.x + corner[0] * canvas_rect.width(),
+                                                canvas_rect.min.y
+                                                    + corner[1] * canvas_rect.height(),
+                                            );
+                                            handle_positions[hi] = pos;
+                                            let handle_rect = egui::Rect::from_center_size(
+                                                pos,
+                                                egui::Vec2::splat(12.0),
+                                            );
+                                            let handle_id = ui.id().with((
+                                                "light_region_handle",
+                                                sel_oi,
+                                                sel_si,
+                                                hi,
+                                            ));
+                                            let handle_response = ui.interact(
+                                                handle_rect,
+                                                handle_id,
+                                                egui::Sense::drag(),
+                                            );
+                                            let handle_color = if handle_response.dragged() {
+                                                egui::Color32::YELLOW
+                                            } else if handle_response.hovered() {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                egui::Color32::from_gray(180)
+                                            };
+                                            painter.circle_filled(pos, 5.0, handle_color);
+                                            painter.text(
+                                                pos - egui::Vec2::new(0.0, 8.0),
+                                                egui::Align2::CENTER_BOTTOM,
+                                                handle_labels[hi],
+                                                egui::FontId::proportional(9.0),
+                                                egui::Color32::from_gray(200),
+                                            );
+                                            if handle_response.dragged() {
+                                                light_region_dragged = true;
+                                                let dx = handle_response.drag_delta().x
+                                                    / canvas_rect.width();
+                                                let dy = handle_response.drag_delta().y
+                                                    / canvas_rect.height();
+                                                if let Some(light) =
+                                                    state.stage.lighting_outputs.get_mut(sel_oi)
+                                                    && let Some(seg) =
+                                                        light.segments.get_mut(sel_si)
+                                                {
+                                                    let [min_u, min_v, max_u, max_v] =
+                                                        &mut seg.region;
+                                                    match hi {
+                                                        0 => {
+                                                            *min_u = (*min_u + dx).clamp(0.0, 1.0);
+                                                            *min_v = (*min_v + dy).clamp(0.0, 1.0);
+                                                        }
+                                                        1 => {
+                                                            *max_u = (*max_u + dx).clamp(0.0, 1.0);
+                                                            *min_v = (*min_v + dy).clamp(0.0, 1.0);
+                                                        }
+                                                        2 => {
+                                                            *max_u = (*max_u + dx).clamp(0.0, 1.0);
+                                                            *max_v = (*max_v + dy).clamp(0.0, 1.0);
+                                                        }
+                                                        3 => {
+                                                            *min_u = (*min_u + dx).clamp(0.0, 1.0);
+                                                            *max_v = (*max_v + dy).clamp(0.0, 1.0);
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                    if *min_u > *max_u {
+                                                        std::mem::swap(min_u, max_u);
+                                                    }
+                                                    if *min_v > *max_v {
+                                                        std::mem::swap(min_v, max_v);
+                                                    }
+                                                    regions_dirty = true;
+                                                }
+                                            }
+                                        }
+                                        for hi in 0..4 {
+                                            let j = (hi + 1) % 4;
+                                            painter.line_segment(
+                                                [handle_positions[hi], handle_positions[j]],
+                                                egui::Stroke::new(1.0, egui::Color32::YELLOW),
                                             );
                                         }
                                     }
                                 }
-                            }
-                        }
-                    }
-                }
 
-                // ── UV crop drag handles ───────────────────────────────────
-                // Corner handles on the stage canvas now control the UV sampling
-                // region (which part of the source texture is shown), not the
-                // output warp. Warp modes draw their own distinct handles below.
-                let mut handle_dragged = false;
-
-                // Every surface handle — UV crop, corner-pin, mesh — hangs off
-                // these two bindings, so the layer gate goes here rather than on
-                // each drag site.
-                let surfaces_live = *layer == StageLayer::Surfaces;
-
-                let uv_handles: Option<[[f32; 2]; 4]> = state.stage.surfaces
-                    .get(state.stage.selected_surface_index)
-                    .filter(|_| surfaces_live)
-                    .map(|s| {
-                        let [min_u, min_v, max_u, max_v] = s.uv_crop_rect;
-                        [
-                            [min_u, min_v], // TL
-                            [max_u, min_v], // TR
-                            [max_u, max_v], // BR
-                            [min_u, max_v], // BL
-                        ]
-                    });
-
-                let selected_warp = state.stage.surfaces
-                    .get(state.stage.selected_surface_index)
-                    .filter(|_| surfaces_live)
-                    .map(|surface| surface.warp.clone());
-
-                // Draw UV crop handles and connecting rectangle
-                if let Some(corners) = uv_handles {
-                    let handle_labels = ["TL", "TR", "BR", "BL"];
-                    let mut positions = [Pos2::ZERO; 4];
-                    for (i, corner) in corners.iter().enumerate() {
-                        let pos = Pos2::new(
-                            canvas_rect.min.x + corner[0] * canvas_rect.width(),
-                            canvas_rect.min.y + corner[1] * canvas_rect.height(),
-                        );
-                        positions[i] = pos;
-                        let handle_rect = Rect::from_center_size(pos, Vec2::splat(18.0));
-                        let handle_id = ui.id().with(("uv_crop_handle", i));
-                        let handle_response = ui.interact(handle_rect, handle_id, egui::Sense::drag());
-
-                        let handle_color = if handle_response.dragged() {
-                            Color32::from_rgb(255, 200, 0) // amber for UV crop
-                        } else if handle_response.hovered() {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(220, 160, 20)
-                        };
-                        painter.circle_filled(pos, 7.0, Color32::from_black_alpha(140));
-                        painter.circle_stroke(pos, 7.0, Stroke::new(2.0_f32, handle_color));
-
-                        // Label
-                        painter.text(
-                            pos - Vec2::new(0.0, 8.0),
-                            egui::Align2::CENTER_BOTTOM,
-                            handle_labels[i],
-                            egui::FontId::proportional(9.0),
-                            Color32::from_rgb(200, 200, 200),
-                        );
-
-                        if handle_response.dragged() {
-                            handle_dragged = true;
-                            let dx = handle_response.drag_delta().x / canvas_rect.width();
-                            let dy = handle_response.drag_delta().y / canvas_rect.height();
-                            if let Some(surf) = state.stage.surfaces.get_mut(state.stage.selected_surface_index) {
-                                let [min_u, min_v, max_u, max_v] = &mut surf.uv_crop_rect;
-                                match i {
-                                    0 => { // TL
-                                        *min_u = (*min_u + dx).clamp(0.0, 1.0);
-                                        *min_v = (*min_v + dy).clamp(0.0, 1.0);
-                                    }
-                                    1 => { // TR
-                                        *max_u = (*max_u + dx).clamp(0.0, 1.0);
-                                        *min_v = (*min_v + dy).clamp(0.0, 1.0);
-                                    }
-                                    2 => { // BR
-                                        *max_u = (*max_u + dx).clamp(0.0, 1.0);
-                                        *max_v = (*max_v + dy).clamp(0.0, 1.0);
-                                    }
-                                    3 => { // BL
-                                        *min_u = (*min_u + dx).clamp(0.0, 1.0);
-                                        *max_v = (*max_v + dy).clamp(0.0, 1.0);
-                                    }
-                                    _ => {}
-                                }
-                                // Ensure min <= max
-                                if *min_u > *max_u { std::mem::swap(min_u, max_u); }
-                                if *min_v > *max_v { std::mem::swap(min_v, max_v); }
-                                // Keep a simple rectangle surface's box in sync
-                                // with the crop, so the outline tracks the crop.
-                                let crop = surf.uv_crop_rect;
-                                if !surf.is_circular && surf.vertices.len() == 4 {
-                                    surf.vertices = vec![
-                                        [crop[0], crop[1]],
-                                        [crop[2], crop[1]],
-                                        [crop[2], crop[3]],
-                                        [crop[0], crop[3]],
-                                    ];
-                                }
-                            }
-                            warp_dirty = true;
-                        }
-                    }
-                    // Draw connecting lines to show crop rect
-                    let crop_line_color = Color32::from_rgba_premultiplied(255, 200, 0, 80);
-                    for i in 0..4 {
-                        let j = (i + 1) % 4;
-                        painter.line_segment([positions[i], positions[j]], egui::Stroke::new(1.0, crop_line_color));
-                    }
-                }
-
-                // Draw the selected warp topology and its draggable handles.
-                match selected_warp {
-                    Some(rustjay_projection::WarpMode::CornerPin { corners }) => {
-                        let positions = corners.map(|corner| {
-                            Pos2::new(
-                                canvas_rect.min.x + corner[0] * canvas_rect.width(),
-                                canvas_rect.min.y + corner[1] * canvas_rect.height(),
-                            )
-                        });
-                        let line_color = Color32::from_rgba_unmultiplied(40, 220, 255, 150);
-                        for i in 0..4 {
-                            painter.line_segment(
-                                [positions[i], positions[(i + 1) % 4]],
-                                Stroke::new(1.25_f32, line_color),
-                            );
-                        }
-
-                        let label_alignments = [
-                            (Vec2::new(8.0, 8.0), egui::Align2::LEFT_TOP),
-                            (Vec2::new(-8.0, 8.0), egui::Align2::RIGHT_TOP),
-                            (Vec2::new(-8.0, -8.0), egui::Align2::RIGHT_BOTTOM),
-                            (Vec2::new(8.0, -8.0), egui::Align2::LEFT_BOTTOM),
-                        ];
-                        for (i, pos) in positions.into_iter().enumerate() {
-                            let handle_response = ui.interact(
-                                Rect::from_center_size(pos, Vec2::splat(10.0)),
-                                ui.id().with(("corner_pin_handle", i)),
-                                egui::Sense::drag(),
-                            );
-                            let handle_color = if handle_response.dragged() {
-                                Color32::YELLOW
-                            } else if handle_response.hovered() {
-                                Color32::WHITE
-                            } else {
-                                Color32::from_rgb(40, 220, 255)
-                            };
-                            painter.add(egui::Shape::convex_polygon(
-                                vec![
-                                    pos + Vec2::new(0.0, -6.0),
-                                    pos + Vec2::new(6.0, 0.0),
-                                    pos + Vec2::new(0.0, 6.0),
-                                    pos + Vec2::new(-6.0, 0.0),
-                                ],
-                                handle_color,
-                                Stroke::new(1.0_f32, Color32::from_black_alpha(180)),
-                            ));
-                            let (label_offset, label_alignment) = label_alignments[i];
-                            painter.text(
-                                pos + label_offset,
-                                label_alignment,
-                                ["TL", "TR", "BR", "BL"][i],
-                                egui::FontId::proportional(9.0),
-                                handle_color,
-                            );
-
-                            if handle_response.dragged()
-                                && let Some(pointer_pos) = handle_response.interact_pointer_pos()
-                                && let Some(surf) = state
-                                    .stage
-                                    .surfaces
-                                    .get_mut(state.stage.selected_surface_index)
-                                && let rustjay_projection::WarpMode::CornerPin { corners } =
-                                    &mut surf.warp
-                            {
-                                handle_dragged = true;
-                                corners[i] = canvas_normalized_point(pointer_pos, canvas_rect);
-                                warp_dirty = true;
-                            }
-                        }
-                    }
-                    Some(rustjay_projection::WarpMode::Mesh(mesh)) => {
-                        let cols = mesh.cols as usize;
-                        let rows = mesh.rows as usize;
-                        let mesh_stroke = Stroke::new(
-                            1.0_f32,
-                            Color32::from_rgba_unmultiplied(200, 200, 200, 100),
-                        );
-                        for row in 0..rows {
-                            for col in 0..cols.saturating_sub(1) {
-                                let left = mesh.points.get(row * cols + col);
-                                let right = mesh.points.get(row * cols + col + 1);
-                                if let (Some(left), Some(right)) = (left, right) {
-                                    painter.line_segment(
-                                        [
-                                            Pos2::new(
-                                                canvas_rect.min.x
-                                                    + left.position[0] * canvas_rect.width(),
-                                                canvas_rect.min.y
-                                                    + left.position[1] * canvas_rect.height(),
-                                            ),
-                                            Pos2::new(
-                                                canvas_rect.min.x
-                                                    + right.position[0] * canvas_rect.width(),
-                                                canvas_rect.min.y
-                                                    + right.position[1] * canvas_rect.height(),
-                                            ),
-                                        ],
-                                        mesh_stroke,
-                                    );
-                                }
-                            }
-                        }
-                        for col in 0..cols {
-                            for row in 0..rows.saturating_sub(1) {
-                                let top = mesh.points.get(row * cols + col);
-                                let bottom = mesh.points.get((row + 1) * cols + col);
-                                if let (Some(top), Some(bottom)) = (top, bottom) {
-                                    painter.line_segment(
-                                        [
-                                            Pos2::new(
-                                                canvas_rect.min.x
-                                                    + top.position[0] * canvas_rect.width(),
-                                                canvas_rect.min.y
-                                                    + top.position[1] * canvas_rect.height(),
-                                            ),
-                                            Pos2::new(
-                                                canvas_rect.min.x
-                                                    + bottom.position[0] * canvas_rect.width(),
-                                                canvas_rect.min.y
-                                                    + bottom.position[1] * canvas_rect.height(),
-                                            ),
-                                        ],
-                                        mesh_stroke,
-                                    );
-                                }
-                            }
-                        }
-
-                        for (i, point) in mesh.points.iter().enumerate() {
-                            let pos_norm = point.position;
-                            let pos = Pos2::new(
-                                canvas_rect.min.x + pos_norm[0] * canvas_rect.width(),
-                                canvas_rect.min.y + pos_norm[1] * canvas_rect.height(),
-                            );
-                            let handle_rect = Rect::from_center_size(pos, Vec2::splat(8.0));
-                            let handle_id = ui.id().with(("mesh_handle", i));
-                            let handle_response = ui.interact(handle_rect, handle_id, egui::Sense::drag());
-
-                            let handle_color = if handle_response.dragged() {
-                                Color32::YELLOW
-                            } else if handle_response.hovered() {
-                                Color32::WHITE
-                            } else {
-                                Color32::from_rgb(200, 200, 200)
-                            };
-                            painter.circle_filled(pos, 3.0, handle_color);
-
-                            if handle_response.dragged()
-                                && let Some(pointer_pos) = handle_response.interact_pointer_pos()
-                                && let Some(surf) = state
-                                    .stage
-                                    .surfaces
-                                    .get_mut(state.stage.selected_surface_index)
-                                && let rustjay_projection::WarpMode::Mesh(mesh) = &mut surf.warp
-                            {
-                                handle_dragged = true;
-                                mesh.points[i].position =
-                                    canvas_normalized_point(pointer_pos, canvas_rect);
-                                warp_dirty = true;
-                            }
-                        }
-                    }
-                    None => {}
-                }
-
-                // ── LED surface overlay: dots at placed positions + quad handles ──
-                // Visible from either layer so surfaces can be placed against
-                // the strip, but only draggable from LIGHTING — a stray drag
-                // while reaching for a surface used to move the whole map.
-                let lighting_live = *layer == StageLayer::Lighting;
-                let mut led_moved = false;
-                if let Some(led) = state.stage.led_surface.as_mut() {
-                    let dot = if lighting_live {
-                        Color32::from_rgb(0, 255, 120)
-                    } else {
-                        Color32::from_rgb(0, 255, 120).gamma_multiply(0.35)
-                    };
-                    for uv in &led.points {
-                        let (cu, cv) = led_bilerp(&led.quad, uv[0], uv[1]);
-                        painter.circle_filled(
-                            Pos2::new(
-                                canvas_rect.min.x + cu * canvas_rect.width(),
-                                canvas_rect.min.y + cv * canvas_rect.height(),
-                            ),
-                            2.0,
-                            dot,
-                        );
-                    }
-                    let mut corners = [Pos2::ZERO; 4];
-                    for (i, corner) in corners.iter_mut().enumerate() {
-                        let pos = Pos2::new(
-                            canvas_rect.min.x + led.quad[i][0] * canvas_rect.width(),
-                            canvas_rect.min.y + led.quad[i][1] * canvas_rect.height(),
-                        );
-                        *corner = pos;
-                        if !lighting_live {
-                            continue;
-                        }
-                        let hr = ui.interact(
-                            Rect::from_center_size(pos, Vec2::splat(12.0)),
-                            ui.id().with(("led_quad_handle", i)),
-                            egui::Sense::drag(),
-                        );
-                        let col = if hr.dragged() {
-                            Color32::from_rgb(0, 255, 120)
-                        } else if hr.hovered() {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(120, 220, 160)
-                        };
-                        painter.circle_filled(pos, 5.0, col);
-                        if hr.dragged() {
-                            handle_dragged = true;
-                            led.quad[i][0] =
-                                (led.quad[i][0] + hr.drag_delta().x / canvas_rect.width()).clamp(0.0, 1.0);
-                            led.quad[i][1] =
-                                (led.quad[i][1] + hr.drag_delta().y / canvas_rect.height()).clamp(0.0, 1.0);
-                        }
-                    }
-                    for i in 0..4 {
-                        let j = (i + 1) % 4;
-                        painter.line_segment(
-                            [corners[i], corners[j]],
-                            egui::Stroke::new(1.0, Color32::from_rgb(0, 180, 90)),
-                        );
-                    }
-
-                    // ── Drag the LED quad by its body ───────────────────────
-                    // Same bargain as a surface: corners warp it, the middle
-                    // moves it. Latched on drag start so a fast drag cannot
-                    // slip off the shape and stop mid-gesture.
-                    if lighting_live {
-                        let norm = |pos: Pos2| {
-                            [
-                                (pos.x - canvas_rect.min.x) / canvas_rect.width(),
-                                (pos.y - canvas_rect.min.y) / canvas_rect.height(),
-                            ]
-                        };
-                        if let Some(pos) = response.hover_pos()
-                            && !handle_dragged
-                            && led.contains(norm(pos))
-                        {
-                            ui.ctx().set_cursor_icon(if *self_drag_led_slot {
-                                egui::CursorIcon::Grabbing
-                            } else {
-                                egui::CursorIcon::Grab
-                            });
-                        }
-                        if response.drag_started() && !handle_dragged {
-                            *self_drag_led_slot = response
-                                .interact_pointer_pos()
-                                .is_some_and(|pos| led.contains(norm(pos)));
-                        }
-                        if *self_drag_led_slot && response.dragged() {
-                            let d = response.drag_delta();
-                            led.translate(
-                                d.x / canvas_rect.width(),
-                                d.y / canvas_rect.height(),
-                            );
-                            handle_dragged = true;
-                        }
-                        if response.drag_stopped() && std::mem::take(self_drag_led_slot) {
-                            led_moved = true;
-                        }
-                    }
-                }
-
-                if led_moved {
-                    state.save_workspace();
-                }
-
-                let hits = |surf: &KovvbojSurface, pos: Pos2| -> bool {
-                    let nx = (pos.x - canvas_rect.min.x) / canvas_rect.width();
-                    let ny = (pos.y - canvas_rect.min.y) / canvas_rect.height();
-                    let [min_x, min_y, max_x, max_y] = surf.bounding_box(stage_aspect);
-                    nx >= min_x && nx <= max_x && ny >= min_y && ny <= max_y
-                };
-
-                // Top-most surface whose box contains a canvas point, if any.
-                let surface_at = |state: &KovvbojAppState, pos: Pos2| -> Option<usize> {
-                    state
-                        .stage
-                        .surfaces
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find_map(|(i, surf)| hits(surf, pos).then_some(i))
-                };
-
-                // What a drag grabs. The selected surface wins wherever it is
-                // under the pointer, even with another stacked on top of it:
-                // you already said which one you meant by selecting it.
-                //
-                // Click-select deliberately does *not* do this — it takes the
-                // top-most, or a surface lying over the selected one could never
-                // be reached with the mouse.
-                let grab_at = |state: &KovvbojAppState, pos: Pos2| -> Option<usize> {
-                    let sel = state.stage.selected_surface_index;
-                    if state.stage.surfaces.get(sel).is_some_and(|s| hits(s, pos)) {
-                        return Some(sel);
-                    }
-                    surface_at(state, pos)
-                };
-
-                // Surface selection via canvas click (skip if a handle is being
-                // dragged, or if another layer owns the canvas).
-                if *layer == StageLayer::Surfaces
-                    && !handle_dragged
-                    && response.clicked_by(egui::PointerButton::Primary)
-                    && let Some(pos) = response.interact_pointer_pos()
-                    && let Some(i) = surface_at(state, pos)
-                {
-                    state.stage.selected_surface_index = i;
-                }
-
-                if *layer == StageLayer::Surfaces
-                    && !handle_dragged
-                    && let Some(pos) = response.hover_pos()
-                    && grab_at(state, pos).is_some()
-                {
-                    ui.ctx().set_cursor_icon(if response.dragged() {
-                        egui::CursorIcon::Grabbing
-                    } else {
-                        egui::CursorIcon::Grab
-                    });
-                }
-
-                // ── Drag a surface by its body ──────────────────────────────
-                // Corner handles resize and warp; grabbing the middle moves the
-                // whole thing. The surface is latched on drag start so a fast
-                // drag that outruns the pointer does not hop to a neighbour.
-                if *layer == StageLayer::Surfaces {
-                    if response.drag_started() && !handle_dragged {
-                        *self_drag_surface_slot = response
-                            .interact_pointer_pos()
-                            .and_then(|pos| grab_at(state, pos));
-                        if let Some(i) = *self_drag_surface_slot {
-                            state.stage.selected_surface_index = i;
-                        }
-                    }
-                    if let Some(i) = *self_drag_surface_slot
-                        && response.dragged()
-                        && let Some(surf) = state.stage.surfaces.get_mut(i)
-                    {
-                        let d = response.drag_delta();
-                        surf.translate(
-                            d.x / canvas_rect.width(),
-                            d.y / canvas_rect.height(),
-                            stage_aspect,
-                        );
-                        warp_dirty = true;
-                    }
-                    if response.drag_stopped() && self_drag_surface_slot.take().is_some() {
-                        state.save_workspace();
-                    }
-                }
-
-                // ── Laser scan region ───────────────────────────────────────
-                // Visible from every layer, because the point of drawing it on
-                // the video canvas at all is to see the beam against the
-                // surfaces it plays over. Draggable only from LASERS.
-                let lasers_live = *layer == StageLayer::Lasers;
-                let mut laser_moved = false;
-                if let Some(place) = state.stage.laser_placement.as_mut() {
-                    let to_screen = |p: [f32; 2]| {
-                        Pos2::new(
-                            canvas_rect.min.x + p[0] * canvas_rect.width(),
-                            canvas_rect.min.y + p[1] * canvas_rect.height(),
-                        )
-                    };
-                    let dim = |c: Color32| if lasers_live { c } else { c.gamma_multiply(0.35) };
-
-                    // The live path, drawn where it would land. Blanked points
-                    // are the beam travelling, not drawing, so they are skipped
-                    // — showing them here would draw a cage the laser does not.
-                    #[cfg(feature = "laser")]
-                    if place.show_path {
-                        let quad = place.quad;
-                        state.laser.with_preview(|frame| {
-                            for w in frame.points.windows(2) {
-                                if w[0].is_blank() || w[0].shape != w[1].shape {
-                                    continue;
-                                }
-                                painter.line_segment(
-                                    [
-                                        to_screen(crate::stage::quad_map(&quad, w[0].x, w[0].y)),
-                                        to_screen(crate::stage::quad_map(&quad, w[1].x, w[1].y)),
-                                    ],
-                                    Stroke::new(
-                                        1.0,
-                                        dim(Color32::from_rgb(
-                                            (w[0].r * 255.0) as u8,
-                                            (w[0].g * 255.0) as u8,
-                                            (w[0].b * 255.0) as u8,
-                                        )),
-                                    ),
-                                );
-                            }
-                        });
-                    }
-
-                    let outline = dim(Color32::from_rgb(255, 90, 160));
-                    let corners: [Pos2; 4] = std::array::from_fn(|i| to_screen(place.quad[i]));
-                    for i in 0..4 {
-                        painter.line_segment(
-                            [corners[i], corners[(i + 1) % 4]],
-                            Stroke::new(1.0, outline),
-                        );
-                    }
-                    painter.text(
-                        corners[0] + Vec2::new(4.0, 4.0),
-                        egui::Align2::LEFT_TOP,
-                        "LASER",
-                        egui::FontId::proportional(10.0),
-                        outline,
-                    );
-
-                    if lasers_live {
-                        for (i, pos) in corners.into_iter().enumerate() {
-                            let hr = ui.interact(
-                                Rect::from_center_size(pos, Vec2::splat(12.0)),
-                                ui.id().with(("laser_quad_handle", i)),
-                                egui::Sense::drag(),
-                            );
-                            let col = if hr.dragged() {
-                                Color32::from_rgb(255, 90, 160)
-                            } else if hr.hovered() {
-                                Color32::WHITE
-                            } else {
-                                Color32::from_rgb(220, 130, 175)
-                            };
-                            painter.circle_filled(pos, 5.0, col);
-                            if hr.dragged() {
-                                handle_dragged = true;
-                                place.quad[i][0] = (place.quad[i][0]
-                                    + hr.drag_delta().x / canvas_rect.width())
-                                .clamp(0.0, 1.0);
-                                place.quad[i][1] = (place.quad[i][1]
-                                    + hr.drag_delta().y / canvas_rect.height())
-                                .clamp(0.0, 1.0);
-                            }
-                        }
-
-                        let norm = |pos: Pos2| {
-                            [
-                                (pos.x - canvas_rect.min.x) / canvas_rect.width(),
-                                (pos.y - canvas_rect.min.y) / canvas_rect.height(),
-                            ]
-                        };
-                        if let Some(pos) = response.hover_pos()
-                            && !handle_dragged
-                            && place.contains(norm(pos))
-                        {
-                            ui.ctx().set_cursor_icon(if *self_drag_laser_slot {
-                                egui::CursorIcon::Grabbing
-                            } else {
-                                egui::CursorIcon::Grab
-                            });
-                        }
-                        if response.drag_started() && !handle_dragged {
-                            *self_drag_laser_slot = response
-                                .interact_pointer_pos()
-                                .is_some_and(|pos| place.contains(norm(pos)));
-                        }
-                        if *self_drag_laser_slot && response.dragged() {
-                            let d = response.drag_delta();
-                            place.translate(
-                                d.x / canvas_rect.width(),
-                                d.y / canvas_rect.height(),
-                            );
-                        }
-                        if response.drag_stopped() && std::mem::take(self_drag_laser_slot) {
-                            laser_moved = true;
-                        }
-                    }
-                }
-                if laser_moved {
-                    state.save_workspace();
-                }
-
-                // ── Lighting region overlay ──────────────────────────────────
-                if *layer == StageLayer::Lighting {
-                    let mut light_region_dragged = false;
-                    // Draw all segment regions first, then handles on top of the selected one.
-                    for (oi, light) in state.stage.lighting_outputs.iter().enumerate() {
-                        if !light.enabled {
-                            continue;
-                        }
-                        let color = egui::Color32::from_rgb(
-                            ((oi * 73) % 200 + 55) as u8,
-                            ((oi * 137) % 200 + 55) as u8,
-                            ((oi * 211) % 200 + 55) as u8,
-                        );
-                        for (si, seg) in light.segments.iter().enumerate() {
-                            if !seg.enabled {
-                                continue;
-                            }
-                            let [u0, v0, u1, v1] = seg.region;
-                            let min = egui::Pos2::new(
-                                canvas_rect.min.x + u0 * canvas_rect.width(),
-                                canvas_rect.min.y + v0 * canvas_rect.height(),
-                            );
-                            let max = egui::Pos2::new(
-                                canvas_rect.min.x + u1 * canvas_rect.width(),
-                                canvas_rect.min.y + v1 * canvas_rect.height(),
-                            );
-                            let rect = egui::Rect::from_min_max(min, max);
-                            let is_selected = selected_light_segment == &Some((oi, si));
-                            let stroke_width = if is_selected { 3.0 } else { 1.5 };
-                            painter.rect_stroke(
-                                rect,
-                                egui::CornerRadius::ZERO,
-                                egui::Stroke::new(stroke_width, color),
-                                egui::StrokeKind::Inside,
-                            );
-                            if is_selected {
-                                painter.rect_filled(rect, egui::CornerRadius::ZERO, color.linear_multiply(0.12));
-                            }
-                            let label = format!("{} / {}", light.name, seg.name);
-                            painter.text(
-                                min + egui::Vec2::new(4.0, 2.0),
-                                egui::Align2::LEFT_TOP,
-                                label,
-                                egui::FontId::proportional(11.0),
-                                egui::Color32::WHITE,
-                            );
-                        }
-                    }
-
-                    // Drag handles for the selected segment.
-                    if let Some((sel_oi, sel_si)) = *selected_light_segment {
-                        let handle_labels = ["TL", "TR", "BR", "BL"];
-                        let mut handle_positions = [egui::Pos2::ZERO; 4];
-                        let mut corners_opt: Option<[[f32; 2]; 4]> = None;
-                        if let Some(light) = state.stage.lighting_outputs.get(sel_oi)
-                            && let Some(seg) = light.segments.get(sel_si)
-                        {
-                            let [u0, v0, u1, v1] = seg.region;
-                            corners_opt = Some([
-                                [u0, v0],
-                                [u1, v0],
-                                [u1, v1],
-                                [u0, v1],
-                            ]);
-                        }
-                        if let Some(corners) = corners_opt {
-                            for (hi, corner) in corners.iter().enumerate() {
-                                let pos = egui::Pos2::new(
-                                    canvas_rect.min.x + corner[0] * canvas_rect.width(),
-                                    canvas_rect.min.y + corner[1] * canvas_rect.height(),
-                                );
-                                handle_positions[hi] = pos;
-                                let handle_rect = egui::Rect::from_center_size(pos, egui::Vec2::splat(12.0));
-                                let handle_id = ui.id().with(("light_region_handle", sel_oi, sel_si, hi));
-                                let handle_response = ui.interact(handle_rect, handle_id, egui::Sense::drag());
-                                let handle_color = if handle_response.dragged() {
-                                    egui::Color32::YELLOW
-                                } else if handle_response.hovered() {
-                                    egui::Color32::WHITE
-                                } else {
-                                    egui::Color32::from_gray(180)
-                                };
-                                painter.circle_filled(pos, 5.0, handle_color);
-                                painter.text(
-                                    pos - egui::Vec2::new(0.0, 8.0),
-                                    egui::Align2::CENTER_BOTTOM,
-                                    handle_labels[hi],
-                                    egui::FontId::proportional(9.0),
-                                    egui::Color32::from_gray(200),
-                                );
-                                if handle_response.dragged() {
-                                    light_region_dragged = true;
-                                    let dx = handle_response.drag_delta().x / canvas_rect.width();
-                                    let dy = handle_response.drag_delta().y / canvas_rect.height();
-                                    if let Some(light) = state.stage.lighting_outputs.get_mut(sel_oi)
-                                        && let Some(seg) = light.segments.get_mut(sel_si)
-                                    {
-                                        let [min_u, min_v, max_u, max_v] = &mut seg.region;
-                                        match hi {
-                                            0 => { *min_u = (*min_u + dx).clamp(0.0, 1.0); *min_v = (*min_v + dy).clamp(0.0, 1.0); }
-                                            1 => { *max_u = (*max_u + dx).clamp(0.0, 1.0); *min_v = (*min_v + dy).clamp(0.0, 1.0); }
-                                            2 => { *max_u = (*max_u + dx).clamp(0.0, 1.0); *max_v = (*max_v + dy).clamp(0.0, 1.0); }
-                                            3 => { *min_u = (*min_u + dx).clamp(0.0, 1.0); *max_v = (*max_v + dy).clamp(0.0, 1.0); }
-                                            _ => {}
-                                        }
-                                        if *min_u > *max_u { std::mem::swap(min_u, max_u); }
-                                        if *min_v > *max_v { std::mem::swap(min_v, max_v); }
-                                        regions_dirty = true;
-                                    }
-                                }
-                            }
-                            for hi in 0..4 {
-                                let j = (hi + 1) % 4;
-                                painter.line_segment([handle_positions[hi], handle_positions[j]], egui::Stroke::new(1.0, egui::Color32::YELLOW));
-                            }
-                        }
-                    }
-
-                    // Select a segment by clicking inside its region.
-                    if !light_region_dragged && response.clicked_by(egui::PointerButton::Primary)
-                        && let Some(pos) = response.interact_pointer_pos()
-                    {
-                        let norm_x = (pos.x - canvas_rect.min.x) / canvas_rect.width();
-                        let norm_y = (pos.y - canvas_rect.min.y) / canvas_rect.height();
-                        let mut new_selection: Option<(usize, usize)> = None;
-                        for (oi, light) in state.stage.lighting_outputs.iter().enumerate().rev() {
-                            if !light.enabled {
-                                continue;
-                            }
-                            for (si, seg) in light.segments.iter().enumerate().rev() {
-                                if !seg.enabled {
-                                    continue;
-                                }
-                                let [u0, v0, u1, v1] = seg.region;
-                                if norm_x >= u0.min(u1) && norm_x <= u0.max(u1)
-                                    && norm_y >= v0.min(v1) && norm_y <= v0.max(v1)
+                                // Select a segment by clicking inside its region.
+                                if !light_region_dragged
+                                    && response.clicked_by(egui::PointerButton::Primary)
+                                    && let Some(pos) = response.interact_pointer_pos()
                                 {
-                                    new_selection = Some((oi, si));
-                                    break;
+                                    let norm_x = (pos.x - canvas_rect.min.x) / canvas_rect.width();
+                                    let norm_y = (pos.y - canvas_rect.min.y) / canvas_rect.height();
+                                    let mut new_selection: Option<(usize, usize)> = None;
+                                    for (oi, light) in
+                                        state.stage.lighting_outputs.iter().enumerate().rev()
+                                    {
+                                        if !light.enabled {
+                                            continue;
+                                        }
+                                        for (si, seg) in light.segments.iter().enumerate().rev() {
+                                            if !seg.enabled {
+                                                continue;
+                                            }
+                                            let [u0, v0, u1, v1] = seg.region;
+                                            if norm_x >= u0.min(u1)
+                                                && norm_x <= u0.max(u1)
+                                                && norm_y >= v0.min(v1)
+                                                && norm_y <= v0.max(v1)
+                                            {
+                                                new_selection = Some((oi, si));
+                                                break;
+                                            }
+                                        }
+                                        if new_selection.is_some() {
+                                            break;
+                                        }
+                                    }
+                                    *selected_light_segment = new_selection;
                                 }
                             }
-                            if new_selection.is_some() {
-                                break;
+
+                            // Bounding box overlay for Mapped mode
+                            if let Some(surf) =
+                                state.stage.surfaces.get(state.stage.selected_surface_index)
+                                && surf.content_mapping == ContentMapping::Mapped
+                            {
+                                let [min_x, min_y, max_x, max_y] = surf.bounding_box(stage_aspect);
+                                let min = Pos2::new(
+                                    canvas_rect.min.x + min_x * canvas_rect.width(),
+                                    canvas_rect.min.y + min_y * canvas_rect.height(),
+                                );
+                                let max = Pos2::new(
+                                    canvas_rect.min.x + max_x * canvas_rect.width(),
+                                    canvas_rect.min.y + max_y * canvas_rect.height(),
+                                );
+                                let _bbox_rect = Rect::from_min_max(min, max);
+                                // Dashed stroke effect using multiple short segments
+                                let dash_len = 8.0;
+                                let gap_len = 4.0;
+                                let dash_color = Color32::from_rgb(255, 255, 0);
+                                let sides = [
+                                    (min, Pos2::new(max.x, min.y)), // top
+                                    (Pos2::new(max.x, min.y), max), // right
+                                    (max, Pos2::new(min.x, max.y)), // bottom
+                                    (Pos2::new(min.x, max.y), min), // left
+                                ];
+                                for (a, b) in sides {
+                                    let dx = b.x - a.x;
+                                    let dy = b.y - a.y;
+                                    let len = (dx * dx + dy * dy).sqrt();
+                                    let steps = (len / (dash_len + gap_len)).ceil() as usize;
+                                    for s in 0..steps {
+                                        let t0 = (s as f32 * (dash_len + gap_len)).min(len) / len;
+                                        let t1 = (s as f32 * (dash_len + gap_len) + dash_len)
+                                            .min(len)
+                                            / len;
+                                        painter.line_segment(
+                                            [
+                                                Pos2::new(a.x + dx * t0, a.y + dy * t0),
+                                                Pos2::new(a.x + dx * t1, a.y + dy * t1),
+                                            ],
+                                            Stroke::new(1.5, dash_color),
+                                        );
+                                    }
+                                }
                             }
-                        }
-                        *selected_light_segment = new_selection;
-                    }
-                }
-
-                // Bounding box overlay for Mapped mode
-                if let Some(surf) = state.stage.surfaces.get(state.stage.selected_surface_index)
-                    && surf.content_mapping == ContentMapping::Mapped
-                {
-                    let [min_x, min_y, max_x, max_y] = surf.bounding_box(stage_aspect);
-                    let min = Pos2::new(
-                        canvas_rect.min.x + min_x * canvas_rect.width(),
-                        canvas_rect.min.y + min_y * canvas_rect.height(),
-                    );
-                    let max = Pos2::new(
-                        canvas_rect.min.x + max_x * canvas_rect.width(),
-                        canvas_rect.min.y + max_y * canvas_rect.height(),
-                    );
-                    let _bbox_rect = Rect::from_min_max(min, max);
-                    // Dashed stroke effect using multiple short segments
-                    let dash_len = 8.0;
-                    let gap_len = 4.0;
-                    let dash_color = Color32::from_rgb(255, 255, 0);
-                    let sides = [
-                        (min, Pos2::new(max.x, min.y)), // top
-                        (Pos2::new(max.x, min.y), max), // right
-                        (max, Pos2::new(min.x, max.y)), // bottom
-                        (Pos2::new(min.x, max.y), min), // left
-                    ];
-                    for (a, b) in sides {
-                        let dx = b.x - a.x;
-                        let dy = b.y - a.y;
-                        let len = (dx * dx + dy * dy).sqrt();
-                        let steps = (len / (dash_len + gap_len)).ceil() as usize;
-                        for s in 0..steps {
-                            let t0 = (s as f32 * (dash_len + gap_len)).min(len) / len;
-                            let t1 = (s as f32 * (dash_len + gap_len) + dash_len).min(len) / len;
-                            painter.line_segment(
-                                [Pos2::new(a.x + dx * t0, a.y + dy * t0), Pos2::new(a.x + dx * t1, a.y + dy * t1)],
-                                Stroke::new(1.5, dash_color),
-                            );
-                        }
-                    }
-                }
-
                         }); // ScrollArea::both
                 }); // ui.vertical (canvas column)
             });
@@ -5152,7 +5476,10 @@ mod egui_impl {
             );
         }
         if let Some(place) = state.stage.laser_placement.as_mut() {
-            if ui.checkbox(&mut place.show_path, "Draw the live path").changed() {
+            if ui
+                .checkbox(&mut place.show_path, "Draw the live path")
+                .changed()
+            {
                 dirty = true;
             }
             ui.label(
@@ -5297,7 +5624,11 @@ mod egui_impl {
                         .show_ui(ui, |ui| {
                             use crate::stage::OutputType;
                             ui.selectable_value(&mut light.output_type, OutputType::Sacn, "sACN");
-                            ui.selectable_value(&mut light.output_type, OutputType::ArtNet, "Art-Net");
+                            ui.selectable_value(
+                                &mut light.output_type,
+                                OutputType::ArtNet,
+                                "Art-Net",
+                            );
                         });
                     if light.output_type != prev_type {
                         light_dirty = true;
@@ -5310,27 +5641,42 @@ mod egui_impl {
                 ui.horizontal(|ui| {
                     ui.label("gamma:");
                     if ui
-                        .add(egui::DragValue::new(&mut light.gamma).speed(0.1).range(0.5..=4.0))
+                        .add(
+                            egui::DragValue::new(&mut light.gamma)
+                                .speed(0.1)
+                                .range(0.5..=4.0),
+                        )
                         .changed()
                     {
                         light_dirty = true;
                     }
                     ui.label("priority:");
                     if ui
-                        .add(egui::DragValue::new(&mut light.transport.priority).speed(1).range(0..=200))
+                        .add(
+                            egui::DragValue::new(&mut light.transport.priority)
+                                .speed(1)
+                                .range(0..=200),
+                        )
                         .changed()
                     {
                         light_dirty = true;
                     }
                     ui.label("fps:");
                     if ui
-                        .add(egui::DragValue::new(&mut light.transport.fps).speed(1).range(1.0..=100.0))
+                        .add(
+                            egui::DragValue::new(&mut light.transport.fps)
+                                .speed(1)
+                                .range(1.0..=100.0),
+                        )
                         .changed()
                     {
                         light_dirty = true;
                     }
                     ui.label("dest IP:");
-                    if ui.text_edit_singleline(&mut light.transport.dest_ip).changed() {
+                    if ui
+                        .text_edit_singleline(&mut light.transport.dest_ip)
+                        .changed()
+                    {
                         light_dirty = true;
                     }
                 });
@@ -5375,7 +5721,11 @@ mod egui_impl {
                                     egui::ComboBox::from_id_salt(format!("seg_src_{}_{}", i, si))
                                         .selected_text(sel_text)
                                         .show_ui(ui, |ui| {
-                                            ui.selectable_value(&mut seg.source_surface, None, "Manual region");
+                                            ui.selectable_value(
+                                                &mut seg.source_surface,
+                                                None,
+                                                "Manual region",
+                                            );
                                             for surf in &state.stage.surfaces {
                                                 ui.selectable_value(
                                                     &mut seg.source_surface,
@@ -5384,39 +5734,118 @@ mod egui_impl {
                                                 );
                                             }
                                         });
-                                    if seg.source_surface != prev_src { light_dirty = true; }
+                                    if seg.source_surface != prev_src {
+                                        light_dirty = true;
+                                    }
                                 });
                                 ui.add_enabled_ui(seg.source_surface.is_none(), |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label("region u0:");
-                                        if ui.add(egui::DragValue::new(&mut seg.region[0]).speed(0.01).range(0.0..=1.0)).changed() { light_dirty = true; }
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut seg.region[0])
+                                                    .speed(0.01)
+                                                    .range(0.0..=1.0),
+                                            )
+                                            .changed()
+                                        {
+                                            light_dirty = true;
+                                        }
                                         ui.label("v0:");
-                                        if ui.add(egui::DragValue::new(&mut seg.region[1]).speed(0.01).range(0.0..=1.0)).changed() { light_dirty = true; }
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut seg.region[1])
+                                                    .speed(0.01)
+                                                    .range(0.0..=1.0),
+                                            )
+                                            .changed()
+                                        {
+                                            light_dirty = true;
+                                        }
                                         ui.label("u1:");
-                                        if ui.add(egui::DragValue::new(&mut seg.region[2]).speed(0.01).range(0.0..=1.0)).changed() { light_dirty = true; }
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut seg.region[2])
+                                                    .speed(0.01)
+                                                    .range(0.0..=1.0),
+                                            )
+                                            .changed()
+                                        {
+                                            light_dirty = true;
+                                        }
                                         ui.label("v1:");
-                                        if ui.add(egui::DragValue::new(&mut seg.region[3]).speed(0.01).range(0.0..=1.0)).changed() { light_dirty = true; }
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut seg.region[3])
+                                                    .speed(0.01)
+                                                    .range(0.0..=1.0),
+                                            )
+                                            .changed()
+                                        {
+                                            light_dirty = true;
+                                        }
                                     });
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("grid:");
-                                    if ui.add(egui::DragValue::new(&mut seg.grid[0]).speed(1).range(1..=4096)).changed() { light_dirty = true; }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut seg.grid[0])
+                                                .speed(1)
+                                                .range(1..=4096),
+                                        )
+                                        .changed()
+                                    {
+                                        light_dirty = true;
+                                    }
                                     ui.label("×");
-                                    if ui.add(egui::DragValue::new(&mut seg.grid[1]).speed(1).range(1..=4096)).changed() { light_dirty = true; }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut seg.grid[1])
+                                                .speed(1)
+                                                .range(1..=4096),
+                                        )
+                                        .changed()
+                                    {
+                                        light_dirty = true;
+                                    }
                                     ui.label("corner:");
                                     let prev_corner = seg.scan.start_corner;
-                                    egui::ComboBox::from_id_salt(format!("seg_corner_{}_{}", i, si))
-                                        .selected_text(seg.scan.start_corner.label())
-                                        .width(50.0)
-                                        .show_ui(ui, |ui| {
-                                            use crate::stage::Corner;
-                                            ui.selectable_value(&mut seg.scan.start_corner, Corner::TopLeft, "TL");
-                                            ui.selectable_value(&mut seg.scan.start_corner, Corner::TopRight, "TR");
-                                            ui.selectable_value(&mut seg.scan.start_corner, Corner::BottomLeft, "BL");
-                                            ui.selectable_value(&mut seg.scan.start_corner, Corner::BottomRight, "BR");
-                                        });
-                                    if seg.scan.start_corner != prev_corner { light_dirty = true; }
-                                    if ui.checkbox(&mut seg.scan.serpentine, "serp").changed() { light_dirty = true; }
+                                    egui::ComboBox::from_id_salt(format!(
+                                        "seg_corner_{}_{}",
+                                        i, si
+                                    ))
+                                    .selected_text(seg.scan.start_corner.label())
+                                    .width(50.0)
+                                    .show_ui(ui, |ui| {
+                                        use crate::stage::Corner;
+                                        ui.selectable_value(
+                                            &mut seg.scan.start_corner,
+                                            Corner::TopLeft,
+                                            "TL",
+                                        );
+                                        ui.selectable_value(
+                                            &mut seg.scan.start_corner,
+                                            Corner::TopRight,
+                                            "TR",
+                                        );
+                                        ui.selectable_value(
+                                            &mut seg.scan.start_corner,
+                                            Corner::BottomLeft,
+                                            "BL",
+                                        );
+                                        ui.selectable_value(
+                                            &mut seg.scan.start_corner,
+                                            Corner::BottomRight,
+                                            "BR",
+                                        );
+                                    });
+                                    if seg.scan.start_corner != prev_corner {
+                                        light_dirty = true;
+                                    }
+                                    if ui.checkbox(&mut seg.scan.serpentine, "serp").changed() {
+                                        light_dirty = true;
+                                    }
                                     ui.label("axis:");
                                     let prev_axis = seg.scan.primary;
                                     egui::ComboBox::from_id_salt(format!("seg_axis_{}_{}", i, si))
@@ -5424,10 +5853,20 @@ mod egui_impl {
                                         .width(60.0)
                                         .show_ui(ui, |ui| {
                                             use crate::stage::Axis;
-                                            ui.selectable_value(&mut seg.scan.primary, Axis::Horizontal, "Horiz");
-                                            ui.selectable_value(&mut seg.scan.primary, Axis::Vertical, "Vert");
+                                            ui.selectable_value(
+                                                &mut seg.scan.primary,
+                                                Axis::Horizontal,
+                                                "Horiz",
+                                            );
+                                            ui.selectable_value(
+                                                &mut seg.scan.primary,
+                                                Axis::Vertical,
+                                                "Vert",
+                                            );
                                         });
-                                    if seg.scan.primary != prev_axis { light_dirty = true; }
+                                    if seg.scan.primary != prev_axis {
+                                        light_dirty = true;
+                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("profile:");
@@ -5439,17 +5878,40 @@ mod egui_impl {
                                         .map(|p| p.name.clone())
                                         .unwrap_or_else(|| "RGB".to_string());
                                     let prev_profile = seg.profile.clone();
-                                    egui::ComboBox::from_id_salt(format!("seg_profile_{}_{}", i, si))
-                                        .selected_text(selected_name)
-                                        .show_ui(ui, |ui| {
-                                            for (id, name) in &profile_names {
-                                                ui.selectable_value(&mut seg.profile, id.clone(), name);
-                                            }
-                                        });
-                                    if seg.profile != prev_profile { light_dirty = true; }
-                                    if ui.add(egui::DragValue::new(&mut seg.start_universe).speed(1).range(1..=63999)).changed() { light_dirty = true; }
+                                    egui::ComboBox::from_id_salt(format!(
+                                        "seg_profile_{}_{}",
+                                        i, si
+                                    ))
+                                    .selected_text(selected_name)
+                                    .show_ui(ui, |ui| {
+                                        for (id, name) in &profile_names {
+                                            ui.selectable_value(&mut seg.profile, id.clone(), name);
+                                        }
+                                    });
+                                    if seg.profile != prev_profile {
+                                        light_dirty = true;
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut seg.start_universe)
+                                                .speed(1)
+                                                .range(1..=63999),
+                                        )
+                                        .changed()
+                                    {
+                                        light_dirty = true;
+                                    }
                                     ui.label("ch:");
-                                    if ui.add(egui::DragValue::new(&mut seg.start_channel).speed(1).range(1..=512)).changed() { light_dirty = true; }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut seg.start_channel)
+                                                .speed(1)
+                                                .range(1..=512),
+                                        )
+                                        .changed()
+                                    {
+                                        light_dirty = true;
+                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     let footprint = state
@@ -5471,30 +5933,87 @@ mod egui_impl {
                                     let span_text = if spans.is_empty() {
                                         "—".to_string()
                                     } else if spans.len() == 1 {
-                                        format!("U{} ch{}–{}", spans[0].universe, spans[0].start, spans[0].end)
+                                        format!(
+                                            "U{} ch{}–{}",
+                                            spans[0].universe, spans[0].start, spans[0].end
+                                        )
                                     } else {
                                         let first = spans.first().unwrap();
                                         let last = spans.last().unwrap();
                                         format!(
                                             "U{} ch{}–{} → U{} ch{}–{}",
-                                            first.universe, first.start, first.end,
-                                            last.universe, last.start, last.end
+                                            first.universe,
+                                            first.start,
+                                            first.end,
+                                            last.universe,
+                                            last.start,
+                                            last.end
                                         )
                                     };
-                                    ui.label(egui::RichText::new(format!("patch: {}", span_text)).weak().monospace());
-                                    ui.label(format!("sample: {}", seg.sample_mode.label())).on_hover_text("Only Point sampling is available in M3");
+                                    ui.label(
+                                        egui::RichText::new(format!("patch: {}", span_text))
+                                            .weak()
+                                            .monospace(),
+                                    );
+                                    ui.label(format!("sample: {}", seg.sample_mode.label()))
+                                        .on_hover_text("Only Point sampling is available in M3");
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("bright:");
-                                    if ui.add(egui::DragValue::new(&mut seg.color.brightness).speed(0.01).range(0.0..=2.0)).changed() { light_dirty = true; }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut seg.color.brightness)
+                                                .speed(0.01)
+                                                .range(0.0..=2.0),
+                                        )
+                                        .changed()
+                                    {
+                                        light_dirty = true;
+                                    }
                                     ui.label("gain R:");
-                                    if ui.add(egui::DragValue::new(&mut seg.color.gain[0]).speed(0.01).range(0.0..=2.0)).changed() { light_dirty = true; }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut seg.color.gain[0])
+                                                .speed(0.01)
+                                                .range(0.0..=2.0),
+                                        )
+                                        .changed()
+                                    {
+                                        light_dirty = true;
+                                    }
                                     ui.label("G:");
-                                    if ui.add(egui::DragValue::new(&mut seg.color.gain[1]).speed(0.01).range(0.0..=2.0)).changed() { light_dirty = true; }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut seg.color.gain[1])
+                                                .speed(0.01)
+                                                .range(0.0..=2.0),
+                                        )
+                                        .changed()
+                                    {
+                                        light_dirty = true;
+                                    }
                                     ui.label("B:");
-                                    if ui.add(egui::DragValue::new(&mut seg.color.gain[2]).speed(0.01).range(0.0..=2.0)).changed() { light_dirty = true; }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut seg.color.gain[2])
+                                                .speed(0.01)
+                                                .range(0.0..=2.0),
+                                        )
+                                        .changed()
+                                    {
+                                        light_dirty = true;
+                                    }
                                     ui.label("dim:");
-                                    if ui.add(egui::DragValue::new(&mut seg.color.master_dimmer).speed(0.01).range(0.0..=1.0)).changed() { light_dirty = true; }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut seg.color.master_dimmer)
+                                                .speed(0.01)
+                                                .range(0.0..=1.0),
+                                        )
+                                        .changed()
+                                    {
+                                        light_dirty = true;
+                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("white:");
@@ -5519,7 +6038,9 @@ mod egui_impl {
                                         let amount = match seg.color.white {
                                             crate::stage::WhiteMode::Off => 1.0,
                                             crate::stage::WhiteMode::Min { amount }
-                                            | crate::stage::WhiteMode::MinSubtract { amount } => amount,
+                                            | crate::stage::WhiteMode::MinSubtract { amount } => {
+                                                amount
+                                            }
                                         };
                                         seg.color.white = match white_mode {
                                             0 => crate::stage::WhiteMode::Off,
@@ -5533,7 +6054,14 @@ mod egui_impl {
                                         crate::stage::WhiteMode::Min { amount }
                                         | crate::stage::WhiteMode::MinSubtract { amount } => amount,
                                     };
-                                    if ui.add(egui::DragValue::new(&mut amount).speed(0.01).range(0.0..=2.0)).changed() {
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut amount)
+                                                .speed(0.01)
+                                                .range(0.0..=2.0),
+                                        )
+                                        .changed()
+                                    {
                                         seg.color.white = match white_mode {
                                             0 => crate::stage::WhiteMode::Off,
                                             1 => crate::stage::WhiteMode::Min { amount },
@@ -5547,7 +6075,9 @@ mod egui_impl {
                     }
                 });
                 if add_segment {
-                    light.segments.push(crate::stage::LightingSegment::default());
+                    light
+                        .segments
+                        .push(crate::stage::LightingSegment::default());
                     light_dirty = true;
                 }
                 if let Some(si) = remove_segment
@@ -5604,7 +6134,11 @@ mod egui_impl {
         // Overlap warnings
         if !state.lighting_overlap_warnings.is_empty() {
             ui.group(|ui| {
-                ui.label(egui::RichText::new("⚠ Patch overlaps").color(ui.visuals().error_fg_color).strong());
+                ui.label(
+                    egui::RichText::new("⚠ Patch overlaps")
+                        .color(ui.visuals().error_fg_color)
+                        .strong(),
+                );
                 for o in &state.lighting_overlap_warnings {
                     ui.label(format!(
                         "U{} ch{}–{}: {} / {}",
@@ -5630,7 +6164,14 @@ mod egui_impl {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&profile.name).strong());
                         ui.label(format!("{}ch", profile.channels.len()));
-                        ui.label(profile.channels.iter().map(|r| r.label()).collect::<Vec<_>>().join(","));
+                        ui.label(
+                            profile
+                                .channels
+                                .iter()
+                                .map(|r| r.label())
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        );
                     });
                 } else {
                     ui.group(|ui| {
@@ -5651,14 +6192,30 @@ mod egui_impl {
                                 profile.channels.push(role);
                                 profile_dirty = true;
                             };
-                            if ui.small_button("R").clicked() { push(ChannelRole::Red); }
-                            if ui.small_button("G").clicked() { push(ChannelRole::Green); }
-                            if ui.small_button("B").clicked() { push(ChannelRole::Blue); }
-                            if ui.small_button("W").clicked() { push(ChannelRole::White); }
-                            if ui.small_button("A").clicked() { push(ChannelRole::Amber); }
-                            if ui.small_button("UV").clicked() { push(ChannelRole::Uv); }
-                            if ui.small_button("D").clicked() { push(ChannelRole::Dimmer); }
-                            if ui.small_button("S").clicked() { push(ChannelRole::Static(255)); }
+                            if ui.small_button("R").clicked() {
+                                push(ChannelRole::Red);
+                            }
+                            if ui.small_button("G").clicked() {
+                                push(ChannelRole::Green);
+                            }
+                            if ui.small_button("B").clicked() {
+                                push(ChannelRole::Blue);
+                            }
+                            if ui.small_button("W").clicked() {
+                                push(ChannelRole::White);
+                            }
+                            if ui.small_button("A").clicked() {
+                                push(ChannelRole::Amber);
+                            }
+                            if ui.small_button("UV").clicked() {
+                                push(ChannelRole::Uv);
+                            }
+                            if ui.small_button("D").clicked() {
+                                push(ChannelRole::Dimmer);
+                            }
+                            if ui.small_button("S").clicked() {
+                                push(ChannelRole::Static(255));
+                            }
                             if ui.small_button("✖ last").clicked() {
                                 profile.channels.pop();
                                 profile_dirty = true;
@@ -5669,17 +6226,29 @@ mod egui_impl {
                             }
                         });
                         // Editable value for the last channel if it is Static.
-                        if let Some(crate::stage::ChannelRole::Static(v)) = profile.channels.last_mut() {
+                        if let Some(crate::stage::ChannelRole::Static(v)) =
+                            profile.channels.last_mut()
+                        {
                             ui.horizontal(|ui| {
                                 ui.label("static value:");
-                                if ui.add(egui::DragValue::new(v).speed(1).range(0..=255)).changed() {
+                                if ui
+                                    .add(egui::DragValue::new(v).speed(1).range(0..=255))
+                                    .changed()
+                                {
                                     profile_dirty = true;
                                 }
                             });
                         }
                         ui.horizontal(|ui| {
                             ui.label("order:");
-                            ui.label(profile.channels.iter().map(|r| r.label()).collect::<Vec<_>>().join(","));
+                            ui.label(
+                                profile
+                                    .channels
+                                    .iter()
+                                    .map(|r| r.label())
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            );
                         });
                     });
                 }
@@ -5788,7 +6357,11 @@ mod egui_impl {
             ui.label(egui::RichText::new("Properties").strong());
             ui.separator();
 
-            if let Some(surf) = state.stage.surfaces.get_mut(state.stage.selected_surface_index) {
+            if let Some(surf) = state
+                .stage
+                .surfaces
+                .get_mut(state.stage.selected_surface_index)
+            {
                 ui.label("Name:");
                 if ui.text_edit_singleline(&mut surf.name).changed() {
                     geo_dirty = true;
@@ -5817,11 +6390,20 @@ mod egui_impl {
                 egui::ComboBox::from_id_salt("geo_content_mapping")
                     .selected_text(mapping_label)
                     .show_ui(ui, |ui| {
-                        if ui.selectable_label(surf.content_mapping == ContentMapping::Fill, "Fill").clicked() {
+                        if ui
+                            .selectable_label(surf.content_mapping == ContentMapping::Fill, "Fill")
+                            .clicked()
+                        {
                             surf.content_mapping = ContentMapping::Fill;
                             warp_dirty = true;
                         }
-                        if ui.selectable_label(surf.content_mapping == ContentMapping::Mapped, "Mapped").clicked() {
+                        if ui
+                            .selectable_label(
+                                surf.content_mapping == ContentMapping::Mapped,
+                                "Mapped",
+                            )
+                            .clicked()
+                        {
                             surf.content_mapping = ContentMapping::Mapped;
                             warp_dirty = true;
                         }
@@ -5848,20 +6430,38 @@ mod egui_impl {
                         let mut changed = false;
                         ui.horizontal(|ui| {
                             ui.label("X:");
-                            if ui.add(egui::DragValue::new(&mut x_px).speed(1.0).suffix(" px")).changed() { changed = true; }
+                            if ui
+                                .add(egui::DragValue::new(&mut x_px).speed(1.0).suffix(" px"))
+                                .changed()
+                            {
+                                changed = true;
+                            }
                             ui.label("Y:");
-                            if ui.add(egui::DragValue::new(&mut y_px).speed(1.0).suffix(" px")).changed() { changed = true; }
+                            if ui
+                                .add(egui::DragValue::new(&mut y_px).speed(1.0).suffix(" px"))
+                                .changed()
+                            {
+                                changed = true;
+                            }
                         });
                         ui.horizontal(|ui| {
                             ui.label("Ø:");
-                            if ui.add(egui::DragValue::new(&mut diam_px).speed(1.0).range(1.0..=f32::MAX).suffix(" px")).changed() { changed = true; }
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut diam_px)
+                                        .speed(1.0)
+                                        .range(1.0..=f32::MAX)
+                                        .suffix(" px"),
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
                         });
                         if changed {
                             surf.radius = (diam_px / 2.0 / cw).max(0.0001);
-                            surf.vertices[0] = [
-                                (x_px + diam_px / 2.0) / cw,
-                                (y_px + diam_px / 2.0) / ch,
-                            ];
+                            surf.vertices[0] =
+                                [(x_px + diam_px / 2.0) / cw, (y_px + diam_px / 2.0) / ch];
                             // Crop region = the circle's bounding box on the master.
                             surf.uv_crop_rect = [
                                 x_px / cw,
@@ -5880,15 +6480,45 @@ mod egui_impl {
                         let mut changed = false;
                         ui.horizontal(|ui| {
                             ui.label("X:");
-                            if ui.add(egui::DragValue::new(&mut x_px).speed(1.0).suffix(" px")).changed() { changed = true; }
+                            if ui
+                                .add(egui::DragValue::new(&mut x_px).speed(1.0).suffix(" px"))
+                                .changed()
+                            {
+                                changed = true;
+                            }
                             ui.label("Y:");
-                            if ui.add(egui::DragValue::new(&mut y_px).speed(1.0).suffix(" px")).changed() { changed = true; }
+                            if ui
+                                .add(egui::DragValue::new(&mut y_px).speed(1.0).suffix(" px"))
+                                .changed()
+                            {
+                                changed = true;
+                            }
                         });
                         ui.horizontal(|ui| {
                             ui.label("W:");
-                            if ui.add(egui::DragValue::new(&mut w_px).speed(1.0).range(1.0..=f32::MAX).suffix(" px")).changed() { changed = true; }
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut w_px)
+                                        .speed(1.0)
+                                        .range(1.0..=f32::MAX)
+                                        .suffix(" px"),
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
                             ui.label("H:");
-                            if ui.add(egui::DragValue::new(&mut h_px).speed(1.0).range(1.0..=f32::MAX).suffix(" px")).changed() { changed = true; }
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut h_px)
+                                        .speed(1.0)
+                                        .range(1.0..=f32::MAX)
+                                        .suffix(" px"),
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
                         });
                         if changed {
                             let new_min_x = x_px / cw;
@@ -5935,9 +6565,11 @@ mod egui_impl {
                         );
                     }
                     ui.label(
-                        egui::RichText::new(format!("   source {src_w:.0}\u{d7}{src_h:.0} px of master"))
-                            .size(11.0)
-                            .weak(),
+                        egui::RichText::new(format!(
+                            "   source {src_w:.0}\u{d7}{src_h:.0} px of master"
+                        ))
+                        .size(11.0)
+                        .weak(),
                     );
                 }
 
@@ -5954,11 +6586,17 @@ mod egui_impl {
                                     ui.label(format!("{i}:"));
                                     let mut x = v[0] * cw;
                                     let mut y = v[1] * ch;
-                                    if ui.add(egui::DragValue::new(&mut x).speed(1.0).suffix(" px")).changed() {
+                                    if ui
+                                        .add(egui::DragValue::new(&mut x).speed(1.0).suffix(" px"))
+                                        .changed()
+                                    {
                                         v[0] = x / cw;
                                         verts_changed = true;
                                     }
-                                    if ui.add(egui::DragValue::new(&mut y).speed(1.0).suffix(" px")).changed() {
+                                    if ui
+                                        .add(egui::DragValue::new(&mut y).speed(1.0).suffix(" px"))
+                                        .changed()
+                                    {
                                         v[1] = y / ch;
                                         verts_changed = true;
                                     }
@@ -5998,10 +6636,7 @@ mod egui_impl {
                     .show_ui(ui, |ui| {
                         if ui
                             .selectable_label(
-                                matches!(
-                                    surf.warp,
-                                    rustjay_projection::WarpMode::CornerPin { .. }
-                                ),
+                                matches!(surf.warp, rustjay_projection::WarpMode::CornerPin { .. }),
                                 "Corner Pin",
                             )
                             .clicked()
@@ -6046,20 +6681,40 @@ mod egui_impl {
                                     let oh = (*oh).max(1) as f32;
                                     let mut x = corner[0] * ow;
                                     let mut y = corner[1] * oh;
-                                    if ui.add(egui::DragValue::new(&mut x).speed(1.0).suffix(" px")).changed() {
+                                    if ui
+                                        .add(egui::DragValue::new(&mut x).speed(1.0).suffix(" px"))
+                                        .changed()
+                                    {
                                         corner[0] = (x / ow).clamp(0.0, 1.0);
                                         warp_dirty = true;
                                     }
-                                    if ui.add(egui::DragValue::new(&mut y).speed(1.0).suffix(" px")).changed() {
+                                    if ui
+                                        .add(egui::DragValue::new(&mut y).speed(1.0).suffix(" px"))
+                                        .changed()
+                                    {
                                         corner[1] = (y / oh).clamp(0.0, 1.0);
                                         warp_dirty = true;
                                     }
                                 }
                                 None => {
-                                    if ui.add(egui::DragValue::new(&mut corner[0]).speed(0.01).range(0.0..=1.0)).changed() {
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut corner[0])
+                                                .speed(0.01)
+                                                .range(0.0..=1.0),
+                                        )
+                                        .changed()
+                                    {
                                         warp_dirty = true;
                                     }
-                                    if ui.add(egui::DragValue::new(&mut corner[1]).speed(0.01).range(0.0..=1.0)).changed() {
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut corner[1])
+                                                .speed(0.01)
+                                                .range(0.0..=1.0),
+                                        )
+                                        .changed()
+                                    {
                                         warp_dirty = true;
                                     }
                                 }
@@ -6075,21 +6730,33 @@ mod egui_impl {
                     let [min_u, min_v, max_u, max_v] = &mut surf.uv_crop_rect;
                     ui.horizontal(|ui| {
                         ui.label("Min U:");
-                        if ui.add(egui::DragValue::new(min_u).speed(0.01).range(0.0..=1.0)).changed() {
+                        if ui
+                            .add(egui::DragValue::new(min_u).speed(0.01).range(0.0..=1.0))
+                            .changed()
+                        {
                             warp_dirty = true;
                         }
                         ui.label("Min V:");
-                        if ui.add(egui::DragValue::new(min_v).speed(0.01).range(0.0..=1.0)).changed() {
+                        if ui
+                            .add(egui::DragValue::new(min_v).speed(0.01).range(0.0..=1.0))
+                            .changed()
+                        {
                             warp_dirty = true;
                         }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Max U:");
-                        if ui.add(egui::DragValue::new(max_u).speed(0.01).range(0.0..=1.0)).changed() {
+                        if ui
+                            .add(egui::DragValue::new(max_u).speed(0.01).range(0.0..=1.0))
+                            .changed()
+                        {
                             warp_dirty = true;
                         }
                         ui.label("Max V:");
-                        if ui.add(egui::DragValue::new(max_v).speed(0.01).range(0.0..=1.0)).changed() {
+                        if ui
+                            .add(egui::DragValue::new(max_v).speed(0.01).range(0.0..=1.0))
+                            .changed()
+                        {
                             warp_dirty = true;
                         }
                     });
@@ -6335,22 +7002,55 @@ mod egui_impl {
                                 .selected_text(proj.output_type.label())
                                 .show_ui(ui, |ui| {
                                     use crate::stage::OutputType;
-                                    ui.selectable_value(&mut proj.output_type, OutputType::Display, "Display");
-                                    ui.selectable_value(&mut proj.output_type, OutputType::Ndi, "NDI");
-                                    ui.selectable_value(&mut proj.output_type, OutputType::Recording, "Recording");
+                                    ui.selectable_value(
+                                        &mut proj.output_type,
+                                        OutputType::Display,
+                                        "Display",
+                                    );
+                                    ui.selectable_value(
+                                        &mut proj.output_type,
+                                        OutputType::Ndi,
+                                        "NDI",
+                                    );
+                                    ui.selectable_value(
+                                        &mut proj.output_type,
+                                        OutputType::Recording,
+                                        "Recording",
+                                    );
                                     #[cfg(target_os = "macos")]
-                                    ui.selectable_value(&mut proj.output_type, OutputType::Syphon, "Syphon");
+                                    ui.selectable_value(
+                                        &mut proj.output_type,
+                                        OutputType::Syphon,
+                                        "Syphon",
+                                    );
                                     #[cfg(target_os = "windows")]
-                                    ui.selectable_value(&mut proj.output_type, OutputType::Spout, "Spout");
+                                    ui.selectable_value(
+                                        &mut proj.output_type,
+                                        OutputType::Spout,
+                                        "Spout",
+                                    );
                                     #[cfg(target_os = "linux")]
-                                    ui.selectable_value(&mut proj.output_type, OutputType::V4l2, "V4L2");
+                                    ui.selectable_value(
+                                        &mut proj.output_type,
+                                        OutputType::V4l2,
+                                        "V4L2",
+                                    );
                                 });
                             #[cfg(target_os = "linux")]
                             if proj.output_type == crate::stage::OutputType::V4l2 {
-                                v4l2_device_picker(ui, ("proj_v4l2", i), &mut proj.v4l2_device, 10 + i);
+                                v4l2_device_picker(
+                                    ui,
+                                    ("proj_v4l2", i),
+                                    &mut proj.v4l2_device,
+                                    10 + i,
+                                );
                             }
                             if proj.output_type == crate::stage::OutputType::Recording {
-                                let label = if proj.recording { "⏹ STOP" } else { "⏺ REC" };
+                                let label = if proj.recording {
+                                    "⏹ STOP"
+                                } else {
+                                    "⏺ REC"
+                                };
                                 if ui
                                     .button(egui::RichText::new(label).monospace())
                                     .on_hover_text(if proj.recording {
@@ -6373,18 +7073,33 @@ mod egui_impl {
                                 .selected_text(proj.rotation.label())
                                 .show_ui(ui, |ui| {
                                     use crate::stage::OutputRotation;
-                                    ui.selectable_value(&mut proj.rotation, OutputRotation::Deg0, OutputRotation::Deg0.label());
-                                    ui.selectable_value(&mut proj.rotation, OutputRotation::Deg90, OutputRotation::Deg90.label());
-                                    ui.selectable_value(&mut proj.rotation, OutputRotation::Deg180, OutputRotation::Deg180.label());
-                                    ui.selectable_value(&mut proj.rotation, OutputRotation::Deg270, OutputRotation::Deg270.label());
+                                    ui.selectable_value(
+                                        &mut proj.rotation,
+                                        OutputRotation::Deg0,
+                                        OutputRotation::Deg0.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut proj.rotation,
+                                        OutputRotation::Deg90,
+                                        OutputRotation::Deg90.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut proj.rotation,
+                                        OutputRotation::Deg180,
+                                        OutputRotation::Deg180.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut proj.rotation,
+                                        OutputRotation::Deg270,
+                                        OutputRotation::Deg270.label(),
+                                    );
                                 });
                             if proj.rotation != prev_rot {
                                 proj_dirty = true;
                             }
                             let is_fullscreen = runtime_idx.and_then(|idx| {
                                 let handle = state.projection_handle.as_ref()?;
-                                let any_guard =
-                                    handle.lock().unwrap_or_else(|e| e.into_inner());
+                                let any_guard = handle.lock().unwrap_or_else(|e| e.into_inner());
                                 let sub = any_guard
                                     .downcast_ref::<rustjay_engine::ProjectionSubsystem>()?;
                                 sub.is_projector_fullscreen(idx)
@@ -6402,8 +7117,8 @@ mod egui_impl {
                             {
                                 let mut any_guard =
                                     handle.lock().unwrap_or_else(|e| e.into_inner());
-                                if let Some(sub) = any_guard
-                                    .downcast_mut::<rustjay_engine::ProjectionSubsystem>()
+                                if let Some(sub) =
+                                    any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>()
                                 {
                                     sub.toggle_projector_fullscreen(idx);
                                 }
@@ -6422,8 +7137,12 @@ mod egui_impl {
                     #[cfg(feature = "projection")]
                     if let Some(handle) = state.projection_handle.as_ref() {
                         let mut any_guard = handle.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(sub) = any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>() {
-                            if let Some(window_id) = state.stage.projectors.get(i).and_then(|p| p.window_id) {
+                        if let Some(sub) =
+                            any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>()
+                        {
+                            if let Some(window_id) =
+                                state.stage.projectors.get(i).and_then(|p| p.window_id)
+                            {
                                 sub.remove_output(window_id);
                             } else {
                                 // Window hasn't been created yet — clear pending queue.
@@ -6438,7 +7157,9 @@ mod egui_impl {
                 #[cfg(feature = "projection")]
                 if let Some(handle) = state.projection_handle.as_ref() {
                     let mut any_guard = handle.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(sub) = any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>() {
+                    if let Some(sub) =
+                        any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>()
+                    {
                         let mut enabled_idx = 0;
                         for proj in state.stage.projectors.iter_mut() {
                             if proj.enabled {
@@ -6461,14 +7182,20 @@ mod egui_impl {
                         .push(crate::stage::KovvbojProjector::default());
                     // Ensure source_syncs, warp_syncs, and rotation_syncs exist for the new projector.
                     while state.stage.source_syncs.len() <= new_idx {
-                        state.stage.source_syncs.push(std::sync::Arc::new(
-                            std::sync::Mutex::new(crate::stage::SourceSync::default()),
-                        ));
+                        state
+                            .stage
+                            .source_syncs
+                            .push(std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::stage::SourceSync::default(),
+                            )));
                     }
                     while state.stage.warp_syncs.len() <= new_idx {
-                        state.stage.warp_syncs.push(std::sync::Arc::new(
-                            std::sync::Mutex::new(crate::stage::WarpSync::default()),
-                        ));
+                        state
+                            .stage
+                            .warp_syncs
+                            .push(std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::stage::WarpSync::default(),
+                            )));
                     }
                     while state.stage.rotation_syncs.len() <= new_idx {
                         state.stage.rotation_syncs.push(std::sync::Arc::new(
@@ -6479,32 +7206,90 @@ mod egui_impl {
                     #[cfg(feature = "projection")]
                     if let Some(handle) = state.projection_handle.as_ref() {
                         let mut any_guard = handle.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(sub) = any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>() {
+                        if let Some(sub) =
+                            any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>()
+                        {
                             let proj = &state.stage.projectors[new_idx];
                             let attrs = winit::window::WindowAttributes::default()
-                                .with_title(format!("KOVVBOJ Projector {} - {}", new_idx + 1, proj.name))
-                                .with_inner_size(winit::dpi::LogicalSize::new(proj.width, proj.height));
-                            let w = state.stage.warp_syncs.get(new_idx).cloned().unwrap_or_else(|| {
-                                std::sync::Arc::new(std::sync::Mutex::new(crate::stage::WarpSync::default()))
-                            });
+                                .with_title(format!(
+                                    "KOVVBOJ Projector {} - {}",
+                                    new_idx + 1,
+                                    proj.name
+                                ))
+                                .with_inner_size(winit::dpi::LogicalSize::new(
+                                    proj.width,
+                                    proj.height,
+                                ));
+                            let w =
+                                state
+                                    .stage
+                                    .warp_syncs
+                                    .get(new_idx)
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        std::sync::Arc::new(std::sync::Mutex::new(
+                                            crate::stage::WarpSync::default(),
+                                        ))
+                                    });
                             let d = state.stage.dome_sync.clone().unwrap();
                             let e = state.stage.edge_blend_sync.clone().unwrap();
-                            let s = state.stage.source_syncs.get(new_idx).cloned().unwrap_or_else(|| {
-                                std::sync::Arc::new(std::sync::Mutex::new(crate::stage::SourceSync::default()))
-                            });
-                            let r = state.stage.rotation_syncs.get(new_idx).cloned().unwrap_or_else(|| {
-                                std::sync::Arc::new(std::sync::Mutex::new(rustjay_projection::RotationSync::default()))
-                            });
-                            sub.add_projector(attrs, proj.fullscreen_monitor, move |device, format| {
-                                vec![
-                                    Box::new(crate::stage::KovvbojSourceStage::new(device, format, s.clone())),
-                                    Box::new(crate::stage::KovvbojDomeStage::new(device, format, d.clone())),
-                                    Box::new(crate::stage::KovvbojEdgeBlendStage::new(device, format, e.clone())),
-                                    Box::new(crate::stage::KovvbojWarpStage::new(device, format, w.clone())),
-                                    Box::new(rustjay_projection::RotationStage::new(device, format, r.clone())),
-                                ]
-                            });
-                            log::info!("[Outputs] Queued projector {} window creation", new_idx + 1);
+                            let s = state
+                                .stage
+                                .source_syncs
+                                .get(new_idx)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    std::sync::Arc::new(std::sync::Mutex::new(
+                                        crate::stage::SourceSync::default(),
+                                    ))
+                                });
+                            let r = state
+                                .stage
+                                .rotation_syncs
+                                .get(new_idx)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    std::sync::Arc::new(std::sync::Mutex::new(
+                                        rustjay_projection::RotationSync::default(),
+                                    ))
+                                });
+                            sub.add_projector(
+                                attrs,
+                                proj.fullscreen_monitor,
+                                move |device, format| {
+                                    vec![
+                                        Box::new(crate::stage::KovvbojSourceStage::new(
+                                            device,
+                                            format,
+                                            s.clone(),
+                                        )),
+                                        Box::new(crate::stage::KovvbojDomeStage::new(
+                                            device,
+                                            format,
+                                            d.clone(),
+                                        )),
+                                        Box::new(crate::stage::KovvbojEdgeBlendStage::new(
+                                            device,
+                                            format,
+                                            e.clone(),
+                                        )),
+                                        Box::new(crate::stage::KovvbojWarpStage::new(
+                                            device,
+                                            format,
+                                            w.clone(),
+                                        )),
+                                        Box::new(rustjay_projection::RotationStage::new(
+                                            device,
+                                            format,
+                                            r.clone(),
+                                        )),
+                                    ]
+                                },
+                            );
+                            log::info!(
+                                "[Outputs] Queued projector {} window creation",
+                                new_idx + 1
+                            );
                         }
                     }
                     state.save_workspace();
@@ -6567,15 +7352,39 @@ mod egui_impl {
                                 .selected_text(hl.output_type.label())
                                 .show_ui(ui, |ui| {
                                     use crate::stage::OutputType;
-                                    ui.selectable_value(&mut hl.output_type, OutputType::Display, "Display");
-                                    ui.selectable_value(&mut hl.output_type, OutputType::Ndi, "NDI");
-                                    ui.selectable_value(&mut hl.output_type, OutputType::Recording, "Recording");
+                                    ui.selectable_value(
+                                        &mut hl.output_type,
+                                        OutputType::Display,
+                                        "Display",
+                                    );
+                                    ui.selectable_value(
+                                        &mut hl.output_type,
+                                        OutputType::Ndi,
+                                        "NDI",
+                                    );
+                                    ui.selectable_value(
+                                        &mut hl.output_type,
+                                        OutputType::Recording,
+                                        "Recording",
+                                    );
                                     #[cfg(target_os = "macos")]
-                                    ui.selectable_value(&mut hl.output_type, OutputType::Syphon, "Syphon");
+                                    ui.selectable_value(
+                                        &mut hl.output_type,
+                                        OutputType::Syphon,
+                                        "Syphon",
+                                    );
                                     #[cfg(target_os = "windows")]
-                                    ui.selectable_value(&mut hl.output_type, OutputType::Spout, "Spout");
+                                    ui.selectable_value(
+                                        &mut hl.output_type,
+                                        OutputType::Spout,
+                                        "Spout",
+                                    );
                                     #[cfg(target_os = "linux")]
-                                    ui.selectable_value(&mut hl.output_type, OutputType::V4l2, "V4L2");
+                                    ui.selectable_value(
+                                        &mut hl.output_type,
+                                        OutputType::V4l2,
+                                        "V4L2",
+                                    );
                                 });
                             #[cfg(target_os = "linux")]
                             if hl.output_type == crate::stage::OutputType::V4l2 {
@@ -6617,7 +7426,9 @@ mod egui_impl {
                     #[cfg(feature = "projection")]
                     if let Some(handle) = state.projection_handle.as_ref() {
                         let mut any_guard = handle.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(sub) = any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>() {
+                        if let Some(sub) =
+                            any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>()
+                        {
                             let mut enabled_idx = 0;
                             let mut found = false;
                             for (j, hl) in state.stage.headless_outputs.iter().enumerate() {
@@ -6700,7 +7511,9 @@ mod egui_impl {
                 #[cfg(feature = "projection")]
                 if let Some(handle) = state.projection_handle.as_ref() {
                     let mut any_guard = handle.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(sub) = any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>() {
+                    if let Some(sub) =
+                        any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>()
+                    {
                         let fps = engine.target_fps as f32;
                         let codec = self.io_codec();
 
@@ -6711,9 +7524,19 @@ mod egui_impl {
                                 match proj.output_type {
                                     crate::stage::OutputType::Recording if proj.recording => {
                                         if !sub.is_projector_recording(enabled_idx) {
-                                            let path = self.auto_record_path(&format!("projector_{}_{}", i, proj.name));
-                                            if let Err(e) = sub.start_projector_recording(enabled_idx, &path, fps, codec) {
-                                                log::error!("[Outputs] Failed to start projector {i} recording: {e}");
+                                            let path = self.auto_record_path(&format!(
+                                                "projector_{}_{}",
+                                                i, proj.name
+                                            ));
+                                            if let Err(e) = sub.start_projector_recording(
+                                                enabled_idx,
+                                                &path,
+                                                fps,
+                                                codec,
+                                            ) {
+                                                log::error!(
+                                                    "[Outputs] Failed to start projector {i} recording: {e}"
+                                                );
                                             }
                                         }
                                     }
@@ -6734,9 +7557,19 @@ mod egui_impl {
                                 match hl.output_type {
                                     crate::stage::OutputType::Recording if hl.recording => {
                                         if !sub.is_headless_recording(enabled_idx) {
-                                            let path = self.auto_record_path(&format!("headless_{}_{}", i, hl.name));
-                                            if let Err(e) = sub.start_headless_recording(enabled_idx, &path, fps, codec) {
-                                                log::error!("[Outputs] Failed to start headless {i} recording: {e}");
+                                            let path = self.auto_record_path(&format!(
+                                                "headless_{}_{}",
+                                                i, hl.name
+                                            ));
+                                            if let Err(e) = sub.start_headless_recording(
+                                                enabled_idx,
+                                                &path,
+                                                fps,
+                                                codec,
+                                            ) {
+                                                log::error!(
+                                                    "[Outputs] Failed to start headless {i} recording: {e}"
+                                                );
                                             }
                                         }
                                     }
@@ -6773,10 +7606,26 @@ mod egui_impl {
                 egui::ComboBox::from_id_salt("recorder_codec")
                     .selected_text(format!("{:?}", self.recording_codec))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.recording_codec, rustjay_core::RecorderCodec::H264, "H.264");
-                        ui.selectable_value(&mut self.recording_codec, rustjay_core::RecorderCodec::H265, "H.265");
-                        ui.selectable_value(&mut self.recording_codec, rustjay_core::RecorderCodec::AV1, "AV1");
-                        ui.selectable_value(&mut self.recording_codec, rustjay_core::RecorderCodec::ProRes422, "ProRes 422");
+                        ui.selectable_value(
+                            &mut self.recording_codec,
+                            rustjay_core::RecorderCodec::H264,
+                            "H.264",
+                        );
+                        ui.selectable_value(
+                            &mut self.recording_codec,
+                            rustjay_core::RecorderCodec::H265,
+                            "H.265",
+                        );
+                        ui.selectable_value(
+                            &mut self.recording_codec,
+                            rustjay_core::RecorderCodec::AV1,
+                            "AV1",
+                        );
+                        ui.selectable_value(
+                            &mut self.recording_codec,
+                            rustjay_core::RecorderCodec::ProRes422,
+                            "ProRes 422",
+                        );
                     });
             });
             ui.horizontal(|ui| {
@@ -6787,7 +7636,9 @@ mod egui_impl {
                     let pending = self.pending_save_path.clone();
                     let ctx = ui.ctx().clone();
                     let ext = match self.recording_codec {
-                        rustjay_core::RecorderCodec::H264 | rustjay_core::RecorderCodec::H265 | rustjay_core::RecorderCodec::AV1 => "mp4",
+                        rustjay_core::RecorderCodec::H264
+                        | rustjay_core::RecorderCodec::H265
+                        | rustjay_core::RecorderCodec::AV1 => "mp4",
                         rustjay_core::RecorderCodec::ProRes422 => "mov",
                     };
                     std::thread::spawn(move || {
@@ -6806,14 +7657,20 @@ mod egui_impl {
             });
             ui.horizontal(|ui| {
                 let is_recording = engine.recording_active;
-                if ui.add_enabled(!is_recording, egui::Button::new("⏺ Start")).clicked() {
+                if ui
+                    .add_enabled(!is_recording, egui::Button::new("⏺ Start"))
+                    .clicked()
+                {
                     engine.output_command = rustjay_core::OutputCommand::StartRecording {
                         path: self.recording_path.clone(),
                         codec: self.recording_codec,
                         audio_device: None,
                     };
                 }
-                if ui.add_enabled(is_recording, egui::Button::new("⏹ Stop")).clicked() {
+                if ui
+                    .add_enabled(is_recording, egui::Button::new("⏹ Stop"))
+                    .clicked()
+                {
                     engine.output_command = rustjay_core::OutputCommand::StopRecording;
                 }
                 if is_recording {
@@ -6976,7 +7833,9 @@ mod egui_impl {
             }
         }
 
-        fn inspector_for(peers: Vec<crate::sources::SourceEntry>) -> egui_kittest::Harness<'static> {
+        fn inspector_for(
+            peers: Vec<crate::sources::SourceEntry>,
+        ) -> egui_kittest::Harness<'static> {
             let mut app = KovvbojAppState::default();
             app.mixer
                 .lock()
@@ -7036,15 +7895,15 @@ mod egui_impl {
             // The layer's own name leads the labels the mixer writes; the
             // inspector already has it as a heading, so it comes off.
             assert_eq!(
-                short_param_name(&desc("bigbro_font_atlas Key Threshold"), "bigbro_font_atlas"),
+                short_param_name(
+                    &desc("bigbro_font_atlas Key Threshold"),
+                    "bigbro_font_atlas"
+                ),
                 "Key Threshold"
             );
             // A parameter that *is* just the owner's name keeps it, rather
             // than rendering as an empty label.
-            assert_eq!(
-                short_param_name(&desc("Blur"), "Blur"),
-                "Blur"
-            );
+            assert_eq!(short_param_name(&desc("Blur"), "Blur"), "Blur");
         }
 
         /// A device layer offers a source picker at all — a plain generator
@@ -7079,8 +7938,8 @@ mod egui_impl {
     mod chip_tests {
         use super::chip;
         use std::sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         };
 
         /// A chip must report a plain click.
@@ -7106,10 +7965,7 @@ mod egui_impl {
                 });
 
             harness.run();
-            assert!(
-                !clicked.load(Ordering::SeqCst),
-                "nothing clicked it yet"
-            );
+            assert!(!clicked.load(Ordering::SeqCst), "nothing clicked it yet");
 
             use egui_kittest::kittest::Queryable as _;
             harness.get_by_label("Kaleido").click();
