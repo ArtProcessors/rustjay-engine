@@ -18,12 +18,23 @@ use rustjay_core::{EffectPlugin, EngineState, RenderHookCtx, Vertex};
 use wgpu::util::DeviceExt as _;
 use rustjay_isf::{IsfEffect, IsfState};
 
-const WIDTH: u32 = 1280;
-const HEIGHT: u32 = 720;
+/// Render size. Overridable so a shader can be timed at the reduced resolution
+/// a quality setting would actually give it.
+static WIDTH: std::sync::LazyLock<u32> =
+    std::sync::LazyLock::new(|| env_u32("ISF_BENCH_WIDTH", 1280));
+static HEIGHT: std::sync::LazyLock<u32> =
+    std::sync::LazyLock::new(|| env_u32("ISF_BENCH_HEIGHT", 720));
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 const WARMUP: u32 = 10;
 const FRAMES: u32 = 60;
-const THUMB_W: u32 = 320;
-const THUMB_H: u32 = 180;
+/// Thumbnail size. Overridable so a render can be inspected at 1:1.
+static THUMB_W: std::sync::LazyLock<u32> =
+    std::sync::LazyLock::new(|| env_u32("ISF_BENCH_THUMB_W", 320));
+static THUMB_H: std::sync::LazyLock<u32> =
+    std::sync::LazyLock::new(|| env_u32("ISF_BENCH_THUMB_H", 180));
 
 struct Gpu {
     device: wgpu::Device,
@@ -86,8 +97,8 @@ fn init_gpu() -> Result<Gpu, String> {
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Bench Target"),
         size: wgpu::Extent3d {
-            width: WIDTH,
-            height: HEIGHT,
+            width: *WIDTH,
+            height: *HEIGHT,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -106,19 +117,19 @@ fn init_gpu() -> Result<Gpu, String> {
     });
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
-        size: u64::from(WIDTH * HEIGHT * 4),
+        size: u64::from(*WIDTH * *HEIGHT * 4),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
     // ponytail: a procedural colour/checker pattern rather than a bundled image
     // — an effect only needs *something* with edges and colour to show what it
     // does. Swap in a real photo if a shader ever needs plausible content.
-    let mut texels = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
+    let mut texels = Vec::with_capacity((*WIDTH * *HEIGHT * 4) as usize);
+    for y in 0..*HEIGHT {
+        for x in 0..*WIDTH {
             let check = ((x / 80) + (y / 80)) % 2 == 0;
-            let fx = (x * 255 / WIDTH) as u8;
-            let fy = (y * 255 / HEIGHT) as u8;
+            let fx = (x * 255 / *WIDTH) as u8;
+            let fy = (y * 255 / *HEIGHT) as u8;
             let k = if check { 255 } else { 90 };
             texels.extend_from_slice(&[fx.max(k / 3), fy.max(k / 4), k, 255]);
         }
@@ -127,7 +138,7 @@ fn init_gpu() -> Result<Gpu, String> {
         &queue,
         &wgpu::TextureDescriptor {
             label: Some("test pattern"),
-            size: wgpu::Extent3d { width: WIDTH, height: HEIGHT, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: *WIDTH, height: *HEIGHT, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -252,13 +263,13 @@ fn save_png(gpu: &Gpu, path: &std::path::Path) -> Result<(), String> {
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 // 1280 * 4 = 5120, already a multiple of the 256-byte alignment.
-                bytes_per_row: Some(WIDTH * 4),
-                rows_per_image: Some(HEIGHT),
+                bytes_per_row: Some(*WIDTH * 4),
+                rows_per_image: Some(*HEIGHT),
             },
         },
         wgpu::Extent3d {
-            width: WIDTH,
-            height: HEIGHT,
+            width: *WIDTH,
+            height: *HEIGHT,
             depth_or_array_layers: 1,
         },
     );
@@ -282,11 +293,11 @@ fn save_png(gpu: &Gpu, path: &std::path::Path) -> Result<(), String> {
             .slice(..)
             .get_mapped_range()
             .map_err(|e| format!("map range: {e}"))?;
-        image::RgbaImage::from_raw(WIDTH, HEIGHT, data.to_vec())
+        image::RgbaImage::from_raw(*WIDTH, *HEIGHT, data.to_vec())
             .ok_or("readback buffer wrong size")?
     };
     gpu.readback.unmap();
-    image::imageops::thumbnail(&img, THUMB_W, THUMB_H)
+    image::imageops::thumbnail(&img, *THUMB_W, *THUMB_H)
         .save(path)
         .map_err(|e| format!("save {}: {e}", path.display()))
 }
@@ -311,8 +322,8 @@ fn run() -> Result<(), String> {
     let mut state = effect.default_state();
 
     let mut engine = EngineState::new();
-    engine.resolution.internal_width = WIDTH;
-    engine.resolution.internal_height = HEIGHT;
+    engine.resolution.internal_width = *WIDTH;
+    engine.resolution.internal_height = *HEIGHT;
 
     for _ in 0..WARMUP {
         render_frame(&gpu, &mut effect, &mut state, &engine)?;

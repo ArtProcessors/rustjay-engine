@@ -16,16 +16,17 @@ pub fn assets_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets")
 }
 
-#[cfg(feature = "mixer")]
-pub mod thumbs;
 #[cfg(feature = "api")]
 pub mod api_state;
 pub mod control;
 pub mod keymap;
 pub mod persistence;
+#[cfg(feature = "mixer")]
+pub mod previs;
 pub mod scene;
 pub mod sources;
 pub mod stage;
+pub mod thumbs;
 #[cfg(feature = "projection")]
 use stage::KovvbojStage;
 pub mod shell;
@@ -71,31 +72,17 @@ pub enum Selection {
     #[default]
     None,
     /// A layer row: its source, mix and chain.
-    Layer {
-        layer: String,
-    },
+    Layer { layer: String },
     /// A layer's source node.
-    Source {
-        layer: String,
-    },
+    Source { layer: String },
     /// An FX slot in a layer's chain.
-    LayerFx {
-        layer: String,
-        fx: String,
-    },
+    LayerFx { layer: String, fx: String },
     /// A bus group: its mix and the chain its members pass through.
-    Group {
-        group: String,
-    },
+    Group { group: String },
     /// An FX slot in a group's chain.
-    GroupFx {
-        group: String,
-        fx: String,
-    },
+    GroupFx { group: String, fx: String },
     /// An FX slot in the master chain.
-    MasterFx {
-        fx: String,
-    },
+    MasterFx { fx: String },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -167,11 +154,13 @@ pub struct KovvbojAppState {
     /// to its output even when outputs are reordered or removed.
     #[serde(skip)]
     #[cfg(feature = "projection")]
-    pub lighting_senders: std::collections::HashMap<rustjay_projection::SamplerId, rustjay_lighting::DmxSender>,
+    pub lighting_senders:
+        std::collections::HashMap<rustjay_projection::SamplerId, rustjay_lighting::DmxSender>,
     /// Latest submitted DMX frame per lighting output, mirrored for the UI activity meters.
     #[serde(skip)]
     #[cfg(feature = "projection")]
-    pub lighting_last_frames: std::collections::HashMap<rustjay_projection::SamplerId, rustjay_lighting::DmxFrame>,
+    pub lighting_last_frames:
+        std::collections::HashMap<rustjay_projection::SamplerId, rustjay_lighting::DmxFrame>,
     /// Latest DMX patch overlap warnings, computed each frame for the UI.
     #[serde(skip)]
     #[cfg(feature = "projection")]
@@ -588,7 +577,7 @@ impl KovvbojAppState {
 
     /// Manually save the current workspace (scene + stage).
     #[cfg(feature = "mixer")]
-/// How many structural edits you can step back through.
+    /// How many structural edits you can step back through.
     ///
     /// Deep enough to cover a run of mistakes, shallow enough that the stack is
     /// never worth thinking about — each entry is a whole graph description.
@@ -601,8 +590,10 @@ impl KovvbojAppState {
     /// OSC, so an undo stack of them would be noise rather than history.
     #[cfg(feature = "mixer")]
     pub fn push_undo_from(&mut self, mixer: &Mixer) {
-        self.undo_stack
-            .push(crate::scene::Topology::from_mixer(mixer, &self.layer_sources));
+        self.undo_stack.push(crate::scene::Topology::from_mixer(
+            mixer,
+            &self.layer_sources,
+        ));
         if self.undo_stack.len() > Self::UNDO_DEPTH {
             self.undo_stack.remove(0);
         }
@@ -639,8 +630,10 @@ impl KovvbojAppState {
             return false;
         };
         if let Ok(mixer) = self.mixer.lock() {
-            self.redo_stack
-                .push(crate::scene::Topology::from_mixer(&mixer, &self.layer_sources));
+            self.redo_stack.push(crate::scene::Topology::from_mixer(
+                &mixer,
+                &self.layer_sources,
+            ));
         }
         self.pending_topology = Some(previous);
         true
@@ -653,8 +646,10 @@ impl KovvbojAppState {
             return false;
         };
         if let Ok(mixer) = self.mixer.lock() {
-            self.undo_stack
-                .push(crate::scene::Topology::from_mixer(&mixer, &self.layer_sources));
+            self.undo_stack.push(crate::scene::Topology::from_mixer(
+                &mixer,
+                &self.layer_sources,
+            ));
         }
         self.pending_topology = Some(next);
         true
@@ -1077,7 +1072,9 @@ fn instantiate_source(
             }
             #[cfg(not(feature = "ffmpeg"))]
             {
-                return Err(anyhow::anyhow!("Stream support requires the ffmpeg feature"));
+                return Err(anyhow::anyhow!(
+                    "Stream support requires the ffmpeg feature"
+                ));
             }
         }
         SourceKind::Ndi => {
@@ -1114,7 +1111,10 @@ fn instantiate_source(
         SourceKind::Spout => {
             #[cfg(target_os = "windows")]
             {
-                Box::new(crate::sources::SpoutSource::new(device, entry.name.clone())?)
+                Box::new(crate::sources::SpoutSource::new(
+                    device,
+                    entry.name.clone(),
+                )?)
             }
             #[cfg(not(target_os = "windows"))]
             {
@@ -1200,8 +1200,7 @@ fn warn_stale_topology(topo: &crate::scene::Topology, engine: &EngineState) {
         crate::scene::TOPOLOGY_VERSION
     );
     engine.notify(
-        "This scene predates layers and was not loaded. Your file is untouched."
-            .to_string(),
+        "This scene predates layers and was not loaded. Your file is untouched.".to_string(),
         rustjay_core::NotificationLevel::Warning,
         std::time::Duration::from_secs(8),
     );
@@ -1280,7 +1279,8 @@ pub struct KovvbojRootPlugin {
     source_syncs: std::sync::Mutex<Vec<std::sync::Arc<std::sync::Mutex<stage::SourceSync>>>>,
     /// Per-projector output rotation. Shared between the stage factory and app state.
     #[cfg(feature = "projection")]
-    rotation_syncs: std::sync::Mutex<Vec<std::sync::Arc<std::sync::Mutex<rustjay_projection::RotationSync>>>>,
+    rotation_syncs:
+        std::sync::Mutex<Vec<std::sync::Arc<std::sync::Mutex<rustjay_projection::RotationSync>>>>,
 }
 
 impl KovvbojRootPlugin {
@@ -1342,7 +1342,9 @@ impl KovvbojRootPlugin {
 
     /// Shared per-projector rotation syncs.
     #[cfg(feature = "projection")]
-    pub fn rotation_syncs(&self) -> Vec<std::sync::Arc<std::sync::Mutex<rustjay_projection::RotationSync>>> {
+    pub fn rotation_syncs(
+        &self,
+    ) -> Vec<std::sync::Arc<std::sync::Mutex<rustjay_projection::RotationSync>>> {
         self.rotation_syncs.lock().unwrap().clone()
     }
 
@@ -1436,7 +1438,6 @@ impl KovvbojRootPlugin {
         }
 
         self.layer_sources_init = sources;
-
 
         // Phase 12 demo: pre-populate sequencer with a beat-synced sequence
         mixer.sequencer.steps = vec![
@@ -1606,7 +1607,6 @@ impl KovvbojRootPlugin {
     }
 }
 
-
 /// Point one output's source stage at the surface assigned to it.
 ///
 /// Shared by projector windows and headless outputs: both carry a
@@ -1628,16 +1628,16 @@ fn sync_surface_source(
     // fills the output quad, matching the Stage-tab canvas.
     let uv_scale = [1.0, 1.0];
     let uv_offset = [0.0, 0.0];
-    let uv_crop = surface.map(|s| s.uv_crop_rect).unwrap_or([0.0, 0.0, 1.0, 1.0]);
+    let uv_crop = surface
+        .map(|s| s.uv_crop_rect)
+        .unwrap_or([0.0, 0.0, 1.0, 1.0]);
     // Current generation of the routed source texture. A channel's
     // output ping-pongs between two physical buffers as its FX-chain
     // parity changes, so the cached view must be rebuilt when this
     // moves — otherwise the surface samples a stale buffer and the
     // FX appear to toggle at random.
     let current_gen = surface.and_then(|surf| match &surf.source {
-        SurfaceSource::Channel(uuid) => {
-            mixer.channel_texture(uuid).map(|t| t.generation)
-        }
+        SurfaceSource::Channel(uuid) => mixer.channel_texture(uuid).map(|t| t.generation),
         _ => None,
     });
     let (needs_update, override_view) = if let Ok(g) = sync.lock() {
@@ -1652,13 +1652,12 @@ fn sync_surface_source(
             let view = match surface {
                 Some(surf) => match &surf.source {
                     SurfaceSource::Master => None,
-                    SurfaceSource::Channel(uuid) => {
-                        mixer.channel_texture(uuid).map(|tex| {
-                            std::sync::Arc::new(tex.texture.create_view(
-                                &wgpu::TextureViewDescriptor::default(),
-                            ))
-                        })
-                    }
+                    SurfaceSource::Channel(uuid) => mixer.channel_texture(uuid).map(|tex| {
+                        std::sync::Arc::new(
+                            tex.texture
+                                .create_view(&wgpu::TextureViewDescriptor::default()),
+                        )
+                    }),
                     SurfaceSource::Deck { .. } => {
                         log::warn!(
                             "Deck source routing not yet implemented, falling back to Master"
@@ -1674,9 +1673,7 @@ fn sync_surface_source(
     } else {
         (false, None)
     };
-    if needs_update
-        && let Ok(mut g) = sync.lock()
-    {
+    if needs_update && let Ok(mut g) = sync.lock() {
         g.source_key = source_key;
         g.override_view = override_view;
         g.output_generation = current_gen;
@@ -1782,7 +1779,10 @@ impl EffectPlugin for KovvbojRootPlugin {
                 if let Some(routing) = self.pending_audio_routing.take()
                     && let Ok(mut slot) = engine.audio_routing_restore.lock()
                 {
-                    log::info!("[Workspace] restoring {} audio routes", routing.matrix.len());
+                    log::info!(
+                        "[Workspace] restoring {} audio routes",
+                        routing.matrix.len()
+                    );
                     *slot = Some(routing);
                 }
 
@@ -1850,7 +1850,8 @@ impl EffectPlugin for KovvbojRootPlugin {
                             self.ensure_source_syncs(state.stage.projectors.len());
                             state.stage.source_syncs = self.source_syncs.lock().unwrap().clone();
                             self.ensure_rotation_syncs(state.stage.projectors.len());
-                            state.stage.rotation_syncs = self.rotation_syncs.lock().unwrap().clone();
+                            state.stage.rotation_syncs =
+                                self.rotation_syncs.lock().unwrap().clone();
                             log::info!(
                                 "[Prepare] after sync injection: warp={}, source={}, rotation={}",
                                 state.stage.warp_syncs.len(),
@@ -1858,7 +1859,11 @@ impl EffectPlugin for KovvbojRootPlugin {
                                 state.stage.rotation_syncs.len()
                             );
                             for (i, sync) in state.stage.warp_syncs.iter().enumerate() {
-                                log::info!("[Prepare] warp_sync[{}] ptr={:p}", i, std::sync::Arc::as_ptr(sync));
+                                log::info!(
+                                    "[Prepare] warp_sync[{}] ptr={:p}",
+                                    i,
+                                    std::sync::Arc::as_ptr(sync)
+                                );
                             }
                             state.stage.dome_sync = Some(self.dome_sync.clone());
                             state.stage.edge_blend_sync = Some(self.edge_blend_sync.clone());
@@ -1945,7 +1950,8 @@ impl EffectPlugin for KovvbojRootPlugin {
                 if let Ok(mut mixer) = state.mixer.lock() {
                     if let Some(legacy_mod) = scene.apply_to_mixer(&mut mixer) {
                         // v1 scene carried modulation in the mixer; merge into unified engine.
-                        let mut mod_eng = engine.modulation.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut mod_eng =
+                            engine.modulation.lock().unwrap_or_else(|e| e.into_inner());
                         for entry in legacy_mod.sources {
                             // S3: guard against duplicate UUIDs if the workflow ever allows queued scenes.
                             if !mod_eng.has_source(&entry.uuid) {
@@ -2053,7 +2059,13 @@ impl EffectPlugin for KovvbojRootPlugin {
                         for ch in mixer.channels.iter_mut() {
                             let base = format!("ch_{}_", ch.uuid);
                             any |= reload_matching_slots(
-                                &mut ch.chain, &base, path, &name, device, queue, engine,
+                                &mut ch.chain,
+                                &base,
+                                path,
+                                &name,
+                                device,
+                                queue,
+                                engine,
                             );
                         }
                         if any {
@@ -2063,10 +2075,6 @@ impl EffectPlugin for KovvbojRootPlugin {
                 }
             }
         }
-
-
-
-
 
         // Publish a fresh app-state snapshot (structure + live modulated values)
         // every frame into the engine's opaque `app_state` slot. The generic
@@ -2175,8 +2183,7 @@ impl EffectPlugin for KovvbojRootPlugin {
             }
 
             // Drain queued FX removals, purging each slot's modulation.
-            let fx_removals: Vec<PendingFxRemoval> =
-                std::mem::take(&mut state.pending_fx_removals);
+            let fx_removals: Vec<PendingFxRemoval> = std::mem::take(&mut state.pending_fx_removals);
             if !fx_removals.is_empty() {
                 if let Ok(mut mixer) = state.mixer.lock() {
                     for req in fx_removals {
@@ -2205,10 +2212,7 @@ impl EffectPlugin for KovvbojRootPlugin {
             // The dimmer is a normal parameter, so MIDI/OSC/LFO can drive it;
             // the mixer just reads the resolved value each frame.
             if let Ok(mut mixer) = state.mixer.lock() {
-                mixer.master_dim = engine
-                    .get_param(crate::ui::MASTER_DIM)
-                    .unwrap_or(1.0);
-
+                mixer.master_dim = engine.get_param(crate::ui::MASTER_DIM).unwrap_or(1.0);
             }
 
             // Text layers: a new string or font, from the inspector or OSC.
@@ -2306,7 +2310,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                     let target = slug(target);
                     for (uuid, name) in &layers {
                         if *name == target || *uuid == target {
-                            state.pending_text.push((uuid.clone(), TextEdit::Body(body.clone())));
+                            state
+                                .pending_text
+                                .push((uuid.clone(), TextEdit::Body(body.clone())));
                         }
                     }
                 }
@@ -2322,8 +2328,7 @@ impl EffectPlugin for KovvbojRootPlugin {
                         let Ok(mut mixer) = state.mixer.lock() else {
                             continue;
                         };
-                        let Some(ch) =
-                            mixer.channels.iter_mut().find(|c| c.uuid == req.layer_uuid)
+                        let Some(ch) = mixer.channels.iter_mut().find(|c| c.uuid == req.layer_uuid)
                         else {
                             continue;
                         };
@@ -2461,7 +2466,6 @@ impl EffectPlugin for KovvbojRootPlugin {
                 }
             }
 
-
             if let Some((gid, name)) = state.pending_group_save.take() {
                 let captured = {
                     let mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
@@ -2470,9 +2474,7 @@ impl EffectPlugin for KovvbojRootPlugin {
                         let layers: Vec<crate::scene::LayerDesc> = g
                             .members
                             .iter()
-                            .filter_map(|u| {
-                                topo.layers.iter().find(|l| &l.uuid == u).cloned()
-                            })
+                            .filter_map(|u| topo.layers.iter().find(|l| &l.uuid == u).cloned())
                             .collect();
                         crate::scene::SavedGroup::capture(
                             name.clone(),
@@ -2548,7 +2550,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                         if mixer.add_channel(channel).is_err() {
                             continue;
                         }
-                        state.layer_sources.insert(desc.uuid.clone(), desc.source.clone());
+                        state
+                            .layer_sources
+                            .insert(desc.uuid.clone(), desc.source.clone());
                         members.push(desc.uuid.clone());
                     }
 
@@ -2772,7 +2776,6 @@ impl EffectPlugin for KovvbojRootPlugin {
             }
         }
 
-
         // Sync headless outputs: add any newly-enabled configs.
         #[cfg(feature = "projection")]
         {
@@ -2781,13 +2784,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                 .headless_outputs
                 .iter()
                 .any(|h| h.enabled && !h.pushed);
-            if needs_push
-                && let Some(handle) = &state.projection_handle
-            {
+            if needs_push && let Some(handle) = &state.projection_handle {
                 let mut any_guard = handle.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(sub) =
-                    any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>()
-                {
+                if let Some(sub) = any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>() {
                     for cfg in state.stage.headless_outputs.iter_mut() {
                         if cfg.enabled && !cfg.pushed {
                             // Source (crop) then warp, the same pair a
@@ -2831,7 +2830,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                         }
                     }
                 } else {
-                    log::warn!("[Headless] projection_handle downcast failed — headless outputs not created");
+                    log::warn!(
+                        "[Headless] projection_handle downcast failed — headless outputs not created"
+                    );
                 }
             }
 
@@ -2868,9 +2869,12 @@ impl EffectPlugin for KovvbojRootPlugin {
                                 .as_secs();
                             let dir = std::path::PathBuf::from("recordings");
                             std::fs::create_dir_all(&dir).ok();
-                            let path = dir.join(format!("projector_{}_{}_{}.mp4", i, proj.name, ts));
+                            let path =
+                                dir.join(format!("projector_{}_{}_{}.mp4", i, proj.name, ts));
                             if let Err(e) = sub.start_projector_recording(idx, &path, fps, codec) {
-                                log::error!("[Kovvboj] Failed to start projector {i} recording: {e}");
+                                log::error!(
+                                    "[Kovvboj] Failed to start projector {i} recording: {e}"
+                                );
                             }
                         } else if !want_rec && sub.is_projector_recording(idx) {
                             sub.stop_projector_recording(idx);
@@ -2945,8 +2949,7 @@ impl EffectPlugin for KovvbojRootPlugin {
                             let want_v4l2 = matches!(proj.output_type, OutputType::V4l2);
                             // Loopback devices must be pre-created (v4l2loopback);
                             // a blank field means /dev/video{10+idx} per projector.
-                            let dev =
-                                crate::stage::v4l2_device_path(&proj.v4l2_device, 10 + idx);
+                            let dev = crate::stage::v4l2_device_path(&proj.v4l2_device, 10 + idx);
                             if want_v4l2 && !sub.is_projector_v4l2(idx) {
                                 match sub.start_projector_v4l2(idx, &dev) {
                                     Ok(_) => engine.notify(
@@ -3005,7 +3008,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                             std::fs::create_dir_all(&dir).ok();
                             let path = dir.join(format!("headless_{}_{}_{}.mp4", i, hl.name, ts));
                             if let Err(e) = sub.start_headless_recording(idx, &path, fps, codec) {
-                                log::error!("[Kovvboj] Failed to start headless {i} recording: {e}");
+                                log::error!(
+                                    "[Kovvboj] Failed to start headless {i} recording: {e}"
+                                );
                             }
                         } else if !want_rec && sub.is_headless_recording(idx) {
                             sub.stop_headless_recording(idx);
@@ -3163,10 +3168,7 @@ impl EffectPlugin for KovvbojRootPlugin {
                             sub.set_sampler_tile_sources(sampler_id, &tile_sources);
 
                             let want = lo.enabled
-                                && matches!(
-                                    lo.output_type,
-                                    OutputType::Sacn | OutputType::ArtNet
-                                );
+                                && matches!(lo.output_type, OutputType::Sacn | OutputType::ArtNet);
 
                             let has_sender = state.lighting_senders.contains_key(&sampler_id);
                             if want && !has_sender {
@@ -3198,12 +3200,7 @@ impl EffectPlugin for KovvbojRootPlugin {
 
                             if want {
                                 if let Some((px, layout)) = sub.pixel_sampler_atlas(sampler_id) {
-                                    let frame = build_dmx_frame(
-                                        lo,
-                                        &profiles,
-                                        px,
-                                        layout,
-                                    );
+                                    let frame = build_dmx_frame(lo, &profiles, px, layout);
                                     state.lighting_last_frames.insert(sampler_id, frame.clone());
                                     if let Some(sender) = state.lighting_senders.get(&sampler_id) {
                                         sender.submit(frame);
@@ -3245,7 +3242,8 @@ impl EffectPlugin for KovvbojRootPlugin {
                         sub.remove_stale_pixel_samplers(&active_ids);
 
                         // Compute overlap warnings for the UI.
-                        state.lighting_overlap_warnings = rustjay_lighting::find_overlaps(&overlap_spans);
+                        state.lighting_overlap_warnings =
+                            rustjay_lighting::find_overlaps(&overlap_spans);
                     }
 
                     // Publish active output sinks (projectors + headless) for the
@@ -3399,7 +3397,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                     // EngineState is not available in init(); legacy v1 modulation
                     // cannot be merged here. Re-load the preset at runtime via the
                     // web/MIDI interface to trigger the prepare() migration path.
-                    log::warn!("[Workspace] v1 scene modulation skipped at init (no engine access); reload preset at runtime to migrate");
+                    log::warn!(
+                        "[Workspace] v1 scene modulation skipped at init (no engine access); reload preset at runtime to migrate"
+                    );
                 }
                 // Modulation + param values can't be applied here (no engine);
                 // stash them for the first prepare().
@@ -3518,15 +3518,19 @@ impl EffectPlugin for KovvbojRootPlugin {
                 let stage = &mut app_state.stage;
                 // Grow/shrink source_syncs and rotation_syncs to match projector count.
                 while stage.source_syncs.len() < stage.projectors.len() {
-                    stage.source_syncs.push(std::sync::Arc::new(
-                        std::sync::Mutex::new(SourceSync::default()),
-                    ));
+                    stage
+                        .source_syncs
+                        .push(std::sync::Arc::new(std::sync::Mutex::new(
+                            SourceSync::default(),
+                        )));
                 }
                 stage.source_syncs.truncate(stage.projectors.len());
                 while stage.rotation_syncs.len() < stage.projectors.len() {
-                    stage.rotation_syncs.push(std::sync::Arc::new(
-                        std::sync::Mutex::new(rustjay_projection::RotationSync::default()),
-                    ));
+                    stage
+                        .rotation_syncs
+                        .push(std::sync::Arc::new(std::sync::Mutex::new(
+                            rustjay_projection::RotationSync::default(),
+                        )));
                 }
                 stage.rotation_syncs.truncate(stage.projectors.len());
 
@@ -3696,7 +3700,6 @@ fn source_entry_to_api(e: &crate::sources::SourceEntry) -> KovvbojSourceEntry {
     }
 }
 
-
 #[cfg(all(test, feature = "mixer"))]
 mod tests {
     use super::*;
@@ -3761,11 +3764,32 @@ mod tests {
         let first_prefix = format!("ch_l1_fx{}_", first_uuid);
 
         // Dropping on the slot's own gaps is a no-op.
-        assert!(!move_effect(&mut mixer, &mut engine, &chain, &first_uuid, &chain, 0));
-        assert!(!move_effect(&mut mixer, &mut engine, &chain, &first_uuid, &chain, 1));
+        assert!(!move_effect(
+            &mut mixer,
+            &mut engine,
+            &chain,
+            &first_uuid,
+            &chain,
+            0
+        ));
+        assert!(!move_effect(
+            &mut mixer,
+            &mut engine,
+            &chain,
+            &first_uuid,
+            &chain,
+            1
+        ));
 
         // Dropping on the trailing gap moves the slot to the end.
-        assert!(move_effect(&mut mixer, &mut engine, &chain, &first_uuid, &chain, 2));
+        assert!(move_effect(
+            &mut mixer,
+            &mut engine,
+            &chain,
+            &first_uuid,
+            &chain,
+            2
+        ));
         let d = layer_ref(&mixer, "l1");
         assert_eq!(d.chain[0].uuid, second_uuid);
         assert_eq!(d.chain[1].uuid, first_uuid);
@@ -3797,17 +3821,19 @@ mod tests {
                 component: None,
             }],
         );
-        engine.midi_mappings.push(rustjay_core::MidiMappingSnapshot {
-            name: "angle".into(),
-            param_path: format!("color/{old_prefix}angle"),
-            kind: rustjay_core::MidiMsgKind::Cc,
-            selector: 20,
-            channel: 0,
-            min_value: 0.0,
-            max_value: 1.0,
-        });
-        engine.param_descriptors = std::sync::Arc::new(vec![
-            rustjay_core::ParameterDescriptor::float(
+        engine
+            .midi_mappings
+            .push(rustjay_core::MidiMappingSnapshot {
+                name: "angle".into(),
+                param_path: format!("color/{old_prefix}angle"),
+                kind: rustjay_core::MidiMsgKind::Cc,
+                selector: 20,
+                channel: 0,
+                min_value: 0.0,
+                max_value: 1.0,
+            });
+        engine.param_descriptors =
+            std::sync::Arc::new(vec![rustjay_core::ParameterDescriptor::float(
                 format!("{old_prefix}angle"),
                 "angle",
                 rustjay_core::ParamCategory::Color,
@@ -3815,8 +3841,7 @@ mod tests {
                 1.0,
                 0.0,
                 0.01,
-            ),
-        ]);
+            )]);
         engine.custom_param_bases = vec![0.7];
         engine.custom_params = vec![0.7];
 
@@ -3896,7 +3921,14 @@ mod tests {
             layer: "deleted-layer".into(),
         };
 
-        assert!(!move_effect(&mut mixer, &mut engine, &from, &uuid, &missing, 0));
+        assert!(!move_effect(
+            &mut mixer,
+            &mut engine,
+            &from,
+            &uuid,
+            &missing,
+            0
+        ));
 
         let d = layer_ref(&mixer, "l1");
         assert_eq!(d.chain.len(), 2, "slot restored, not lost");
@@ -3959,11 +3991,20 @@ mod tests {
                 .add_channel(Channel::new(uuid, uuid, Box::new(DummyFx::new())))
                 .unwrap();
         }
-        let ids = |m: &Mixer| m.channels.iter().map(|c| c.uuid.clone()).collect::<Vec<_>>();
+        let ids = |m: &Mixer| {
+            m.channels
+                .iter()
+                .map(|c| c.uuid.clone())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(ids(&mixer), ["bottom", "middle", "top"]);
 
         // Drag "bottom" onto "top": it takes top's index.
-        let from = mixer.channels.iter().position(|c| c.uuid == "bottom").unwrap();
+        let from = mixer
+            .channels
+            .iter()
+            .position(|c| c.uuid == "bottom")
+            .unwrap();
         let to = mixer.channels.iter().position(|c| c.uuid == "top").unwrap();
         mixer.reorder_channel(from, to);
         assert_eq!(ids(&mixer), ["middle", "top", "bottom"]);
