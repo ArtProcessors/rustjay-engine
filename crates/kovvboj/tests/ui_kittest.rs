@@ -440,3 +440,78 @@ fn the_splash_grows_credits_only_when_invoked() {
     about.get_by_label("KOVVBOJ");
     about.get_by_label("Close");
 }
+
+/// Clicking ➕ on a generator row must queue a layer.
+///
+/// Regression guard: the library row grew a weight dot and a struck-through
+/// state for shaders that do not compile, both drawn in the same strip as this
+/// button. A row is a lot of nested layout, and it is easy to allocate
+/// something that quietly covers the control next to it.
+#[cfg(feature = "ffmpeg")]
+#[test]
+fn plus_on_a_generator_row_queues_a_layer() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let dir = std::env::temp_dir().join(format!("kovvboj-plus-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shader = dir.join("test_generator.fs");
+    // No inputImage, so the library files it under GENERATORS and the button
+    // reads "New layer" rather than "add to the selected layer".
+    std::fs::write(
+        &shader,
+        "/*{\"INPUTS\":[]}*/\nvoid main(){ gl_FragColor = vec4(1.0); }\n",
+    )
+    .unwrap();
+
+    let mut app = KovvbojAppState::default();
+    app.registry.shaders.push(kovvboj::sources::SourceEntry {
+        id: "test_generator".into(),
+        name: "test_generator".into(),
+        kind: kovvboj::sources::SourceKind::Isf,
+        path: Some(shader),
+        device_index: 0,
+        text: None,
+    });
+
+    let app = Rc::new(RefCell::new(app));
+    let probe = Rc::clone(&app);
+    let mut engine = EngineState::default();
+    let mut tab = EffectsTab::default();
+    let mut harness = Harness::builder()
+        .with_size([700.0, 800.0])
+        .with_pixels_per_point(1.0)
+        .with_theme(egui::Theme::Dark)
+        .build_ui(move |ui| {
+            let mut state = app.borrow_mut();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                tab.draw(ui, &mut *state, &mut engine);
+            });
+        });
+    harness.run();
+
+    assert!(
+        probe.borrow().pending_layers.is_empty(),
+        "nothing queued before the click"
+    );
+
+    let plus: Vec<_> = harness.get_all_by_label("➕").collect();
+    assert!(!plus.is_empty(), "no ➕ button drawn for the generator row");
+    plus.last().expect("a ➕ button").click();
+    harness.run();
+
+    let queued = probe.borrow();
+    assert_eq!(
+        queued.pending_layers.len(),
+        1,
+        "clicking ➕ on a generator row must queue exactly one layer"
+    );
+    // Named, not just counted: the library draws a ➕ per row, so a test that
+    // only counts passes just as happily when the wrong row is clicked.
+    assert_eq!(
+        queued.pending_layers[0].source.name, "test_generator",
+        "the queued layer must come from the row that was clicked"
+    );
+    drop(queued);
+    let _ = std::fs::remove_dir_all(&dir);
+}
