@@ -157,6 +157,12 @@ pub struct IsfEffect {
     time: f32,
     /// Previous frame's timestamp — for TIMEDELTA.
     last_frame: Option<Instant>,
+    /// Pin the per-frame time step instead of measuring the wall clock.
+    ///
+    /// The clock is otherwise driven by `Instant::now()`, so two renders of the
+    /// same shader never match and nothing can be compared frame to frame. A
+    /// headless harness sets this to make a render reproducible.
+    pub fixed_delta: Option<f32>,
     /// FRAMEINDEX built-in counter.
     frame_index: u64,
 
@@ -302,6 +308,7 @@ impl IsfEffect {
             last_reset: 0.0,
             time: 0.0,
             last_frame: None,
+            fixed_delta: None,
             frame_index: 0,
             transpile_error: None,
             offscreen_size: None,
@@ -413,10 +420,11 @@ impl IsfEffect {
     /// std140-pack the IsfData block (64 bytes).
     fn pack_data(&mut self, engine: &EngineState, state: &IsfState) -> [u8; 64] {
         let now = Instant::now();
-        let delta = self
-            .last_frame
-            .map(|t| now.duration_since(t).as_secs_f32())
-            .unwrap_or(0.0);
+        let delta = self.fixed_delta.unwrap_or_else(|| {
+            self.last_frame
+                .map(|t| now.duration_since(t).as_secs_f32())
+                .unwrap_or(0.0)
+        });
         self.last_frame = Some(now);
         let frame = self.frame_index;
         self.frame_index += 1;

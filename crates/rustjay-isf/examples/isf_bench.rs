@@ -301,6 +301,9 @@ fn run() -> Result<(), String> {
     let gpu = init_gpu()?;
 
     let mut effect = IsfEffect::from_path(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // A fixed step makes the render reproducible, so two builds of the
+    // transpiler (or a shader before and after a rewrite) can be compared.
+    effect.fixed_delta = Some(1.0 / 60.0);
     EffectPlugin::init(&mut effect, &gpu.device, &gpu.queue);
     if let Some(err) = &effect.transpile_error {
         return Err(format!("pipeline init failed: {err}"));
