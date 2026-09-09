@@ -214,12 +214,16 @@ fn trim_err(e: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Compat defines: legacy WebGL-era sampler calls route through the shared sampler.
+/// ponytail: `textureCube` samples the bound 2D texture equirectangularly rather
+/// than as a real cubemap — ISF has no cubemap input type, so the texture behind
+/// these Shadertoy `iChannel` cube lookups is always 2D. Upgrade path: a genuine
+/// cubemap input type in the ISF header, if one ever exists.
 /// glslang accepts function-like macros named after reserved words (PoC-verified);
 /// `#define GL_ES` on the other hand is rejected, which is why GL_ES-guarded code
 /// is handled textually below.
 const DEFINES: &str = "\
 #define texture2D(t, c) texture(sampler2D(t, img_sampler), c)
-#define textureCube(t, c) texture(samplerCube(t, img_sampler), c)
+#define textureCube(t, c) texture(sampler2D(t, img_sampler), vec2(atan((c).z, (c).x) * 0.15915494 + 0.5, acos(clamp(normalize(c).y, -1.0, 1.0)) * 0.31830989))
 #define attribute in
 ";
 
@@ -319,7 +323,12 @@ fn build_glsl(
     // Does this shader sample through the IMG_* macros? Checked before the
     // rewrite below replaces them. Only those get the Y-flipped coordinate; see
     // `IsfManifest::flip_frag_norm_coord`.
-    let uses_img_macros = ["IMG_THIS_PIXEL", "IMG_NORM_PIXEL", "IMG_PIXEL"]
+    let uses_img_macros = [
+        "IMG_THIS_PIXEL",
+        "IMG_NORM_PIXEL",
+        "IMG_PIXEL",
+        "MM_SHADER_NORM_PIXEL",
+    ]
         .iter()
         .any(|m| body.contains(m));
 
@@ -339,6 +348,8 @@ fn build_glsl(
     // 2. excise `#ifndef GL_ES`-guarded redefinitions of GLSL builtins (we compile as
     //    desktop GL; the guarded fallback implementations only break glslang 450).
     body = excise_gles_builtin_redefs(&body);
+    body = rename_builtin_redefs(&body);
+    body = pin_madmapper_host_uniforms(&body);
 
     // 3. legacy varying name used by older ISF hosts
     body = body.replace("vv_FragNormCoord", "isf_FragNormCoord");
@@ -411,13 +422,13 @@ fn build_glsl(
         body.contains("gl_FragCoord") || has_main_image || has_material_fn || laser_fn.is_some();
     // The bridged dialects have no `main` to rename, so they are checked first:
     // their bridge sets the flipped coordinate itself.
-    let flip = "isf_FragCoord = vec2(gl_FragCoord.x, RENDERSIZE.y - gl_FragCoord.y);";
+    let flip = "isf_FragCoord = vec4(gl_FragCoord.x, RENDERSIZE.y - gl_FragCoord.y, gl_FragCoord.z, gl_FragCoord.w);";
     let body = if let Some(entry) = laser_fn {
         format!("{}\n{}", outs_become_inout(&body, entry), laser_main(entry))
     } else if has_main_image || has_material_fn {
         let b = body.replace("gl_FragCoord", "isf_FragCoord");
         let call = if has_main_image {
-            "mainImage(FragColor, isf_FragCoord);".to_string()
+            "mainImage(FragColor, isf_FragCoord.xy);".to_string()
         } else {
             "FragColor = materialColorForPixel(isf_FragNormCoord);".to_string()
         };
@@ -438,7 +449,7 @@ fn build_glsl(
     }
     p.push_str("layout(location = 0) in vec2 isf_FragNormCoord;\n");
     if uses_fragcoord {
-        p.push_str("vec2 isf_FragCoord;\n");
+        p.push_str("vec4 isf_FragCoord;\n");
     }
     p.push_str(
         "layout(set = 0, binding = 0) uniform IsfData {\n    int PASSINDEX;\n    vec2 RENDERSIZE;\n    float TIME;\n    float TIMEDELTA;\n    vec4 DATE;\n    int FRAMEINDEX;\n};\n",
@@ -873,6 +884,90 @@ fn strip_header(src: &str) -> Result<String, String> {
 /// Remove `#ifndef GL_ES`-guarded blocks that redefine GLSL builtins (the stock-corpus
 /// `GLSL_450_INCOMPATIBLE` class: custom `distance`, `round`, etc.). When the guard has
 /// an `#else` branch, that branch's content is kept (it is the desktop-GL branch).
+/// Pin MadMapper's surface-pipeline uniforms to the values MadMapper itself
+/// defaults them to.
+///
+/// These are supplied by MadMapper's surface renderer, not by the shader's ISF
+/// header, so rustjay homes them into `IsfInputs` where they default to zero —
+/// and `out_color *= modulationColor` then blacks the shader out entirely.
+///
+/// ponytail: lighting and shadow-map uniforms are pinned *off* rather than
+/// emulated, so a lit surface3D shader renders unlit. Emulating MadMapper's
+/// surface renderer is the upgrade path, if these shaders ever earn it.
+fn pin_madmapper_host_uniforms(body: &str) -> String {
+    const PINS: [(&str, &str, &str); 14] = [
+        ("vec4", "modulationColor", "vec4(1.0)"),
+        ("vec4", "textureColor", "vec4(1.0)"),
+        ("vec4", "solidColor", "vec4(1.0)"),
+        ("vec4", "wireframeColor", "vec4(0.0)"),
+        ("vec4", "ambient", "vec4(0.0)"),
+        ("mat4", "textureMatrix", "mat4(1.0)"),
+        ("float", "ignoreAlpha", "0.0"),
+        ("float", "opacity", "1.0"),
+        ("bool", "texturedEnabled", "true"),
+        ("bool", "solidEnabled", "false"),
+        ("bool", "lightingEnabled", "false"),
+        ("bool", "lightAttenuated", "false"),
+        ("bool", "lightSpot", "false"),
+        ("bool", "hasShadowMap", "false"),
+    ];
+    if !body.contains("MM_SHADER_") {
+        return body.to_string();
+    }
+    body.lines()
+        .map(|line| {
+            let t = line.trim_start();
+            for (ty, name, value) in PINS {
+                let decl = format!("uniform {ty} {name}");
+                if t.starts_with(&decl) && t[decl.len()..].trim_start().starts_with(';') {
+                    return format!("const {ty} {name} = {value};");
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Rename a shader's own definition of a GLSL builtin (and every call to it).
+///
+/// glslang rejects `float round(float n)` outright: an overload of a builtin must
+/// repeat its precision qualifiers, which hand-written shaders never do. Renaming
+/// both the definition and the call sites sidesteps the qualifier rule entirely.
+///
+/// ponytail: renames *every* call, not just the ones whose types match the user's
+/// overload — so a shader that defines `round(vec2)` and also calls `round(vec3)`
+/// now fails to resolve the second. That case doesn't appear in the corpus, and
+/// the sweep catches it if it ever does. Upgrade path: resolve overloads properly.
+fn rename_builtin_redefs(body: &str) -> String {
+    const TYPES: [&str; 12] = [
+        "float", "vec2", "vec3", "vec4", "int", "ivec2", "ivec3", "ivec4", "bool", "mat2", "mat3",
+        "mat4",
+    ];
+    let mut out = body.to_string();
+    for name in BUILTIN_FNS {
+        let defined = out.lines().any(|l| {
+            let t = l.trim_start();
+            TYPES.iter().any(|ty| {
+                t.strip_prefix(ty)
+                    .map(|r| r.trim_start())
+                    .and_then(|r| r.strip_prefix(name))
+                    .map(|r| r.trim_start().starts_with('('))
+                    .unwrap_or(false)
+            })
+        });
+        if defined {
+            out = replace_word(&out, name, &format!("isf_user_{name}"));
+        }
+    }
+    out
+}
+
+/// GLSL builtins a shader may try to redefine unconditionally.
+const BUILTIN_FNS: [&str; 8] = [
+    "round", "inverse", "sinh", "cosh", "tanh", "sign", "trunc", "roundEven",
+];
+
 fn excise_gles_builtin_redefs(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
     let mut keep = vec![true; lines.len()];
@@ -1066,6 +1161,11 @@ fn inline_img_calls(body: &str) -> String {
                 "texture(sampler2D({}, img_sampler), vec2(({}).x, 1.0 - ({}).y))",
                 args[0], args[1], args[1]
             )),
+            // Shadertoy's third argument is a LOD bias; `texture` takes one.
+            ("IMG_NORM_PIXEL", 3) => Some(format!(
+                "texture(sampler2D({}, img_sampler), vec2(({}).x, 1.0 - ({}).y), {})",
+                args[0], args[1], args[1], args[2]
+            )),
             ("IMG_PIXEL", 2) => Some(format!(
                 "texelFetch(sampler2D({}, img_sampler), ivec2(int(({}).x), int(RENDERSIZE.y) - 1 - int(({}).y)), 0)",
                 args[0], args[1], args[1]
@@ -1075,6 +1175,16 @@ fn inline_img_calls(body: &str) -> String {
                 "texture(sampler2D({}, img_sampler), vec2((isf_FragNormCoord).x, 1.0 - (isf_FragNormCoord).y))",
                 args[0]
             )),
+            // MadMapper's surface macros: the input is always `inputImage`,
+            // so they are the IMG_* forms with that texture baked in.
+            ("MM_SHADER_THIS_NORM_PIXEL", 0) => Some(
+                "texture(sampler2D(inputImage, img_sampler), vec2((isf_FragNormCoord).x, 1.0 - (isf_FragNormCoord).y))"
+                    .to_string(),
+            ),
+            ("MM_SHADER_NORM_PIXEL", 1) => Some(format!(
+                "texture(sampler2D(inputImage, img_sampler), vec2(({}).x, 1.0 - ({}).y))",
+                args[0], args[0]
+            )),
             ("IMG_THIS_PIXEL", 1) => Some(format!(
                 "texelFetch(sampler2D({}, img_sampler), ivec2(int((isf_FragNormCoord).x * RENDERSIZE.x), int(RENDERSIZE.y) - 1 - int((isf_FragNormCoord).y * RENDERSIZE.y)), 0)",
                 args[0]
@@ -1082,7 +1192,9 @@ fn inline_img_calls(body: &str) -> String {
             _ => None,
         }
     }
-    const NAMES: [&str; 5] = [
+    const NAMES: [&str; 7] = [
+        "MM_SHADER_THIS_NORM_PIXEL",
+        "MM_SHADER_NORM_PIXEL",
         "IMG_THIS_NORM_PIXEL",
         "IMG_THIS_PIXEL",
         "IMG_NORM_PIXEL",

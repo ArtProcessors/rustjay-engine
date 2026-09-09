@@ -15,12 +15,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rustjay_core::{EffectPlugin, EngineState, RenderHookCtx, Vertex};
+use wgpu::util::DeviceExt as _;
 use rustjay_isf::{IsfEffect, IsfState};
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 const WARMUP: u32 = 10;
 const FRAMES: u32 = 60;
+const THUMB_W: u32 = 320;
+const THUMB_H: u32 = 180;
 
 struct Gpu {
     device: wgpu::Device,
@@ -31,6 +34,11 @@ struct Gpu {
     target_view: wgpu::TextureView,
     /// 1-byte buffer mapped after every submit to force GPU completion.
     fence_buf: wgpu::Buffer,
+    /// Full-frame readback, only used when a thumbnail is requested.
+    readback: wgpu::Buffer,
+    /// Test pattern bound as the input image, so effects have something to eat.
+    input_view: wgpu::TextureView,
+    input_sampler: wgpu::Sampler,
 }
 
 fn init_gpu() -> Result<Gpu, String> {
@@ -96,6 +104,47 @@ fn init_gpu() -> Result<Gpu, String> {
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: u64::from(WIDTH * HEIGHT * 4),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    // ponytail: a procedural colour/checker pattern rather than a bundled image
+    // — an effect only needs *something* with edges and colour to show what it
+    // does. Swap in a real photo if a shader ever needs plausible content.
+    let mut texels = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let check = ((x / 80) + (y / 80)) % 2 == 0;
+            let fx = (x * 255 / WIDTH) as u8;
+            let fy = (y * 255 / HEIGHT) as u8;
+            let k = if check { 255 } else { 90 };
+            texels.extend_from_slice(&[fx.max(k / 3), fy.max(k / 4), k, 255]);
+        }
+    }
+    let input_tex = device.create_texture_with_data(
+        &queue,
+        &wgpu::TextureDescriptor {
+            label: Some("test pattern"),
+            size: wgpu::Extent3d { width: WIDTH, height: HEIGHT, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &texels,
+    );
+    let input_view = input_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let input_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("test pattern sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
     Ok(Gpu {
         device,
         queue,
@@ -103,6 +152,9 @@ fn init_gpu() -> Result<Gpu, String> {
         target,
         target_view,
         fence_buf,
+        readback,
+        input_view,
+        input_sampler,
     })
 }
 
@@ -125,7 +177,12 @@ fn render_frame(
             encoder: &mut encoder,
             device: &gpu.device,
             queue: &gpu.queue,
-            input: None,
+            input: Some(rustjay_core::EffectInput {
+                view: &gpu.input_view,
+                sampler: &gpu.input_sampler,
+                generation: 0,
+                texture: None,
+            }),
             target_view: &gpu.target_view,
             engine_state: engine,
             vertex_buffer: &gpu.quad_vb,
@@ -176,12 +233,71 @@ fn render_frame(
     Ok(())
 }
 
+/// Copy the last rendered frame back and write it as a downscaled PNG.
+/// ponytail: full-res readback then downscale, rather than rendering a second
+/// small pass — one extra copy per shader is cheaper than a second pipeline.
+fn save_png(gpu: &Gpu, path: &std::path::Path) -> Result<(), String> {
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("thumb") });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &gpu.target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &gpu.readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                // 1280 * 4 = 5120, already a multiple of the 256-byte alignment.
+                bytes_per_row: Some(WIDTH * 4),
+                rows_per_image: Some(HEIGHT),
+            },
+        },
+        wgpu::Extent3d {
+            width: WIDTH,
+            height: HEIGHT,
+            depth_or_array_layers: 1,
+        },
+    );
+    gpu.queue.submit(std::iter::once(encoder.finish()));
+
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&done);
+    gpu.readback
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |res| {
+            res.expect("map_async");
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        gpu.device.poll(wgpu::PollType::Poll).ok();
+        std::thread::yield_now();
+    }
+    let img = {
+        let data = gpu
+            .readback
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| format!("map range: {e}"))?;
+        image::RgbaImage::from_raw(WIDTH, HEIGHT, data.to_vec())
+            .ok_or("readback buffer wrong size")?
+    };
+    gpu.readback.unmap();
+    image::imageops::thumbnail(&img, THUMB_W, THUMB_H)
+        .save(path)
+        .map_err(|e| format!("save {}: {e}", path.display()))
+}
+
 fn run() -> Result<(), String> {
     let path = PathBuf::from(
         std::env::args()
             .nth(1)
-            .ok_or("usage: isf_bench <shader.fs>")?,
+            .ok_or("usage: isf_bench <shader.fs> [thumb.png]")?,
     );
+    let thumb = std::env::args().nth(2).map(PathBuf::from);
     let gpu = init_gpu()?;
 
     let mut effect = IsfEffect::from_path(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -203,6 +319,9 @@ fn run() -> Result<(), String> {
         render_frame(&gpu, &mut effect, &mut state, &engine)?;
     }
     let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(FRAMES);
+    if let Some(t) = &thumb {
+        save_png(&gpu, t)?;
+    }
     println!("{{\"ms\": {ms:.3}, \"frames\": {FRAMES}}}");
     Ok(())
 }
