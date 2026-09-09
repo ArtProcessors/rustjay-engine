@@ -21,8 +21,14 @@ const THUMB_H: u32 = 90;
 ///
 /// Each preview is its own render pass and allocates a bind group, measured at
 /// roughly 30us per layer — about 0.5ms, or 3% of a 60fps frame, across a full
-/// sixteen. A preview exists to tell you what a layer is putting out, and 20fps
-/// answers that as well as 60 does, for a third of the cost.
+/// sixteen.
+///
+/// This runs on the *output* render hook, which is paced by `target_fps` (60 by
+/// default). The GUI that displays these draws on its own slower cadence —
+/// `UI_RENDER_INTERVAL`, 33ms, so 30fps — which meant every second blit was
+/// produced for a frame nobody ever drew. A divisor of three lands at 20fps:
+/// under the GUI's rate, so no blit is wasted, and still live enough to read a
+/// layer at a glance.
 const REFRESH_EVERY: u64 = 3;
 
 /// How long previews keep updating after the last one was drawn.
