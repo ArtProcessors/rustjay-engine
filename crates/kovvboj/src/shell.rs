@@ -9,9 +9,9 @@
 //! unmodified. Rebuilding the deck card as a chain strip, and moving params
 //! into the inspector, is the next phase — see `KOVVBOJ_UI.md`.
 
+use crate::splash::{LAUNCH_HOLD, Presentation, backdrop_opacity, launch_opacity, splash};
 #[cfg(feature = "webcam")]
 use crate::ui::LedMapTab;
-use crate::splash::{LAUNCH_HOLD, Presentation, backdrop_opacity, launch_opacity, splash};
 use crate::ui::{DeckTab, EffectsTab, MixerTab, OutputsTab, SequencerTab, StageTab};
 use rustjay_engine::prelude::{AnyEguiShell, AnyEguiTab, EguiControlGui, EngineState, GuiTab};
 use rustjay_gui::egui_theme::{Palette, set_palette};
@@ -270,7 +270,8 @@ impl KovvbojShell {
         let resp = ui.interact(handle, ui.id().with(id), egui::Sense::drag());
         if resp.hovered() || resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-            ui.painter().rect_filled(handle, 0.0, amber().gamma_multiply(0.5));
+            ui.painter()
+                .rect_filled(handle, 0.0, amber().gamma_multiply(0.5));
         }
         if !resp.dragged() {
             return resp.drag_stopped().then_some(width);
@@ -379,7 +380,11 @@ impl AnyEguiShell for KovvbojShell {
         }
 
         // A folder picked by the File menu last frame.
-        if let Some((action, dir)) = self.pending_workspace.lock().ok().and_then(|mut g| g.take())
+        if let Some((action, dir)) = self
+            .pending_workspace
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
             && let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>()
         {
             match action {
@@ -482,8 +487,7 @@ impl AnyEguiShell for KovvbojShell {
                             else {
                                 return;
                             };
-                            let mut guard =
-                                engine.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut guard = engine.lock().unwrap_or_else(|e| e.into_inner());
                             crate::ui::draw_inspector(ui, state, &mut guard);
                         });
                     new_width = Self::edge_drag(
@@ -517,72 +521,72 @@ impl AnyEguiShell for KovvbojShell {
             .rect_filled(central, 0.0, ui.style().visuals.panel_fill);
         ui.scope_builder(egui::UiBuilder::new().max_rect(central), |ui| {
             egui::Frame::central_panel(ui.style()).show(ui, |ui| {
-            self.mode_switcher(ui);
-            ui.separator();
+                self.mode_switcher(ui);
+                ui.separator();
 
-            match self.mode {
-                Mode::Mix => {
-                    // MASTER is pinned to the bottom so the crossfader stays
-                    // reachable however far the deck list scrolls.
-                    #[allow(deprecated)]
-                    // The floor, not the default, is what actually holds this
-                    // open: `default_size` only applies on the frame before the
-                    // panel has stored a size, and something narrower than the
-                    // content was winning from then on — a drag was the only
-                    // thing that rewrote it. egui clamps the size it loads to
-                    // this range every frame, so a floor survives that.
-                    // ponytail: 200 clears the master row, the chain-name row
-                    // and the FX strip. If the master area ever needs to shrink
-                    // below that, it wants the inspector's arrangement — own the
-                    // resize, keep the height in `UiPrefs` — not a lower floor.
-                    egui::Panel::bottom("kovvboj_master")
-                        .default_size(220.0)
-                        .min_size(200.0)
-                        .resizable(true)
-                        .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt("master_scroll")
-                                .show(ui, |ui| tab(&mut self.master, ui, app_state, &engine));
-                        });
-                    let mut decks = egui::ScrollArea::vertical()
-                        .id_salt("decks_scroll")
-                        .show(ui, |ui| tab(&mut self.decks, ui, app_state, &engine));
-                    // While a chip or layer drag is in flight, hovering the
-                    // top/bottom edge scrolls the list, so off-screen layers
-                    // stay reachable as drop targets.
-                    if egui::DragAndDrop::has_any_payload(ui.ctx())
-                        && let Some(pos) = ui.ctx().pointer_interact_pos()
-                        && decks.inner_rect.contains(pos)
-                    {
-                        let delta = crate::ui::drag_edge_scroll_delta(
-                            pos.y,
-                            decks.inner_rect.top(),
-                            decks.inner_rect.bottom(),
-                        );
-                        if delta != 0.0 {
-                            decks.state.offset.y += delta;
-                            decks.state.store(ui.ctx(), decks.id);
-                            ui.ctx().request_repaint();
+                match self.mode {
+                    Mode::Mix => {
+                        // MASTER is pinned to the bottom so the crossfader stays
+                        // reachable however far the deck list scrolls.
+                        #[allow(deprecated)]
+                        // The floor, not the default, is what actually holds this
+                        // open: `default_size` only applies on the frame before the
+                        // panel has stored a size, and something narrower than the
+                        // content was winning from then on — a drag was the only
+                        // thing that rewrote it. egui clamps the size it loads to
+                        // this range every frame, so a floor survives that.
+                        // ponytail: 200 clears the master row, the chain-name row
+                        // and the FX strip. If the master area ever needs to shrink
+                        // below that, it wants the inspector's arrangement — own the
+                        // resize, keep the height in `UiPrefs` — not a lower floor.
+                        egui::Panel::bottom("kovvboj_master")
+                            .default_size(220.0)
+                            .min_size(200.0)
+                            .resizable(true)
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("master_scroll")
+                                    .show(ui, |ui| tab(&mut self.master, ui, app_state, &engine));
+                            });
+                        let mut decks = egui::ScrollArea::vertical()
+                            .id_salt("decks_scroll")
+                            .show(ui, |ui| tab(&mut self.decks, ui, app_state, &engine));
+                        // While a chip or layer drag is in flight, hovering the
+                        // top/bottom edge scrolls the list, so off-screen layers
+                        // stay reachable as drop targets.
+                        if egui::DragAndDrop::has_any_payload(ui.ctx())
+                            && let Some(pos) = ui.ctx().pointer_interact_pos()
+                            && decks.inner_rect.contains(pos)
+                        {
+                            let delta = crate::ui::drag_edge_scroll_delta(
+                                pos.y,
+                                decks.inner_rect.top(),
+                                decks.inner_rect.bottom(),
+                            );
+                            if delta != 0.0 {
+                                decks.state.offset.y += delta;
+                                decks.state.store(ui.ctx(), decks.id);
+                                ui.ctx().request_repaint();
+                            }
                         }
                     }
+                    Mode::Stage => {
+                        // No outer scroll area: the stage canvas sizes itself from
+                        // the space it is given, and inside a vertical scroll that
+                        // space is unbounded, so it came out a strip. The tab owns
+                        // its own layout — a bottom panel for the inspector, the
+                        // canvas filling the rest — and scrolls where it needs to.
+                        tab(&mut self.stage, ui, app_state, &engine);
+                    }
+                    Mode::Calibrate => {
+                        #[cfg(feature = "webcam")]
+                        egui::ScrollArea::vertical()
+                            .id_salt("map_scroll")
+                            .show(ui, |ui| tab(&mut self.ledmap, ui, app_state, &engine));
+                        #[cfg(not(feature = "webcam"))]
+                        ui.label("LED mapping needs the `webcam` feature.");
+                    }
                 }
-                Mode::Stage => {
-                    // No outer scroll area: the stage canvas sizes itself from
-                    // the space it is given, and inside a vertical scroll that
-                    // space is unbounded, so it came out a strip. The tab owns
-                    // its own layout — a bottom panel for the inspector, the
-                    // canvas filling the rest — and scrolls where it needs to.
-                    tab(&mut self.stage, ui, app_state, &engine);
-                }
-                Mode::Calibrate => {
-                    #[cfg(feature = "webcam")]
-                    egui::ScrollArea::vertical()
-                        .id_salt("map_scroll")
-                        .show(ui, |ui| tab(&mut self.ledmap, ui, app_state, &engine));
-                    #[cfg(not(feature = "webcam"))]
-                    ui.label("LED mapping needs the `webcam` feature.");
-                }
-            }
             });
         });
 
@@ -880,12 +884,109 @@ impl KovvbojShell {
                         ui.checkbox(&mut self.show_preview, "Preview");
                     });
 
+                    // Library analysis. A scan is a pre-show job, like a DJ
+                    // analysing a crate: never automatic, because rendering an
+                    // unknown shader costs GPU time the live output wants.
+                    ui.menu_button("Library", |ui| {
+                        let scanning = app_state
+                            .downcast_ref::<crate::KovvbojAppState>()
+                            .is_some_and(|s| s.scan.is_some());
+                        if scanning {
+                            if let Some(state) =
+                                app_state.downcast_mut::<crate::KovvbojAppState>()
+                                && let Some(job) = state.scan.as_mut()
+                            {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}/{} analysed",
+                                        job.done, job.total
+                                    ))
+                                    .size(11.0),
+                                );
+                                if ui.button("Cancel scan").clicked() {
+                                    job.cancel();
+                                    ui.close();
+                                }
+                            }
+                        } else {
+                            let start = ui
+                                .button("Scan library")
+                                .on_hover_text(
+                                    "Analyse shaders not yet seen: thumbnail, weight and \
+                                     whether they compile",
+                                )
+                                .clicked();
+                            let rescan = ui
+                                .button("Rescan everything")
+                                .on_hover_text(
+                                    "Re-measure the whole library — needed after changing \
+                                     internal resolution",
+                                )
+                                .clicked();
+                            if (start || rescan)
+                                && let Some(state) =
+                                    app_state.downcast_mut::<crate::KovvbojAppState>()
+                            {
+                                let paths = state.library_shader_paths();
+                                // The size the analyzer will actually render
+                                // at, so an already-scanned shader is only
+                                // skipped when its weight still applies.
+                                let at = engine
+                                    .lock()
+                                    .map(|e| {
+                                        [
+                                            e.resolution.internal_width,
+                                            e.resolution.internal_height,
+                                        ]
+                                    })
+                                    .unwrap_or([1920, 1080]);
+                                state.scan = Some(if rescan {
+                                    crate::previs::ScanJob::rescan(paths)
+                                } else {
+                                    crate::previs::ScanJob::new(paths, &state.previs, at)
+                                });
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui
+                            .button("Add folder…")
+                            .on_hover_text("Another directory for the library to scan")
+                            .clicked()
+                            && let Some(state) =
+                                app_state.downcast_ref::<crate::KovvbojAppState>()
+                        {
+                            let pending = state.pending_library_folder.clone();
+                            let ctx = ui.ctx().clone();
+                            std::thread::spawn(move || {
+                                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                    if let Ok(mut g) = pending.lock() {
+                                        *g = Some(dir);
+                                    }
+                                    ctx.request_repaint();
+                                }
+                            });
+                            ui.close();
+                        }
+                    });
+
                     ui.menu_button("Help", |ui| {
                         if ui.button("About KOVVBOJ").clicked() {
                             self.about_opened_at = Some(ui.input(|i| i.time));
                             ui.close();
                         }
                     });
+
+                    // Scan progress sits with the other long-job readouts, so
+                    // there is one place to look for "the app is working".
+                    if let Some(text) = app_state
+                        .downcast_ref::<crate::KovvbojAppState>()
+                        .and_then(|s| s.scan.as_ref())
+                        .map(|j| j.label())
+                    {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new(text).size(11.0).monospace().color(amber()));
+                    }
 
                     if let Some(job) = busy.lock().ok().and_then(|b| b.clone()) {
                         ui.add_space(10.0);
@@ -1259,7 +1360,11 @@ fn workspace_label(dir: &std::path::Path) -> String {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("workspace");
-    match dir.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+    match dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+    {
         Some(parent) if name.starts_with('.') => format!("{parent}/{name}"),
         _ => name.to_string(),
     }

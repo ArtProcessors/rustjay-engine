@@ -1,7 +1,9 @@
 #!/bin/bash
 # Batch driver for the isf_bench example.
 #
-# Usage: isf_bench_driver.sh <shader-list.txt> <out.jsonl>
+# Usage: isf_bench_driver.sh <shader-list.txt> <out.jsonl> [thumb-dir]
+#
+# With a thumb-dir, each shader also writes <thumb-dir>/<basename>.png.
 #
 # Reads shader paths (one per line, blanks and #-comments skipped), runs each
 # under `cargo run --release -p rustjay-isf --example isf_bench` with a 15s
@@ -12,12 +14,14 @@ set -u
 
 TIMEOUT_SECS=15
 
-if [ $# -ne 2 ]; then
-    echo "usage: $0 <shader-list.txt> <out.jsonl>" >&2
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+    echo "usage: $0 <shader-list.txt> <out.jsonl> [thumb-dir]" >&2
     exit 2
 fi
 LIST="$1"
 OUT="$2"
+THUMBDIR="${3:-}"
+[ -n "$THUMBDIR" ] && mkdir -p "$THUMBDIR"
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$ROOT"
@@ -41,11 +45,11 @@ KILLED_FLAG=""
 run_bench() {
     # stdout = bench JSON, rc: 0 ok, 124 timeout, 1 shader error, other crash
     if [ -n "$HAVE_TIMEOUT" ]; then
-        "$HAVE_TIMEOUT" "$TIMEOUT_SECS" "$BIN" "$1"
+        "$HAVE_TIMEOUT" "$TIMEOUT_SECS" "$BIN" "$@"
         return $?
     fi
     KILLED_FLAG="$(mktemp -t isf_bench)"
-    "$BIN" "$1" &
+    "$BIN" "$@" &
     local pid=$!
     ( sleep "$TIMEOUT_SECS" && kill -9 "$pid" 2>/dev/null && touch "$KILLED_FLAG.killed" ) &
     local watcher=$!
@@ -70,7 +74,14 @@ json_escape() {
 while IFS= read -r shader || [ -n "$shader" ]; do
     case "$shader" in '' | \#*) continue ;; esac
     errtmp="$(mktemp -t isf_bench_err)"
-    out="$(run_bench "$shader" 2>"$errtmp")"
+    if [ -n "$THUMBDIR" ]; then
+        # Path-derived, not basename: the corpus has `circle/Default.fs` and
+        # `triangle/Default.fs`, which would otherwise overwrite each other.
+        base="$(printf '%s' "${shader%.fs}" | sed 's|.*/ISF-shaders-collection/||; s|/|__|g')"
+        out="$(run_bench "$shader" "$THUMBDIR/$base.png" 2>"$errtmp")"
+    else
+        out="$(run_bench "$shader" 2>"$errtmp")"
+    fi
     rc=$?
     esc="$(json_escape "$shader")"
     ms="$(printf '%s' "$out" | sed -n 's/^{"ms": \([0-9.]*\), "frames": [0-9]*}$/\1/p')"

@@ -358,7 +358,10 @@ pub fn quad_map(quad: &[[f32; 2]; 4], x: f32, y: f32) -> [f32; 2] {
         quad[3][0] + (quad[2][0] - quad[3][0]) * u,
         quad[3][1] + (quad[2][1] - quad[3][1]) * u,
     ];
-    [top[0] + (bottom[0] - top[0]) * v, top[1] + (bottom[1] - top[1]) * v]
+    [
+        top[0] + (bottom[0] - top[0]) * v,
+        top[1] + (bottom[1] - top[1]) * v,
+    ]
 }
 
 impl LaserPlacement {
@@ -527,10 +530,12 @@ impl KovvbojStage {
     /// Numbering off `surfaces.len()` collided: delete "Surface 2" from three
     /// surfaces and the next add is named "Surface 3" alongside the existing one.
     pub fn next_surface_number(&self, prefix: &str) -> usize {
-        (1..).find(|n| {
-            let candidate = format!("{prefix} {n}");
-            !self.surfaces.iter().any(|s| s.name == candidate)
-        }).expect("1.. is unbounded")
+        (1..)
+            .find(|n| {
+                let candidate = format!("{prefix} {n}");
+                !self.surfaces.iter().any(|s| s.name == candidate)
+            })
+            .expect("1.. is unbounded")
     }
 
     pub fn with_default_surface() -> Self {
@@ -602,30 +607,35 @@ impl KovvbojStage {
     /// an actual edit. Call after the GUI mutates a surface's warp.
     #[cfg(feature = "projection")]
     pub fn publish_warp(&self) {
-        log::debug!("[publish_warp] {} projectors, {} warp_syncs, {} surfaces", self.projectors.len(), self.warp_syncs.len(), self.surfaces.len());
+        log::debug!(
+            "[publish_warp] {} projectors, {} warp_syncs, {} surfaces",
+            self.projectors.len(),
+            self.warp_syncs.len(),
+            self.surfaces.len()
+        );
         for (i, proj) in self.projectors.iter().enumerate() {
-            if let Some(sync) = self.warp_syncs.get(i) {
-                let surface = proj
-                    .surface_index
-                    .and_then(|idx| self.surfaces.get(idx))
-                    .or_else(|| self.surfaces.first());
-                if let Some(surf) = surface {
-                    match sync.lock() {
-                        Ok(mut g) => {
-                            let old_version = g.version;
-                            g.mode = surf.warp.clone();
-                            g.version = g.version.wrapping_add(1);
-                            log::debug!("[publish_warp] proj {} -> surf {:?} ptr={:p} version {} -> {}", i, proj.surface_index, std::sync::Arc::as_ptr(sync), old_version, g.version);
-                        }
-                        Err(e) => {
-                            log::warn!("[publish_warp] proj {} sync poisoned: {}", i, e);
-                        }
-                    }
-                } else {
-                    log::warn!("[publish_warp] proj {} has no surface (surface_index={:?}, surfaces={})", i, proj.surface_index, self.surfaces.len());
-                }
-            } else {
+            let Some(sync) = self.warp_syncs.get(i) else {
                 log::warn!("[publish_warp] proj {} has no warp_sync", i);
+                continue;
+            };
+            let mode = self.warp_for(proj.surface_index);
+            match sync.lock() {
+                Ok(mut g) => {
+                    let old_version = g.version;
+                    g.mode = mode;
+                    g.version = g.version.wrapping_add(1);
+                    log::debug!(
+                        "[publish_warp] proj {} -> surf {:?} ptr={:p} version {} -> {}",
+                        i,
+                        proj.surface_index,
+                        std::sync::Arc::as_ptr(sync),
+                        old_version,
+                        g.version
+                    );
+                }
+                Err(e) => {
+                    log::warn!("[publish_warp] proj {} sync poisoned: {}", i, e);
+                }
             }
         }
 
@@ -636,17 +646,28 @@ impl KovvbojStage {
             let Some(sync) = self.headless_warp_syncs.get(i) else {
                 continue;
             };
-            let surface = hl
-                .surface_index
-                .and_then(|idx| self.surfaces.get(idx))
-                .or_else(|| self.surfaces.first());
-            if let Some(surf) = surface
-                && let Ok(mut g) = sync.lock()
-            {
-                g.mode = surf.warp.clone();
+            let mode = self.warp_for(hl.surface_index);
+            if let Ok(mut g) = sync.lock() {
+                g.mode = mode;
                 g.version = g.version.wrapping_add(1);
             }
         }
+    }
+
+    /// The warp an output should show: its assigned surface, else the first
+    /// surface, else identity.
+    ///
+    /// The identity fallback is the point. Leaving the sync untouched when no
+    /// surface resolves kept a deleted surface's corner-pin live on the
+    /// projector for the rest of the session — the geometry outlived the thing
+    /// that owned it, and no edit could reach it any more.
+    #[cfg(feature = "projection")]
+    fn warp_for(&self, surface_index: Option<usize>) -> rustjay_projection::WarpMode {
+        surface_index
+            .and_then(|idx| self.surfaces.get(idx))
+            .or_else(|| self.surfaces.first())
+            .map(|s| s.warp.clone())
+            .unwrap_or_else(rustjay_projection::WarpMode::identity)
     }
 }
 
@@ -1203,7 +1224,12 @@ impl rustjay_projection::ProjectionStage for KovvbojWarpStage {
             (g.mode.clone(), g.version)
         };
         if version != self.last_version {
-            log::debug!("[KovvbojWarpStage] ptr={:p} version changed {} -> {}", std::sync::Arc::as_ptr(&self.sync), self.last_version, version);
+            log::debug!(
+                "[KovvbojWarpStage] ptr={:p} version changed {} -> {}",
+                std::sync::Arc::as_ptr(&self.sync),
+                self.last_version,
+                version
+            );
             self.last_version = version;
             match &mode {
                 // Same mode family → cheap homography update (no rebuild on drag).
@@ -1321,7 +1347,13 @@ impl rustjay_projection::ProjectionStage for KovvbojSourceStage {
     ) {
         let (override_view, version, uv_scale, uv_offset, uv_crop) = {
             let g = self.sync.lock().unwrap_or_else(|e| e.into_inner());
-            (g.override_view.clone(), g.version, g.uv_scale, g.uv_offset, g.uv_crop)
+            (
+                g.override_view.clone(),
+                g.version,
+                g.uv_scale,
+                g.uv_offset,
+                g.uv_crop,
+            )
         };
 
         let source = override_view.as_ref().map(|a| a.as_ref()).unwrap_or(input);
@@ -1329,7 +1361,8 @@ impl rustjay_projection::ProjectionStage for KovvbojSourceStage {
         if self.last_version != version || self.cached_bind_group.is_none() {
             self.last_version = version;
             self.cached_bind_group = Some(self.blit.create_bind_group(ctx.device, source));
-            self.blit.set_uv_transform(ctx.queue, uv_scale, uv_offset, uv_crop);
+            self.blit
+                .set_uv_transform(ctx.queue, uv_scale, uv_offset, uv_crop);
         }
 
         let bind_group = self.cached_bind_group.as_ref().unwrap();
@@ -1558,9 +1591,15 @@ mod tests {
     fn remove_surface_repoints_outputs() {
         let mut stage = stage_with(3);
         for idx in [Some(0), Some(1), Some(2), None] {
-            stage.projectors.push(KovvbojProjector { surface_index: idx, ..Default::default() });
+            stage.projectors.push(KovvbojProjector {
+                surface_index: idx,
+                ..Default::default()
+            });
         }
-        stage.headless_outputs.push(KovvbojHeadlessConfig { surface_index: Some(2), ..Default::default() });
+        stage.headless_outputs.push(KovvbojHeadlessConfig {
+            surface_index: Some(2),
+            ..Default::default()
+        });
 
         stage.remove_surface(1);
 
@@ -1568,6 +1607,30 @@ mod tests {
         assert_eq!(got, vec![Some(0), None, Some(1), None]);
         assert_eq!(stage.headless_outputs[0].surface_index, Some(1));
         assert_eq!(stage.surfaces.len(), 2);
+    }
+
+    /// Deleting the last surface must hand the projector identity, not leave
+    /// the dead surface's warp live on the output.
+    #[cfg(feature = "projection")]
+    #[test]
+    fn publish_warp_falls_back_to_identity() {
+        let mut stage = stage_with(1);
+        stage.surfaces[0].warp = rustjay_projection::WarpMode::corner_pin([
+            [0.2, 0.2],
+            [0.8, 0.1],
+            [0.9, 0.9],
+            [0.1, 0.8],
+        ]);
+        stage.projectors.push(KovvbojProjector::default());
+        let sync = std::sync::Arc::new(std::sync::Mutex::new(WarpSync::default()));
+        stage.warp_syncs.push(sync.clone());
+
+        stage.publish_warp();
+        assert!(!sync.lock().unwrap().mode.is_identity());
+
+        stage.remove_surface(0);
+        stage.publish_warp();
+        assert!(sync.lock().unwrap().mode.is_identity());
     }
 
     /// Numbering off `len()` hands out a name that is already taken.
@@ -1622,7 +1685,10 @@ mod tests {
         };
 
         assert!(led.contains([0.5, 0.5]), "centre should be inside");
-        assert!(!led.contains([0.05, 0.05]), "top-left of the box is outside");
+        assert!(
+            !led.contains([0.05, 0.05]),
+            "top-left of the box is outside"
+        );
 
         led.translate(0.0, -0.5); // already flush at the top
         assert_eq!(led.quad[0], [0.4, 0.0]);

@@ -5587,6 +5587,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "image",
  "isf",
  "log",
  "naga 29.0.3",
@@ -5640,6 +5641,7 @@ dependencies = [
  "bytemuck",
  "log",
  "naga 29.0.3",
+ "pollster 0.4.0",
  "rustjay-core",
  "rustjay-render",
  "serde",
