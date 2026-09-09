@@ -59,8 +59,6 @@ api     = ["dep:rustjay-api"]
 # Push parameter changes back to an OSC controller (Maschine Mk1 bridge).
 osc-feedback = ["rustjay-control/osc-feedback"]
 projection = ["dep:rustjay-projection", "rustjay-projection/surface-import", "rustjay-projection/auto-edge-blend"]
-spout   = []
-v4l2    = []
 link    = ["rustjay-sync/link", "rustjay-core/link", "rustjay-gui/link"]
 prodj   = ["rustjay-sync/prodj", "rustjay-core/prodj", "rustjay-gui/prodj"]
 mtc     = ["rustjay-control/mtc", "rustjay-gui/mtc"]
