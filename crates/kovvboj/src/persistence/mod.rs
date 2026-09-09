@@ -69,14 +69,43 @@ impl Workspace {
         std::fs::create_dir_all(&self.dir)
     }
 
-    /// Where saved layers live, one JSON file each so they can be copied
-    /// between workspaces by hand.
-    pub fn layers_dir(&self) -> PathBuf {
-        self.dir.join("layers")
+    /// Where state that belongs to the rig rather than to one show lives.
+    ///
+    /// A workspace is a set: its scene, its stage, its keymap. Saved layers and
+    /// favourites are not that — they are building blocks you assemble sets
+    /// from, and having them vanish when you open a new set makes them useless.
+    /// Same call [`recent_path`] makes for the recent-sets list.
+    ///
+    /// Falls back to the workspace when there is no home directory, which beats
+    /// losing them outright.
+    fn global_root(&self) -> PathBuf {
+        dirs::data_dir()
+            .map(|d| d.join("rustjay"))
+            .unwrap_or_else(|| self.dir.clone())
     }
 
+    /// Where saved layers live, one JSON file each so they can be copied
+    /// between rigs by hand. Global: a layer you built is a building block, not
+    /// a property of the set you happened to build it in.
+    pub fn layers_dir(&self) -> PathBuf {
+        let global = self.global_root().join("layers");
+        // Carry a workspace's layers over the first time this build runs.
+        let legacy = self.dir.join("layers");
+        if legacy != global && legacy.is_dir() {
+            migrate_dir(&legacy, &global);
+        }
+        global
+    }
+
+    /// Starred library entries. Global, for the same reason as [`Self::layers_dir`]:
+    /// a star says "I like this shader", not "I like it during this show".
     pub fn favourites_path(&self) -> PathBuf {
-        self.dir.join("favourites.json")
+        let global = self.global_root().join("favourites.json");
+        let legacy = self.dir.join("favourites.json");
+        if legacy != global && legacy.is_file() && !global.exists() {
+            migrate_file(&legacy, &global);
+        }
+        global
     }
 
     /// Ids of library entries the user starred. A missing or unreadable file
@@ -92,14 +121,16 @@ impl Workspace {
         &self,
         favourites: &std::collections::HashSet<String>,
     ) -> anyhow::Result<()> {
-        self.ensure_dir()?;
+        // The favourites file is global now, so it is that parent which has to
+        // exist — `ensure_dir` only makes the workspace.
+        let path = self.favourites_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         // Sorted, so the file does not churn between runs for no reason.
         let mut ids: Vec<&String> = favourites.iter().collect();
         ids.sort();
-        std::fs::write(
-            self.favourites_path(),
-            serde_json::to_string_pretty(&ids)?,
-        )?;
+        std::fs::write(path, serde_json::to_string_pretty(&ids)?)?;
         Ok(())
     }
 
@@ -108,8 +139,12 @@ impl Workspace {
     }
 
     /// Extra folders the library scans, on top of the bundled shaders and
-    /// assets dirs. Per-workspace, like favourites: a set is a show, and a
-    /// show has its own clips.
+    /// assets dirs.
+    ///
+    /// Still per-workspace, unlike favourites and saved layers: a set can carry
+    /// the clips for that gig. Worth revisiting — a shader library is usually a
+    /// property of the rig, and per-workspace folders mean a new set starts
+    /// with an empty library.
     pub fn load_folders(&self) -> Vec<PathBuf> {
         std::fs::read_to_string(self.folders_path())
             .ok()
@@ -133,10 +168,20 @@ impl Workspace {
         let slug: String = layer
             .name
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let slug = slug.trim_matches('_').to_string();
-        let slug = if slug.is_empty() { "layer".to_string() } else { slug };
+        let slug = if slug.is_empty() {
+            "layer".to_string()
+        } else {
+            slug
+        };
         let path = self.layers_dir().join(format!("{slug}.json"));
         std::fs::write(&path, serde_json::to_string_pretty(layer)?)?;
         Ok(path)
@@ -149,10 +194,20 @@ impl Workspace {
         let slug: String = chain
             .name
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let slug = slug.trim_matches('_').to_string();
-        let slug = if slug.is_empty() { "chain".to_string() } else { slug };
+        let slug = if slug.is_empty() {
+            "chain".to_string()
+        } else {
+            slug
+        };
         let path = dir.join(format!("{slug}.json"));
         std::fs::write(&path, serde_json::to_string_pretty(chain)?)?;
         Ok(path)
@@ -165,10 +220,20 @@ impl Workspace {
         let slug: String = group
             .name
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let slug = slug.trim_matches('_').to_string();
-        let slug = if slug.is_empty() { "group".to_string() } else { slug };
+        let slug = if slug.is_empty() {
+            "group".to_string()
+        } else {
+            slug
+        };
         let path = dir.join(format!("{slug}.json"));
         std::fs::write(&path, serde_json::to_string_pretty(group)?)?;
         Ok(path)
@@ -404,6 +469,48 @@ impl Default for UiPrefs {
     }
 }
 
+/// Copy a directory's files into `to`, skipping any that already exist.
+///
+/// Migration only fills gaps: whatever is already global was written more
+/// recently than whatever a workspace is carrying.
+fn migrate_dir(from: &Path, to: &Path) {
+    if std::fs::create_dir_all(to).is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    let mut moved = 0usize;
+    for e in entries.flatten() {
+        let Some(name) = e.path().file_name().map(|n| n.to_owned()) else {
+            continue;
+        };
+        let dst = to.join(&name);
+        if dst.exists() {
+            continue;
+        }
+        if std::fs::copy(e.path(), &dst).is_ok() {
+            moved += 1;
+        }
+    }
+    if moved > 0 {
+        log::info!(
+            "[Workspace] carried {moved} file(s) over from {}",
+            from.display()
+        );
+    }
+}
+
+/// Copy one file if the destination has none.
+fn migrate_file(from: &Path, to: &Path) {
+    if let Some(parent) = to.parent()
+        && std::fs::create_dir_all(parent).is_ok()
+        && std::fs::copy(from, to).is_ok()
+    {
+        log::info!("[Workspace] carried {} over", from.display());
+    }
+}
+
 pub fn default_workspace() -> Workspace {
     // ponytail: read-only compatibility shim. Delete once no `.varda/` remains
     // in the wild; a real migration would have to move presets/ too.
@@ -419,7 +526,11 @@ pub fn default_workspace() -> Workspace {
 /// sets would be useless. Lives beside the engine's own config, not in any
 /// `.kovvboj/`.
 fn recent_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("rustjay").join("kovvboj-recent.json"))
+    Some(
+        dirs::config_dir()?
+            .join("rustjay")
+            .join("kovvboj-recent.json"),
+    )
 }
 
 pub fn load_recent() -> Vec<PathBuf> {
@@ -474,5 +585,64 @@ mod tests {
         promote(&mut list, Path::new("/sets/5"));
         assert_eq!(list[0], PathBuf::from("/sets/5"));
         assert_eq!(list.iter().filter(|p| p.ends_with("5")).count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod global_state_tests {
+    use super::*;
+
+    /// The bug: opening a new set lost every saved layer and every star,
+    /// because both were stored in the workspace. They are building blocks you
+    /// assemble sets from, so they belong to the rig.
+    #[test]
+    fn layers_and_favourites_are_not_stored_per_workspace() {
+        // Only meaningful where a home directory exists — which is every real
+        // machine. Without one the fallback is the workspace, deliberately.
+        let Some(_) = dirs::data_dir() else { return };
+        let ws = std::env::temp_dir().join(format!("kv-global-{}", std::process::id()));
+        let w = Workspace::new(&ws);
+        assert!(
+            !w.favourites_path().starts_with(&ws),
+            "favourites must not live in the workspace: {}",
+            w.favourites_path().display()
+        );
+        assert!(
+            !w.layers_dir().starts_with(&ws),
+            "saved layers must not live in the workspace: {}",
+            w.layers_dir().display()
+        );
+        // The scene is the show, and stays with it.
+        assert!(
+            w.scene_path().starts_with(&ws),
+            "the scene is per-workspace"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn a_workspace_file_is_carried_over_but_never_clobbers() {
+        let base = std::env::temp_dir().join(format!("kv-mig-{}", std::process::id()));
+        let from = base.join("from");
+        let to = base.join("to");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("a.json"), "old").unwrap();
+        std::fs::write(from.join("b.json"), "carried").unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(to.join("a.json"), "mine").unwrap();
+
+        migrate_dir(&from, &to);
+        assert_eq!(
+            std::fs::read_to_string(to.join("a.json")).unwrap(),
+            "mine",
+            "an existing global file wins"
+        );
+        assert_eq!(
+            std::fs::read_to_string(to.join("b.json")).unwrap(),
+            "carried",
+            "a missing one is carried over"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
