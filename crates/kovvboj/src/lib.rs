@@ -93,6 +93,28 @@ pub struct KovvbojAppState {
     #[serde(skip)]
     #[cfg(feature = "mixer")]
     pub thumbs: crate::thumbs::Thumbnails,
+    /// Analysed shader library: thumbnails, weights and compile status. Loaded
+    /// from the workspace on open, so it is rebuilt rather than serialised.
+    #[serde(skip)]
+    pub previs: crate::previs::Previs,
+    /// A library scan in flight, stepped one shader per frame by the render hook.
+    #[serde(skip)]
+    pub scan: Option<crate::previs::ScanJob>,
+    /// Built on the first scan, at the engine's internal resolution. Dropped
+    /// when that resolution changes, since its target would be the wrong size.
+    #[serde(skip)]
+    previs_analyzer: Option<crate::previs::Analyzer>,
+    /// A library folder picked from the file dialog, waiting to be added.
+    /// Shared because the dialog runs off-thread, and on app state because both
+    /// the Library panel and the Library menu offer the same action.
+    /// Bumped whenever a library file changes on disk. Anything caching a
+    /// shader's *contents* — the previs hash memo, say — is stale after this,
+    /// since an edited shader hashes differently and its old weight no longer
+    /// describes it.
+    #[serde(skip)]
+    pub library_generation: u64,
+    #[serde(skip)]
+    pub pending_library_folder: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     pub ready: bool,
     /// What the inspector panel is showing. Transient — not persisted.
     #[serde(skip)]
@@ -532,9 +554,52 @@ impl KovvbojAppState {
         roots
     }
 
+    /// Analyse the next queued shader, if a scan is running.
+    ///
+    /// The analyzer owns a render target at the engine's internal resolution;
+    /// if that resolution has changed, it is rebuilt, because a weight measured
+    /// at one size says nothing about another.
+    pub fn pump_scan(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        quad: &wgpu::Buffer,
+        size: [u32; 2],
+    ) {
+        let Some(job) = self.scan.as_mut() else {
+            return;
+        };
+        if job.is_finished() {
+            log::info!(
+                "[Previs] scan finished: {} analysed, {} failed",
+                job.done,
+                job.failed
+            );
+            self.scan = None;
+            return;
+        }
+        if self.previs_analyzer.as_ref().map(|a| a.size()) != Some(size) {
+            self.previs_analyzer = Some(crate::previs::Analyzer::new(device, queue, size));
+        }
+        let Some(analyzer) = self.previs_analyzer.as_mut() else {
+            return;
+        };
+        job.step(analyzer, &mut self.previs, device, queue, quad);
+    }
+
+    /// Every shader in the library, for a scan to work through.
+    pub fn library_shader_paths(&self) -> Vec<std::path::PathBuf> {
+        self.registry
+            .shaders
+            .iter()
+            .filter_map(|e| e.path.clone())
+            .collect()
+    }
+
     /// Re-walk every library root. Called on startup, when the shader watcher
     /// sees a file appear or vanish, and when a folder is added or removed.
     pub fn rescan_library(&mut self) {
+        self.library_generation = self.library_generation.wrapping_add(1);
         self.registry = crate::sources::Registry::scan(&self.library_roots());
         log::info!(
             "[Registry] scanned {} shaders, {} images, {} videos across {} folders",
@@ -751,6 +816,11 @@ impl Default for KovvbojAppState {
             mixer: Arc::new(Mutex::new(Mixer::new())),
             #[cfg(feature = "mixer")]
             thumbs: crate::thumbs::Thumbnails::default(),
+            previs: crate::previs::Previs::default(),
+            scan: None,
+            previs_analyzer: None,
+            library_generation: 0,
+            pending_library_folder: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "laser")]
             laser: crate::ui::LaserTab::new(),
             ready: false,
@@ -1766,6 +1836,7 @@ impl EffectPlugin for KovvbojRootPlugin {
                 crate::persistence::push_recent(&state.workspace.dir);
                 state.favourites = state.workspace.load_favourites();
                 state.library_folders = state.workspace.load_folders();
+                state.previs = crate::previs::Previs::open(&state.workspace.dir);
                 state.saved_layers = state.workspace.load_layers();
                 state.saved_chains = state.workspace.load_chains();
                 state.saved_groups = state.workspace.load_groups();
@@ -1995,6 +2066,11 @@ impl EffectPlugin for KovvbojRootPlugin {
 
             if let Some(ref watcher) = state.shader_watcher {
                 let events = watcher.poll();
+                // A modify does not change the list, but it does change a
+                // shader's contents — so anything keyed on those is stale.
+                if !events.is_empty() {
+                    state.library_generation = state.library_generation.wrapping_add(1);
+                }
                 // A modify is a hot-reload, handled below and no change to the
                 // list. A create or remove is: rescan so the Library follows
                 // the folder, whether the file arrived through Add file… or was
@@ -3485,6 +3561,11 @@ impl EffectPlugin for KovvbojRootPlugin {
             app_state
                 .thumbs
                 .update(ctx.device, ctx.encoder, ctx.vertex_buffer, &mixer);
+
+            // One library shader analysed per frame, if a scan is running.
+            // Deliberately after the mixer: the scan is a pre-show job and must
+            // never delay the frame the audience is watching.
+            app_state.pump_scan(ctx.device, ctx.queue, ctx.vertex_buffer, size);
 
             // The saved corner-pin goes down to the deck each frame. Cheap, and
             // it means a workspace load, an edit and a calibration all reach the

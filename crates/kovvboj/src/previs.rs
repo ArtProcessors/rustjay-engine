@@ -122,7 +122,7 @@ pub fn hash_source(src: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in src.as_bytes() {
         h ^= u64::from(*b);
-        h = h.wrapping_mul(0x1000_0000_01b3);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{h:016x}")
 }
@@ -725,5 +725,249 @@ impl Analyzer {
         };
         self.readback.unmap();
         Some(img)
+    }
+}
+
+/// A library scan in flight.
+///
+/// One shader is analysed per frame rather than the whole queue at once: each
+/// shader blocks the GPU for tens of frames, so a batch would freeze the app
+/// with no progress and no way out. Per-frame keeps the readout moving and the
+/// cancel button live.
+#[derive(Debug, Default)]
+pub struct ScanJob {
+    queue: Vec<PathBuf>,
+    pub done: usize,
+    pub total: usize,
+    pub failed: usize,
+    cancel: bool,
+}
+
+impl ScanJob {
+    /// Queue every shader that needs analysing at this resolution.
+    ///
+    /// Anything already analysed at the same resolution is skipped, which is
+    /// what makes a rescan after adding a few shaders to a large folder cheap.
+    pub fn new(paths: impl IntoIterator<Item = PathBuf>, previs: &Previs, at: [u32; 2]) -> Self {
+        let queue: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| match std::fs::read_to_string(p) {
+                Ok(src) => previs.needs_scan(&src, at),
+                Err(_) => false,
+            })
+            .collect();
+        Self {
+            total: queue.len(),
+            queue,
+            done: 0,
+            failed: 0,
+            cancel: false,
+        }
+    }
+
+    /// Re-analyse everything, ignoring what is already cached.
+    pub fn rescan(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        let queue: Vec<PathBuf> = paths.into_iter().collect();
+        Self {
+            total: queue.len(),
+            queue,
+            done: 0,
+            failed: 0,
+            cancel: false,
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        self.cancel = true;
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.cancel || self.queue.is_empty()
+    }
+
+    /// What to show in the menu bar while this runs.
+    pub fn label(&self) -> String {
+        match self.queue.last().and_then(|p| p.file_name()) {
+            Some(name) => format!(
+                "Scanning {}/{} — {}",
+                self.done + 1,
+                self.total,
+                name.to_string_lossy()
+            ),
+            None => format!("Scanning {}/{}", self.done, self.total),
+        }
+    }
+
+    /// Analyse the next shader. Returns false when the job is done.
+    pub fn step(
+        &mut self,
+        analyzer: &mut Analyzer,
+        previs: &mut Previs,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        quad: &wgpu::Buffer,
+    ) -> bool {
+        if self.cancel {
+            self.queue.clear();
+            return false;
+        }
+        let Some(path) = self.queue.pop() else {
+            return false;
+        };
+        self.done += 1;
+        match analyzer.analyze(device, queue, quad, &path) {
+            Ok((record, thumb)) => {
+                if matches!(record.status, Status::Failed(_)) {
+                    self.failed += 1;
+                }
+                let hash = record.hash.clone();
+                if let Err(e) = previs.insert(record) {
+                    log::warn!(
+                        "[Previs] could not write record for {}: {e}",
+                        path.display()
+                    );
+                }
+                if let Some(img) = thumb
+                    && let Err(e) = previs.put_thumb(&hash, &img)
+                {
+                    log::warn!("[Previs] could not write thumb for {}: {e}", path.display());
+                }
+            }
+            Err(e) => {
+                self.failed += 1;
+                log::warn!("[Previs] {} could not be analysed: {e}", path.display());
+            }
+        }
+        !self.queue.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn a_scan_skips_what_is_already_analysed_at_this_resolution() {
+        let dir = std::env::temp_dir().join(format!("previs-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.fs");
+        let b = dir.join("b.fs");
+        std::fs::write(&a, "shader a").unwrap();
+        std::fs::write(&b, "shader b").unwrap();
+
+        let mut previs = Previs::open(&dir);
+        previs
+            .insert(Record {
+                hash: hash_source("shader a"),
+                status: Status::Ok,
+                kind: Kind::Generator,
+                ms: Some(1.0),
+                measured_at: Some([1920, 1080]),
+                has_thumb: true,
+            })
+            .unwrap();
+
+        // `a` is cached at this resolution, so only `b` is queued.
+        let job = ScanJob::new(vec![a.clone(), b.clone()], &previs, [1920, 1080]);
+        assert_eq!(job.total, 1);
+        // At another resolution its weight is meaningless, so both come back.
+        let job = ScanJob::new(vec![a.clone(), b.clone()], &previs, [1280, 720]);
+        assert_eq!(job.total, 2);
+        // A forced rescan ignores the cache entirely.
+        assert_eq!(ScanJob::rescan(vec![a, b]).total, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelling_stops_the_queue() {
+        let mut job = ScanJob::rescan(vec![PathBuf::from("x.fs"), PathBuf::from("y.fs")]);
+        assert!(!job.is_finished());
+        job.cancel();
+        assert!(job.is_finished());
+    }
+}
+
+impl Band {
+    /// Dot colour for a library row.
+    ///
+    /// Deliberately calm at the low end: 77% of a real corpus lands in `Free`,
+    /// and a heatmap where almost everything is quiet makes the few loud
+    /// entries findable. Colouring by percentile instead would paint a rainbow
+    /// over differences of a third of a millisecond.
+    pub fn colour(self) -> [u8; 3] {
+        match self {
+            Band::Free => [70, 140, 90],
+            Band::Light => [150, 160, 70],
+            Band::Notable => [200, 150, 60],
+            Band::Heavy => [210, 100, 55],
+            Band::Extreme => [200, 60, 60],
+            Band::Unknown => [90, 90, 95],
+            Band::Broken => [120, 60, 70],
+        }
+    }
+
+    /// What the row's tooltip says about cost.
+    pub fn describe(self, ms: Option<f32>) -> String {
+        let cost = match ms {
+            Some(ms) => format!("{ms:.2} ms/frame — "),
+            None => String::new(),
+        };
+        match self {
+            Band::Free => format!("{cost}under 5% of a frame; stack freely"),
+            Band::Light => format!("{cost}5-12% of a frame"),
+            Band::Notable => format!("{cost}12-25% of a frame"),
+            Band::Heavy => format!("{cost}a quarter to half a frame"),
+            Band::Extreme => format!("{cost}over half a frame on its own"),
+            Band::Unknown => "Not analysed — run Library ▸ Scan library".to_string(),
+            Band::Broken => "Does not compile".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    /// Pins the hash against the values `checked/seed_previs.py` produces.
+    ///
+    /// The seed script reimplements FNV-1a in Python; if either side drifts,
+    /// every seeded record silently resolves to nothing and the library looks
+    /// unanalysed. Cheaper to catch here than to debug there.
+    #[test]
+    fn hash_matches_the_seed_script() {
+        assert_eq!(hash_source(""), "cbf29ce484222325");
+        assert_eq!(hash_source("void"), "3173c900e37ae1df");
+        assert_eq!(hash_source("void main(){}"), "f82eeec12e61704f");
+        assert_eq!(hash_source("a"), "af63dc4c8601ec8c");
+    }
+
+    /// A seeded record — no weight yet — must load and read as "not analysed".
+    #[test]
+    fn a_seeded_record_loads_and_asks_to_be_scanned() {
+        let json = r#"{
+            "hash": "00294b5f72e5a50e",
+            "status": "Ok",
+            "kind": "Generator",
+            "ms": null,
+            "measured_at": null,
+            "has_thumb": true
+        }"#;
+        let r: Record = serde_json::from_str(json).expect("seeded record must deserialise");
+        assert!(r.has_thumb);
+        assert_eq!(r.ms, None);
+        // A thumbnail without a weight still needs scanning locally.
+        assert_eq!(Band::of(Some(&r), 60.0), Band::Unknown);
+
+        let failed = r#"{
+            "hash": "deadbeef",
+            "status": {"Failed": "naga: bad"},
+            "kind": "Effect",
+            "ms": null,
+            "measured_at": null,
+            "has_thumb": false
+        }"#;
+        let f: Record = serde_json::from_str(failed).expect("failed record must deserialise");
+        assert_eq!(Band::of(Some(&f), 60.0), Band::Broken);
     }
 }
