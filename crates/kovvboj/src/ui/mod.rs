@@ -2179,6 +2179,9 @@ mod egui_impl {
             let mut group_acts = GroupActions::default();
 
             {
+                // Reading the ids is what says previews are on screen; the
+                // render hook stops refreshing them when nothing does.
+                state.thumbs.mark_wanted();
                 let thumb_ids = state.thumbs.ids.clone();
                 let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
 
