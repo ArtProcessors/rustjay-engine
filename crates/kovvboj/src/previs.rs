@@ -6,10 +6,13 @@
 //! BPM. The one exception is a shader already live in a layer: hot-reload is
 //! rendering it anyway, so refreshing its thumbnail there is free.
 //!
-//! Results live in the workspace (`.kovvboj/previs/`) keyed by a hash of the
-//! shader source, not by path. Renaming or moving a shader keeps its analysis,
-//! two copies of the same shader share one entry, and a read-only library
-//! folder is still scannable. Each record is written as it completes, so a scan
+//! Results live beside the engine's own config rather than in any workspace,
+//! keyed by a hash of the shader source rather than by path. A shader's weight
+//! is a property of the shader and this machine's GPU, not of the show you
+//! happened to be building when you measured it — analysis that vanished when
+//! you opened a new set would mean rescanning a whole library per gig. Hashing
+//! the source means renaming or moving a shader keeps its analysis, and two
+//! copies share one entry. Each record is written as it completes, so a scan
 //! that dies partway costs only the shader it was on.
 
 use std::collections::HashMap;
@@ -157,10 +160,39 @@ pub struct Previs {
     records: HashMap<String, Record>,
 }
 
+/// Where analysis lives: global, beside the engine's other cross-set state.
+///
+/// Falls back to the workspace only when there is no home directory to speak
+/// of, which is better than losing the cache entirely.
+fn global_dir(workspace_dir: &Path) -> PathBuf {
+    // Data rather than config: this is a regenerable cache that happens to be
+    // expensive to regenerate, and on Linux that belongs under ~/.local/share.
+    dirs::data_dir()
+        .map(|d| d.join("rustjay").join("previs"))
+        .unwrap_or_else(|| workspace_dir.join("previs"))
+}
+
 impl Previs {
     /// Open (and create) the cache directory, loading whatever is already there.
+    ///
+    /// `workspace_dir` is only consulted to migrate a cache written by an
+    /// earlier build that stored analysis per-workspace, and as a last-resort
+    /// location when there is no home directory.
     pub fn open(workspace_dir: &Path) -> Self {
-        let dir = workspace_dir.join("previs");
+        let dir = global_dir(workspace_dir);
+        let legacy = workspace_dir.join("previs");
+        if legacy != dir && legacy.is_dir() {
+            migrate(&legacy, &dir);
+        }
+        Self::open_at(dir)
+    }
+
+    /// Open a cache at an explicit directory.
+    ///
+    /// Separate from [`Self::open`] so a test can point at a temporary
+    /// directory: writing through the global path would have every test run
+    /// scribble on the user's real analysis.
+    pub fn open_at(dir: PathBuf) -> Self {
         let mut records = HashMap::new();
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for e in entries.flatten() {
@@ -176,6 +208,11 @@ impl Previs {
             }
         }
         Self { dir, records }
+    }
+
+    /// The directory analysis is being read from and written to.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     pub fn get(&self, hash: &str) -> Option<&Record> {
@@ -388,11 +425,62 @@ mod tests {
         assert_eq!(Band::of(None, 60.0), Band::Unknown);
     }
 
+    /// The bug this guards: analysis was written into the workspace, so opening
+    /// a new set showed a freshly scanned library as entirely unanalysed. A
+    /// weight belongs to the shader and the GPU, not to the show.
+    #[test]
+    fn analysis_does_not_live_in_the_workspace() {
+        let ws = std::env::temp_dir().join(format!("previs-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let p = Previs::open(&ws);
+        // Only meaningful where a home directory exists, which is every real
+        // machine; the fallback path is exercised by not asserting otherwise.
+        if dirs::data_dir().is_some() {
+            assert!(
+                !p.dir().starts_with(&ws),
+                "analysis must not be stored per-workspace, got {}",
+                p.dir().display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A cache written by an earlier per-workspace build must not be thrown
+    /// away: rescanning a library costs hours.
+    #[test]
+    fn a_workspace_cache_is_carried_over() {
+        let ws = std::env::temp_dir().join(format!("previs-mig-{}", std::process::id()));
+        let dest = std::env::temp_dir().join(format!("previs-mig-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&dest);
+        let legacy = ws.join("previs");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("abc.json"), "{}").unwrap();
+        std::fs::write(legacy.join("abc.png"), "not really a png").unwrap();
+        // Pre-existing entries win: a local measurement beats a carried one.
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("abc.json"), "mine").unwrap();
+
+        migrate(&legacy, &dest);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("abc.json")).unwrap(),
+            "mine",
+            "migration must not clobber an existing record"
+        );
+        assert!(
+            dest.join("abc.png").exists(),
+            "missing files are carried over"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
     #[test]
     fn a_weight_from_another_resolution_is_rescanned() {
         let dir = std::env::temp_dir().join(format!("previs-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut p = Previs::open(&dir);
+        let mut p = Previs::open_at(dir.clone());
         let src = "void main(){}";
         assert!(p.needs_scan(src, [1920, 1080]));
         p.insert(Record {
@@ -413,7 +501,7 @@ mod tests {
     fn a_failed_shader_is_not_rescanned_forever() {
         let dir = std::env::temp_dir().join(format!("previs-fail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut p = Previs::open(&dir);
+        let mut p = Previs::open_at(dir.clone());
         let src = "broken";
         p.insert(Record {
             hash: hash_source(src),
@@ -433,7 +521,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("previs-reopen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let hash = {
-            let mut p = Previs::open(&dir);
+            let mut p = Previs::open_at(dir.clone());
             let h = hash_source("x");
             p.insert(Record {
                 hash: h.clone(),
@@ -446,7 +534,7 @@ mod tests {
             .unwrap();
             h
         };
-        let reopened = Previs::open(&dir);
+        let reopened = Previs::open_at(dir.clone());
         assert_eq!(reopened.get(&hash).and_then(|r| r.ms), Some(2.5));
         assert_eq!(reopened.get(&hash).map(|r| r.kind), Some(Kind::Effect));
         let _ = std::fs::remove_dir_all(&dir);
@@ -475,6 +563,40 @@ mod tests {
         if let Ok(path) = std::env::var("PREVIS_DUMP_CARD") {
             test_card(1280, 720).save(path).unwrap();
         }
+    }
+}
+
+/// Copy a per-workspace cache into the global one, once.
+///
+/// Only fills gaps: a record already measured on this machine is better than
+/// one carried over from a workspace, and copying is skipped entirely if the
+/// destination already has an entry.
+fn migrate(from: &Path, to: &Path) {
+    if std::fs::create_dir_all(to).is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    let mut moved = 0usize;
+    for e in entries.flatten() {
+        let src = e.path();
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        let dst = to.join(name);
+        if dst.exists() {
+            continue;
+        }
+        if std::fs::copy(&src, &dst).is_ok() {
+            moved += 1;
+        }
+    }
+    if moved > 0 {
+        log::info!(
+            "[Previs] carried {moved} file(s) over from {} — analysis is global now",
+            from.display()
+        );
     }
 }
 
@@ -856,7 +978,7 @@ mod scan_tests {
         std::fs::write(&a, "shader a").unwrap();
         std::fs::write(&b, "shader b").unwrap();
 
-        let mut previs = Previs::open(&dir);
+        let mut previs = Previs::open_at(dir.clone());
         previs
             .insert(Record {
                 hash: hash_source("shader a"),
