@@ -346,8 +346,18 @@ exists.
    pre-existing bug: the master pass anchored a group at its topmost member
    outright, but only visits contributing channels — so muting the top layer of
    a group stopped the whole group being blended.
-4. **Deck roles** — two permanent top-level groups, transition pass between
-   their `group_out`, `"crossfader"` registered as a param, 0/1 early-out.
+4. ~~**Deck roles** — two permanent top-level groups, transition pass between
+   their `group_out`, `"crossfader"` registered as a param, 0/1 early-out.~~
+   **Done** `2cff0d3` (mixer) + `255b74e` (kovvboj).
+
+   Two things the plan got wrong: `"crossfader"` was **already** registered by
+   `Mixer::parameters()`, so that item was zero work. And `prepare` holds
+   `&EngineState`, so the fader reaches `transition_progress` through
+   `EngineState::param_restore` — the queue the renderer drains each frame,
+   which exists for exactly this.
+
+   Not yet exercised in the app — no UI reaches the fader or picks a shader
+   until step 5, so this is compiled and unit-tested but not seen.
 5. **UI** — two stacks, crossfader strip, flanking previews, `[A][B]` library
    buttons, transition picker.
 6. **TAKE** — wire `AutoCrossfade` / `BeatSyncCrossfade` / sequencer to the
