@@ -1449,13 +1449,17 @@ impl KovvbojShell {
                 );
             }
             // Nothing published yet: hold the space so the fader does not jump
-            // sideways on the frame the previews arrive.
+            // sideways on the frame the previews arrive. Dark and outlined —
+            // a light slab reads as a blown-out image rather than an empty one.
             None => {
                 let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                ui.painter().rect_filled(
+                let painter = ui.painter();
+                painter.rect_filled(rect, 2.0, ui.style().visuals.extreme_bg_color);
+                painter.rect_stroke(
                     rect,
                     2.0,
-                    rustjay_gui::egui_theme::colors::ink_2(),
+                    egui::Stroke::new(1.0, rustjay_gui::egui_theme::colors::ink_2()),
+                    egui::StrokeKind::Inside,
                 );
             }
         }

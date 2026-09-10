@@ -298,6 +298,12 @@ impl OutputsTab {
 /// scrollable span: zero outside the edge margins, faster the deeper in.
 /// Axis-agnostic — works for the vertical layer list and the horizontal FX
 /// strips. Pure so it is unit-testable; the caller owns applying the offset.
+/// The uuid of deck `d`.
+#[cfg(all(feature = "mixer", feature = "egui"))]
+fn deck_uuid(d: usize) -> &'static str {
+    if d == 1 { crate::DECK_B } else { crate::DECK_A }
+}
+
 /// The library's add-target buttons: `[A][B]` when a set has decks, a plain
 /// `➕` when it does not.
 ///
@@ -312,20 +318,27 @@ pub fn deck_add_buttons(ui: &mut egui::Ui, decked: bool, what: &str) -> Option<O
             .clicked()
             .then_some(None);
     }
+    // Library rows lay out right-to-left, so B goes in first for A to end up
+    // on the left — the order they read in everywhere else.
+    //
+    // Tight, because two buttons have to fit where one ➕ did: at the stock
+    // library width the second was clipped off the panel edge entirely.
+    ui.spacing_mut().item_spacing.x = 2.0;
+    ui.spacing_mut().button_padding.x = 3.0;
     let mut picked = None;
-    if ui
-        .small_button("A")
-        .on_hover_text(format!("{what} on deck A"))
-        .clicked()
-    {
-        picked = Some(Some(0));
-    }
     if ui
         .small_button("B")
         .on_hover_text(format!("{what} on deck B"))
         .clicked()
     {
         picked = Some(Some(1));
+    }
+    if ui
+        .small_button("A")
+        .on_hover_text(format!("{what} on deck A"))
+        .clicked()
+    {
+        picked = Some(Some(0));
     }
     picked
 }
@@ -2264,7 +2277,17 @@ mod egui_impl {
                         let gid = g.uuid.clone();
                         let members = mixer.group_members(&gid);
                         let gi = mixer.groups.iter().position(|x| x.uuid == gid).unwrap();
-                        if members.last() == Some(&idx) {
+                        // A deck column is already the deck's own header: the
+                        // column heading names it, and the crossfader strip
+                        // carries its controls. Drawing the group row too gave
+                        // two headings, an ✕ on furniture that cannot be
+                        // deleted, and a row that does not fit half a width —
+                        // its name field, opacity slider and S/M overlapped.
+                        // Groups *inside* the deck still announce themselves.
+                        let is_this_deck = self
+                            .deck
+                            .is_some_and(|d| mixer.deck_of(&gid) == Some(d) && gid == deck_uuid(d));
+                        if members.last() == Some(&idx) && !is_this_deck {
                             let sel = matches!(
                                 &selection,
                                 crate::Selection::Group { group } if *group == gid
