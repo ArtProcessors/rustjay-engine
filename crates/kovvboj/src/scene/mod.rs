@@ -407,6 +407,16 @@ pub struct SavedGroup {
 
 #[cfg(feature = "mixer")]
 impl SavedGroup {
+    /// Whether this was saved from a deck rather than from a group.
+    ///
+    /// Derived from `group_uuid` rather than stored: a save whose top-level
+    /// group *is* a deck is a deck save, by construction. Nothing to default,
+    /// nothing to migrate, and every file ever written classifies itself —
+    /// including the ones already in a workspace.
+    pub fn is_deck(&self) -> bool {
+        self.group_uuid == crate::DECK_A || self.group_uuid == crate::DECK_B
+    }
+
     /// Capture a group and everything under it: every layer at any depth, and
     /// every group nested inside it.
     pub fn capture(
@@ -1113,6 +1123,23 @@ mod tests {
             serde_json::from_str(json).expect("an older saved group must still parse");
         assert!(back.groups.is_empty());
         assert_eq!(back.instantiate_into("deck_b").group_uuid, "deck_b");
+    }
+
+    /// Which section of the library a save belongs in, decided by what it is
+    /// rather than by a flag someone has to remember to set — so the saves
+    /// already in a workspace classify themselves.
+    #[test]
+    fn a_save_from_a_deck_knows_it_came_from_a_deck() {
+        assert!(!saved_group().is_deck(), "an ordinary group is not a deck");
+
+        let json = r#"{"name":"Deck B","group_uuid":"deck_b","layers":[],
+            "opacity":1.0,"blend_mode":"Normal"}"#;
+        let back: SavedGroup = serde_json::from_str(json).expect("parse");
+        assert!(
+            back.is_deck(),
+            "a file written before there were sections still reads as a deck save"
+        );
+        assert!(back.instantiate_into(crate::DECK_A).group_uuid == crate::DECK_A);
     }
 
     #[test]

@@ -1587,6 +1587,10 @@ pub struct KovvbojRootPlugin {
     /// back to where the base still sat.
     #[cfg(feature = "mixer")]
     crossfade_owned: bool,
+    /// How many layers were on no deck last time anyone looked. Only a change
+    /// is worth saying anything about — see the check in `prepare`.
+    #[cfg(feature = "mixer")]
+    off_deck_seen: usize,
     /// Per-projector warp state. Each projector gets its own sync so surface-
     /// specific warp edits don't leak across outputs.
     #[cfg(feature = "projection")]
@@ -1621,6 +1625,8 @@ impl KovvbojRootPlugin {
             pending_params: None,
             #[cfg(feature = "mixer")]
             crossfade_owned: false,
+            #[cfg(feature = "mixer")]
+            off_deck_seen: 0,
             #[cfg(feature = "projection")]
             warp_syncs: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "projection")]
@@ -2641,14 +2647,41 @@ impl EffectPlugin for KovvbojRootPlugin {
                 // quietly composite as ordinary groups, which is a failure that
                 // looks like nothing happening. Two `any()` over at most eight
                 // groups is not worth being clever about.
-                let decked = self
+                let (decked, off_deck) = self
                     .mixer
                     .lock()
                     .map(|mut m| {
                         ensure_decks(&mut m);
-                        m.decks.is_some() && m.transition.is_some()
+                        (
+                            m.decks.is_some() && m.transition.is_some(),
+                            m.channels_off_deck().len(),
+                        )
                     })
-                    .unwrap_or(false);
+                    .unwrap_or((false, 0));
+
+                // Nothing should ever be off a deck: neither column lists such
+                // a layer, so it renders into the master with no way to reach
+                // it, and every "my layers disappeared" report has been this
+                // shape. The paths that used to do it are fixed; this is here
+                // so the next one to try says so out loud instead of losing
+                // someone's layer quietly.
+                if off_deck != self.off_deck_seen {
+                    if off_deck > self.off_deck_seen {
+                        log::warn!(
+                            "[Decks] {off_deck} layer(s) belong to no deck — they render but no \
+                             column shows them"
+                        );
+                        engine.notify(
+                            format!(
+                                "{off_deck} layer(s) are on no deck — they still render, but \
+                                 no column can show them"
+                            ),
+                            rustjay_core::NotificationLevel::Error,
+                            std::time::Duration::from_secs(6),
+                        );
+                    }
+                    self.off_deck_seen = off_deck;
+                }
                 if decked
                     && let Some(x) = engine.get_param("crossfader")
                     && let Ok(mut restore) = engine.param_restore.lock()
@@ -5281,5 +5314,117 @@ mod take_tests {
         assert!(!m.sequencer.playing, "the sequencer outranks auto in the tick");
         assert!(m.beat_sync.is_none());
         assert!(m.auto.is_some());
+    }
+}
+
+/// Grouping layers on a deck must leave them on that deck.
+///
+/// Reported as "the layers were deleted": the new group was created at top
+/// level and took its members out of the deck, where no column lists them and
+/// the transition does not composite them.
+#[cfg(all(test, feature = "mixer"))]
+mod grouping_inside_a_deck_tests {
+    use super::*;
+
+    struct Stub;
+    impl rustjay_core::EffectInstance for Stub {
+        fn render_to(
+            &mut self,
+            _ctx: &mut rustjay_core::RenderCtx<'_>,
+            _inputs: &[rustjay_core::EffectInput<'_>],
+            _target: rustjay_core::RenderTarget<'_>,
+            _engine: &EngineState,
+        ) {
+        }
+    }
+
+    fn deck_mixer(layers: &[(&str, &str)]) -> Mixer {
+        let mut m = Mixer::new();
+        m.use_crossfader = false;
+        for (uuid, deck) in layers {
+            let mut ch = Channel::new(*uuid, *uuid, Box::new(Stub));
+            ch.group = Some((*deck).to_string());
+            m.add_channel(ch).unwrap();
+        }
+        ensure_decks(&mut m);
+        m
+    }
+
+    #[test]
+    fn a_group_made_inside_a_deck_stays_inside_it() {
+        let mut m = deck_mixer(&[("a", DECK_A), ("b", DECK_A), ("c", DECK_B)]);
+        let gid = m
+            .group_channels("g1", "Group 1", &["a".into(), "b".into()])
+            .expect("two members is enough");
+
+        assert_eq!(
+            m.groups.iter().find(|g| g.uuid == gid).unwrap().parent.as_deref(),
+            Some(DECK_A),
+            "the new group hangs off the deck its members were on"
+        );
+        assert_eq!(m.deck_of(&gid), Some(0));
+        for uuid in ["a", "b"] {
+            let i = m.channels.iter().position(|c| c.uuid == uuid).unwrap();
+            assert_eq!(
+                m.deck_of_channel(i),
+                Some(0),
+                "'{uuid}' must still be on deck A after grouping"
+            );
+        }
+        assert!(
+            m.channels_off_deck().is_empty(),
+            "no layer may end up on no deck: {:?}",
+            m.channels_off_deck()
+        );
+    }
+
+    #[test]
+    fn dissolving_a_group_inside_a_deck_leaves_its_layers_on_the_deck() {
+        let mut m = deck_mixer(&[("a", DECK_A), ("b", DECK_A), ("c", DECK_B)]);
+        let gid = m
+            .group_channels("g1", "Group 1", &["a".into(), "b".into()])
+            .unwrap();
+        m.ungroup(&gid);
+
+        for uuid in ["a", "b"] {
+            let i = m.channels.iter().position(|c| c.uuid == uuid).unwrap();
+            assert_eq!(m.deck_of_channel(i), Some(0), "'{uuid}' fell off the deck");
+        }
+        assert!(m.channels_off_deck().is_empty());
+    }
+
+    #[test]
+    fn dissolving_a_group_rehomes_the_groups_inside_it() {
+        let mut m = deck_mixer(&[("a", DECK_A), ("b", DECK_A), ("c", DECK_A), ("d", DECK_A)]);
+        let outer = m
+            .group_channels("outer", "Outer", &["a".into(), "b".into()])
+            .unwrap();
+        let inner = m
+            .group_channels("inner", "Inner", &["a".into(), "b".into()])
+            .unwrap();
+        assert_eq!(
+            m.groups.iter().find(|g| g.uuid == inner).unwrap().parent.as_deref(),
+            Some(outer.as_str()),
+            "a group made from one group's members nests inside it"
+        );
+
+        m.ungroup(&outer);
+        assert_eq!(
+            m.groups.iter().find(|g| g.uuid == inner).unwrap().parent.as_deref(),
+            Some(DECK_A),
+            "the inner group must not be left pointing at a group that is gone"
+        );
+        assert!(m.channels_off_deck().is_empty());
+    }
+
+    #[test]
+    fn nothing_is_off_deck_in_a_normal_set() {
+        let m = deck_mixer(&[("a", DECK_A), ("b", DECK_B)]);
+        assert!(m.channels_off_deck().is_empty());
+
+        // And the check only means anything with decks configured.
+        let mut plain = Mixer::new();
+        plain.add_channel(Channel::new("x", "x", Box::new(Stub))).unwrap();
+        assert!(plain.channels_off_deck().is_empty());
     }
 }

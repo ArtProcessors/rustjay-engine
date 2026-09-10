@@ -2112,20 +2112,33 @@ mod egui_impl {
             }
             let n = mixer.group_members(&uuid).len();
             let name = mixer.groups[gi].name.clone();
-            if ui
-                .selectable_label(
-                    selected,
-                    egui::RichText::new(format!("⛶ {name}")).strong().monospace(),
-                )
-                .on_hover_text(format!(
-                    "{n} layers composited together — select it, then add an effect from the library"
-                ))
-                .clicked()
-            {
-                acts.select = Some(uuid.clone());
-            }
+            // A deck column is half a window wide, and groups live inside decks
+            // now, so this row has to fit one. Laid out right-to-left it
+            // anchored to an edge the column does not have and spilled over its
+            // neighbour; bounded left-to-right, the name is what gives way.
+            const CONTROLS: f32 = 210.0;
+            let name_w = (ui.available_width() - CONTROLS).clamp(48.0, 260.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(name_w, ui.spacing().interact_size.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    if ui
+                        .selectable_label(
+                            selected,
+                            egui::RichText::new(format!("⛶ {name}")).strong().monospace(),
+                        )
+                        .on_hover_text(format!(
+                            "{n} layers composited together — select it, then add an effect from the library"
+                        ))
+                        .clicked()
+                    {
+                        acts.select = Some(uuid.clone());
+                    }
+                },
+            );
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            {
+                let ui = &mut *ui;
                 if ui
                     .small_button("✖")
                     .on_hover_text("Ungroup — the layers stay")
@@ -2149,8 +2162,12 @@ mod egui_impl {
                 let mut op = engine
                     .get_param_base(&key)
                     .unwrap_or(mixer.groups[gi].opacity);
+                let slider_w = (ui.available_width() - 56.0).clamp(40.0, 80.0);
                 if ui
-                    .add_sized([80.0, 18.0], egui::Slider::new(&mut op, 0.0..=1.0).show_value(false))
+                    .add_sized(
+                        [slider_w, 18.0],
+                        egui::Slider::new(&mut op, 0.0..=1.0).show_value(false),
+                    )
                     .on_hover_text("Group opacity")
                     .changed()
                 {
@@ -2167,7 +2184,7 @@ mod egui_impl {
                     solo = !solo;
                     mixer.groups[gi].solo = solo;
                 }
-            });
+            }
         });
 
         // The group's own chain: what every member passes through together.
@@ -2246,25 +2263,50 @@ mod egui_impl {
                 let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
 
                 // Drawn top-first so the list reads the way it composites.
-                // A deck column shows only what composites into that deck, at
-                // any nesting depth; an ungrouped layer belongs to neither and
-                // shows in the full stack only.
-                let order: Vec<String> = mixer
+                // A deck column shows what composites into that deck, at any
+                // nesting depth.
+                //
+                // A layer on *no* deck still renders — it blends straight into
+                // the master, above the transition, ignoring the fader — so it
+                // has to be somewhere you can see it. Deck A's column takes
+                // them, under a heading that says what they are. Nothing else
+                // in the deck layout lists them, and a layer nothing lists is
+                // indistinguishable from a deleted one: that is exactly what
+                // "grouping deleted my layers" turned out to be.
+                let off_deck = |m: &rustjay_mixer::Mixer, i: usize| {
+                    m.decks.is_some() && m.deck_of_channel(i).is_none()
+                };
+                let order: Vec<(String, bool)> = mixer
                     .channels
                     .iter()
                     .enumerate()
                     .rev()
                     .filter(|(i, _)| match self.deck {
                         None => true,
-                        Some(d) => mixer.deck_of_channel(*i) == Some(d),
+                        Some(d) => {
+                            mixer.deck_of_channel(*i) == Some(d)
+                                || (d == 0 && off_deck(&mixer, *i))
+                        }
                     })
-                    .map(|(_, c)| c.uuid.clone())
+                    .map(|(i, c)| (c.uuid.clone(), off_deck(&mixer, i)))
                     .collect();
+                let mut said_off_deck = false;
 
-                for uuid in order.iter() {
+                for (uuid, is_off_deck) in order.iter() {
                     let Some(idx) = mixer.channels.iter().position(|c| c.uuid == *uuid) else {
                         continue;
                     };
+                    if *is_off_deck && !said_off_deck {
+                        said_off_deck = true;
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("NOT ON A DECK — ignores the crossfader")
+                                .monospace()
+                                .size(10.0)
+                                .color(rustjay_gui::egui_theme::colors::ink_3()),
+                        );
+                        ui.separator();
+                    }
 
                     // A group announces itself above its topmost member, then
                     // its members follow indented — unless it is collapsed, in
@@ -2712,21 +2754,49 @@ mod egui_impl {
 
                 // Grouping, before the restack invalidates indices.
                 if want_group && picked.len() > 1 {
-                    undo_snapshot.get_or_insert_with(|| {
-                        crate::scene::Topology::from_mixer(&mixer, &state.layer_sources)
-                    });
-                    let uuid = crate::scene::new_uuid();
-                    let name = format!("Group {}", mixer.groups.len() + 1);
                     let members: Vec<String> = picked.iter().cloned().collect();
-                    // Gathers them together; a scattered pick is grouped rather
-                    // than refused, which is what every editor does.
-                    state.params_dirty_request = true;
-                    if mixer.group_channels(uuid, name, &members).is_none() {
+                    // A group belongs to one deck. `group_channels` puts it
+                    // inside whatever its members shared, so a pick spanning
+                    // both decks — or one that includes a layer on no deck —
+                    // would land it at top level, where in deck mode no column
+                    // lists it and the transition does not composite it.
+                    // Refused, rather than silently moving layers between decks
+                    // during a gesture that says nothing about decks.
+                    let decks_of: Vec<Option<usize>> = members
+                        .iter()
+                        .map(|u| {
+                            mixer
+                                .channels
+                                .iter()
+                                .position(|c| &c.uuid == u)
+                                .and_then(|i| mixer.deck_of_channel(i))
+                        })
+                        .collect();
+                    let one_deck = decks_of.first().is_some_and(|d| d.is_some())
+                        && decks_of.windows(2).all(|w| w[0] == w[1]);
+                    if mixer.decks.is_some() && !one_deck {
                         engine.notify(
-                            "Pick at least two layers to group".to_string(),
+                            "A group lives on one deck — pick layers from a single deck"
+                                .to_string(),
                             rustjay_core::NotificationLevel::Error,
                             std::time::Duration::from_secs(4),
                         );
+                    } else {
+                        undo_snapshot.get_or_insert_with(|| {
+                            crate::scene::Topology::from_mixer(&mixer, &state.layer_sources)
+                        });
+                        let uuid = crate::scene::new_uuid();
+                        let name = format!("Group {}", mixer.groups.len() + 1);
+                        // Gathers them together; a scattered pick is grouped
+                        // rather than refused, which is what every editor does.
+                        state.params_dirty_request = true;
+                        if mixer.group_channels(uuid, name, &members).is_none() {
+                            engine.notify(
+                                "Pick at least two layers to group".to_string(),
+                                rustjay_core::NotificationLevel::Error,
+                                std::time::Duration::from_secs(4),
+                            );
+                        }
                     }
                     clear_picks = true;
                 }
@@ -2734,7 +2804,22 @@ mod egui_impl {
                     undo_snapshot.get_or_insert_with(|| {
                         crate::scene::Topology::from_mixer(&mixer, &state.layer_sources)
                     });
-                    mixer.set_channel_group(&layer, None);
+                    // Out of the group, into whatever held the group — the deck,
+                    // usually. `None` would take it off the deck entirely, and
+                    // off a deck there is no column to see it in.
+                    let parent = mixer
+                        .channels
+                        .iter()
+                        .find(|c| c.uuid == layer)
+                        .and_then(|c| c.group.clone())
+                        .and_then(|gid| {
+                            mixer
+                                .groups
+                                .iter()
+                                .find(|g| g.uuid == gid)
+                                .and_then(|g| g.parent.clone())
+                        });
+                    mixer.set_channel_group(&layer, parent);
                     state.params_dirty_request = true;
                 }
                 if let Some(uuid) = ungroup_at
@@ -3309,14 +3394,27 @@ mod egui_impl {
                         ui.add_space(4.0);
                     }
 
-                    // Saved groups: whole arrangements of layers.
+                    // Saved decks and saved groups: the same file on disk, but
+                    // a whole deck is not a group of layers and does not read
+                    // like one, so the library lists them apart. Which is which
+                    // is `SavedGroup::is_deck` — the top-level uuid, derived.
                     #[cfg(feature = "mixer")]
-                    if !state.saved_groups.is_empty() {
-                        let open = heading(ui, "GROUPS", "➕ adds its layers");
+                    for (title, hint, decks_only) in [
+                        ("DECKS", "A / B loads it onto a deck", true),
+                        ("GROUPS", "A / B adds its layers", false),
+                    ] {
+                        if !state
+                            .saved_groups
+                            .iter()
+                            .any(|g| g.is_deck() == decks_only)
+                        {
+                            continue;
+                        }
+                        let open = heading(ui, title, hint);
                         let mut groups: Vec<&crate::scene::SavedGroup> = state
                             .saved_groups
                             .iter()
-                            .filter(|g| open && hit(&g.name))
+                            .filter(|g| g.is_deck() == decks_only && open && hit(&g.name))
                             .collect();
                         groups.sort_by_key(|g| !favourites.contains(&g.name));
                         for g in groups {
@@ -3338,9 +3436,15 @@ mod egui_impl {
                                 ui.with_layout(
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
-                                        if let Some(deck) =
-                                            super::deck_add_buttons(ui, decked, "Load this group")
-                                        {
+                                        if let Some(deck) = super::deck_add_buttons(
+                                            ui,
+                                            decked,
+                                            if decks_only {
+                                                "Load this deck onto"
+                                            } else {
+                                                "Load this group onto"
+                                            },
+                                        ) {
                                             queue_group_recall = Some(((*g).clone(), deck));
                                         }
                                         if ui
@@ -3359,8 +3463,13 @@ mod egui_impl {
                                             size,
                                             egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
+                                                // A stack for a deck, a frame
+                                                // for a group. Both are in the
+                                                // font the app ships with; 🎛
+                                                // was not, and drew as a box.
+                                                let icon = if decks_only { "≡" } else { "⛶" };
                                                 ui.add(
-                                                    egui::Label::new(format!("⛶ {}", g.name))
+                                                    egui::Label::new(format!("{icon} {}", g.name))
                                                         .truncate(),
                                                 )
                                                 .on_hover_text(format!("{n} layers"));

@@ -65,6 +65,9 @@ pub struct KovvbojShell {
     /// when a set has no decks.
     deck_a: DeckTab,
     deck_b: DeckTab,
+    /// What each deck is about to be saved as, while it is being typed.
+    /// Cleared on save, and not persisted — a name in flight is not state.
+    deck_name: [String; 2],
     master: MixerTab,
     stage: StageTab,
     #[cfg(feature = "webcam")]
@@ -181,6 +184,7 @@ impl KovvbojShell {
             decks: DeckTab::default(),
             deck_a: DeckTab::for_deck(0),
             deck_b: DeckTab::for_deck(1),
+            deck_name: [String::new(), String::new()],
             master: MixerTab::default(),
             stage: StageTab::new(),
             #[cfg(feature = "webcam")]
@@ -622,15 +626,23 @@ impl AnyEguiShell for KovvbojShell {
                             let mut right = full;
                             right.min.x = mid + 4.0;
 
+                            // Both axes: a layer row has a minimum width — the
+                            // blend picker and the mix buttons do not shrink —
+                            // and half a window can be under it. Scrolling
+                            // sideways keeps a narrow column's rows reachable
+                            // *and* keeps them inside their own column: without
+                            // it the first row over the width silently widened
+                            // the ones after it, which painted deck A's layers
+                            // across deck B.
                             ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
-                                Self::deck_heading(ui, "DECK A", app_state, 0);
-                                egui::ScrollArea::vertical()
+                                self.deck_heading(ui, "DECK A", app_state, 0);
+                                egui::ScrollArea::both()
                                     .id_salt("deck_a_scroll")
                                     .show(ui, |ui| tab(&mut self.deck_a, ui, app_state, &engine));
                             });
                             ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                                Self::deck_heading(ui, "DECK B", app_state, 1);
-                                egui::ScrollArea::vertical()
+                                self.deck_heading(ui, "DECK B", app_state, 1);
+                                egui::ScrollArea::both()
                                     .id_salt("deck_b_scroll")
                                     .show(ui, |ui| tab(&mut self.deck_b, ui, app_state, &engine))
                             })
@@ -1359,10 +1371,20 @@ impl KovvbojShell {
 
     /// A deck column's heading, with the one verb a deck has of its own.
     ///
-    /// A deck draws no group row — the column *is* the header — so 💾 lives
-    /// here instead, where a group's would be.
+    /// A deck draws no group row — the column *is* the header — so saving lives
+    /// here instead, where a group's 💾 would be. Named on the way out, the way
+    /// the master chain is: a deck's own name is always "Deck A", so saving
+    /// under it wrote the same file every time and replaced the last look
+    /// silently. Typing a name and saving is one gesture, and a name already
+    /// taken says "replaces" *before* the click, not after.
     #[cfg_attr(not(feature = "mixer"), allow(unused_variables))]
-    fn deck_heading(ui: &mut egui::Ui, label: &str, app_state: &mut dyn std::any::Any, deck: usize) {
+    fn deck_heading(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        app_state: &mut dyn std::any::Any,
+        deck: usize,
+    ) {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(label)
@@ -1371,28 +1393,37 @@ impl KovvbojShell {
                     .color(rustjay_gui::egui_theme::colors::ink_4()),
             );
             #[cfg(feature = "mixer")]
-            if ui
-                .small_button("💾")
-                .on_hover_text("Save this deck to the library, layers and all")
-                .clicked()
-                && let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>()
             {
-                let uuid = if deck == 1 { crate::DECK_B } else { crate::DECK_A };
-                // Under the deck's own name, exactly as a group saves under
-                // its: renaming the deck in the inspector is how you save a
-                // second look without overwriting the first.
-                let name = state
-                    .mixer
-                    .lock()
-                    .ok()
-                    .and_then(|m| {
-                        m.groups
-                            .iter()
-                            .find(|g| g.uuid == uuid)
-                            .map(|g| g.name.clone())
-                    })
-                    .unwrap_or_else(|| label.to_string());
-                state.pending_group_save = Some((uuid.to_string(), name));
+                let typed = &mut self.deck_name[deck.min(1)];
+                let entry = ui.add(
+                    egui::TextEdit::singleline(typed)
+                        .hint_text("deck name")
+                        .desired_width(110.0),
+                );
+                let name = typed.trim().to_string();
+                let named = !name.is_empty();
+                // Enter saves, so naming and saving is one gesture.
+                let entered =
+                    entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && named;
+                let clicked = ui
+                    .add_enabled(named, egui::Button::new("💾").small())
+                    .on_hover_text("Save this deck to the library, layers and all")
+                    .on_disabled_hover_text("Give the deck a name first")
+                    .clicked();
+                if let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>() {
+                    if entered || clicked {
+                        let uuid = if deck == 1 { crate::DECK_B } else { crate::DECK_A };
+                        state.pending_group_save = Some((uuid.to_string(), name.clone()));
+                        self.deck_name[deck.min(1)].clear();
+                    } else if named && state.saved_groups.iter().any(|g| g.name == name) {
+                        // One name is one file, deck or group: say so first.
+                        ui.label(
+                            egui::RichText::new("replaces")
+                                .size(10.0)
+                                .color(rustjay_gui::egui_theme::colors::amber()),
+                        );
+                    }
+                }
             }
         });
         ui.separator();

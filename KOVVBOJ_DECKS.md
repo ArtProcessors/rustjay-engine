@@ -433,6 +433,55 @@ exists.
    still adds. 💾 on the deck column heading saves; the library's GROUPS rows
    grew the same `[A][B]` buttons the source rows have.
 
+## What user testing found
+
+Three, all of them the same shape underneath: a deck is a group, and the code
+that made groups did not know decks existed.
+
+1. **Grouping layers inside a deck made them vanish.** `group_channels` pushed
+   the new group at top level, which took its members *out* of the deck. In deck
+   mode neither column lists a layer that is on no deck, and the transition does
+   not composite one, so they were unreachable and read as deleted. A new group
+   now inherits whatever its members already shared — grouping inside a folder
+   keeps you in the folder — which is a general rule that happens to fix decks.
+   `ungroup` had the same bug in reverse (members and nested groups dropped to
+   `None`, orphaning them and leaving dangling parent pointers), and so did
+   "remove from group".
+
+   **Edge cases:** a pick spanning both decks, or mixing decked and free layers,
+   is **refused** with a notification. Silently moving layers between decks
+   during a gesture that says nothing about decks is worse than saying no. The
+   gather-to-contiguous can reorder members past a layer of the other deck; that
+   is harmless, because deck membership is `Channel::group`, not an index range,
+   and both decks resolve to one image at one anchor.
+
+   **The guard:** `Mixer::channels_off_deck` names the condition, `prepare`
+   warns when it changes, and — since the free tier is a deliberate part of the
+   design, not something to repair away — deck A's column now lists those layers
+   under **NOT ON A DECK — ignores the crossfader**. A layer nothing lists is
+   indistinguishable from a deleted one; that is the whole bug, so the fix is to
+   list it.
+
+2. **Deck saves could not be named** and overwrote each other: a deck's name is
+   always "Deck A", and that is what the filename came from. The heading now
+   carries a name field, Enter or 💾 to save, and an amber "replaces" the moment
+   the typed name matches something already saved — the shape `MixerTab` already
+   uses for the master chain.
+
+3. **Saved decks were filed under GROUPS.** The library lists **DECKS** and
+   **GROUPS** separately, split on `SavedGroup::is_deck()` — *derived* from
+   `group_uuid` rather than stored as a flag and rather than moved to their own
+   directory. One directory stays one namespace, there is nothing to migrate,
+   and every file already in a workspace classifies itself correctly.
+
+**Still open, and pre-existing:** a layer row has a minimum width — the blend
+picker and the mix buttons do not shrink — that a half-window deck column can be
+under. The first row over the width used to widen every row after it, which is
+how deck A's layers came to be painted across deck B; the columns now scroll in
+both axes, so an over-wide row is contained and reachable instead. Making the
+row itself fit a narrow column is a separate piece of work: something has to
+give way, and deciding what is a design question, not a bug fix.
+
 ## Note on provenance
 
 The first half of the design session was conducted against the
