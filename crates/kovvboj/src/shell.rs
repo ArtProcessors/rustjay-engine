@@ -612,7 +612,7 @@ impl AnyEguiShell for KovvbojShell {
                                 .min_size(84.0)
                                 .resizable(false)
                                 .show(ui, |ui| {
-                                    self.crossfader_strip(ui, app_state, &engine);
+                                    Self::crossfader_strip(ui, app_state, &engine);
                                 });
                         }
 
@@ -1435,7 +1435,6 @@ impl KovvbojShell {
     /// same movement looks like.
     #[cfg(feature = "mixer")]
     fn crossfader_strip(
-        &mut self,
         ui: &mut egui::Ui,
         app_state: &mut dyn std::any::Any,
         engine: &Arc<Mutex<EngineState>>,
@@ -1461,65 +1460,94 @@ impl KovvbojShell {
 
         let mut pick: Option<std::path::PathBuf> = None;
 
-        ui.horizontal(|ui| {
-            let side = (ui.available_width() * 0.22).clamp(80.0, 200.0);
-
-            // Deck A's output, then the fader, then deck B's.
-            Self::deck_preview(ui, engine, 0, side);
-
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("A").strong().monospace());
-                    let width = (ui.available_width() - 90.0).max(120.0);
+        // Deck A's output pinned to the left edge, deck B's to the right, and
+        // the fader filling the span between. Equal previews at both edges put
+        // the fader's centre on the seam between the deck columns at any width;
+        // packed in from the left, it drifted off-centre, further the wider
+        // the window.
+        let full = ui.available_rect_before_wrap();
+        let side = (full.width() * 0.22).clamp(80.0, 200.0);
+        let gap = ui.spacing().item_spacing.x;
+        let a = egui::Rect::from_min_size(full.min, egui::vec2(side, full.height()));
+        let b = egui::Rect::from_min_max(egui::pos2(full.max.x - side, full.min.y), full.max);
+        let middle = egui::Rect::from_min_max(
+            egui::pos2(a.max.x + gap, full.min.y),
+            egui::pos2(b.min.x - gap, full.max.y),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(a), |ui| {
+            Self::deck_preview(ui, engine, 0, side)
+        });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(b), |ui| {
+            Self::deck_preview(ui, engine, 1, side)
+        });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(middle), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("A").strong().monospace());
+                // B goes in first, right-to-left, so the fader takes exactly
+                // the span between the two letters.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("B").strong().monospace());
+                    // `slider_width`, not `add_sized`: a Slider ignores the
+                    // size it is handed, so this sat at the theme's 200pt.
+                    ui.spacing_mut().slider_width = ui.available_width().max(40.0);
                     let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
                     let mut x = eng.get_param_base("crossfader").unwrap_or(0.0);
                     if ui
-                        .add_sized(
-                            [width, 20.0],
-                            egui::Slider::new(&mut x, 0.0..=1.0).show_value(false),
+                        .add(egui::Slider::new(&mut x, 0.0..=1.0).show_value(false))
+                        .on_hover_text(
+                            "Crossfade between the decks — this is the transition's progress",
                         )
-                        .on_hover_text("Crossfade between the decks — this is the transition's progress")
                         .changed()
                     {
                         eng.set_param_base("crossfader", x);
                     }
-                    drop(eng);
-                    ui.label(egui::RichText::new("B").strong().monospace());
                 });
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("transition")
-                            .size(10.0)
-                            .color(rustjay_gui::egui_theme::colors::ink_4()),
-                    );
-                    egui::ComboBox::from_id_salt("transition_pick")
-                        .selected_text(current_name)
-                        .width(140.0)
-                        .show_ui(ui, |ui| {
-                            for path in crate::transition_shaders() {
-                                let name = path
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("?")
-                                    .trim_start_matches("transition_")
-                                    .to_string();
-                                if ui
-                                    .selectable_label(current.as_deref() == Some(&*path), name)
-                                    .clicked()
-                                {
-                                    pick = Some(path.clone());
-                                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("transition")
+                        .size(10.0)
+                        .color(rustjay_gui::egui_theme::colors::ink_4()),
+                );
+                egui::ComboBox::from_id_salt("transition_pick")
+                    .selected_text(current_name)
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        for path in crate::transition_shaders() {
+                            let name = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("?")
+                                .trim_start_matches("transition_")
+                                .to_string();
+                            if ui
+                                .selectable_label(current.as_deref() == Some(&*path), name)
+                                .clicked()
+                            {
+                                pick = Some(path.clone());
                             }
-                        });
+                        }
+                    });
 
+                // Right-to-left, so TAKE sits under B.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // TAKE: an action, not a value. It arms the auto-crossfade,
                     // which writes the fader's *base* as it runs, so anything
                     // modulating the crossfader still applies once and not
                     // twice. The length is a parameter, so it is mappable.
-                    let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
-                    let mut secs = eng
+                    let mut secs = engine
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
                         .get_param_base(crate::TAKE_SECONDS)
                         .unwrap_or(1.0);
+                    if ui
+                        .button(egui::RichText::new("TAKE").strong().monospace())
+                        .on_hover_text("Crossfade to the other deck (⌘T)")
+                        .clicked()
+                        && let Ok(mut m) = state.mixer.lock()
+                    {
+                        crate::take(&mut m, secs);
+                    }
                     if ui
                         .add(
                             egui::DragValue::new(&mut secs)
@@ -1530,21 +1558,13 @@ impl KovvbojShell {
                         .on_hover_text("How long a TAKE runs")
                         .changed()
                     {
-                        eng.set_param_base(crate::TAKE_SECONDS, secs);
-                    }
-                    drop(eng);
-                    if ui
-                        .button(egui::RichText::new("TAKE").strong().monospace())
-                        .on_hover_text("Crossfade to the other deck (⌘T)")
-                        .clicked()
-                        && let Ok(mut m) = state.mixer.lock()
-                    {
-                        crate::take(&mut m, secs);
+                        engine
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .set_param_base(crate::TAKE_SECONDS, secs);
                     }
                 });
             });
-
-            Self::deck_preview(ui, engine, 1, side);
         });
 
         if let Some(path) = pick {
@@ -1839,4 +1859,48 @@ fn import_dialog(
         *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
         ctx.request_repaint();
     });
+}
+
+#[cfg(all(test, feature = "mixer"))]
+mod crossfader_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable as _;
+
+    /// The fader sits on the seam between the two deck columns at any window
+    /// width, and stretches across the span between the previews. It used to
+    /// be packed in from the left, and the width it was handed through
+    /// `add_sized` was ignored, so it stayed at the theme's 200pt and drifted
+    /// off-centre as the window grew.
+    #[test]
+    fn crossfader_is_centred_on_the_decks_and_stretches() {
+        for width in [700.0_f32, 1600.0] {
+            let engine = Arc::new(Mutex::new(EngineState::new()));
+            let mut app = crate::KovvbojAppState::default();
+            let strip = Arc::new(Mutex::new(egui::Rect::NOTHING));
+            let seen = strip.clone();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size([width, 160.0])
+                .build_ui(move |ui| {
+                    *seen.lock().unwrap() = ui.available_rect_before_wrap();
+                    KovvbojShell::crossfader_strip(ui, &mut app, &engine);
+                });
+            rustjay_gui::egui_theme::apply_professional_theme(&harness.ctx);
+            harness.run();
+
+            let strip = *strip.lock().unwrap();
+            let fader = harness.get_by_role(egui::accesskit::Role::Slider).rect();
+            assert!(
+                (fader.center().x - strip.center().x).abs() < 1.0,
+                "at {width}pt the fader centres on {} but the decks meet at {}",
+                fader.center().x,
+                strip.center().x
+            );
+            assert!(
+                fader.width() > strip.width() * 0.4,
+                "at {width}pt the fader is {}pt of a {}pt strip",
+                fader.width(),
+                strip.width()
+            );
+        }
+    }
 }
