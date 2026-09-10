@@ -2504,7 +2504,12 @@ mod egui_impl {
                                                 });
                                             }
                                         }
-                                        let in_group = mixer.group_of(idx).is_some();
+                                        // A deck is a group too, but not one to leave
+                                        // or dissolve from here: "Ungroup" on a deck's
+                                        // own layer moved the whole deck onto no deck
+                                        // at all, and "Remove from group" took the
+                                        // layer off it. Only real groups offer them.
+                                        let in_group = nested;
                                         resp.context_menu(|ui| {
                                             let n = picked.len();
                                             if ui

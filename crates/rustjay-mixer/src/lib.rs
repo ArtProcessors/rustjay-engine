@@ -1099,6 +1099,12 @@ impl Mixer {
     /// as deleted. Child groups pointing at a group that no longer exists were
     /// the same failure by another route.
     pub fn ungroup(&mut self, uuid: &str) {
+        // A deck is furniture. Dissolving one hands its layers to no deck at
+        // all — out of both columns and out of the transition — and the host
+        // rebuilds it empty. Nothing that says "ungroup" means that.
+        if self.decks.as_ref().is_some_and(|d| d.iter().any(|x| x == uuid)) {
+            return;
+        }
         let parent = self
             .groups
             .iter()
@@ -2538,6 +2544,17 @@ mod deck_tests {
             .unwrap();
         m.decks = Some(["deck_a".into(), "deck_b".into()]);
         m
+    }
+
+    /// The layer menu offered "Ungroup" on every deck layer, a deck being a
+    /// group, and taking it moved the whole deck onto no deck at all.
+    #[test]
+    fn a_deck_cannot_be_ungrouped() {
+        let mut m = two_decks();
+        m.ungroup("deck_a");
+        assert!(m.groups.iter().any(|g| g.uuid == "deck_a"));
+        assert_eq!(m.deck_of_channel(0), Some(0));
+        assert_eq!(m.deck_of_channel(1), Some(0));
     }
 
     #[test]
