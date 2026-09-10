@@ -705,7 +705,7 @@ impl Mixer {
             .iter()
             .map(|g| (self.group_depth(&g.uuid).unwrap_or(0), g.uuid.clone()))
             .collect();
-        order.sort_by(|a, b| b.0.cmp(&a.0));
+        order.sort_by_key(|(depth, _)| std::cmp::Reverse(*depth));
         order.into_iter().map(|(_, uuid)| uuid).collect()
     }
 
