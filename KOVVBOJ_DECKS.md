@@ -358,8 +358,21 @@ exists.
 
    Not yet exercised in the app — no UI reaches the fader or picks a shader
    until step 5, so this is compiled and unit-tested but not seen.
-5. **UI** — two stacks, crossfader strip, flanking previews, `[A][B]` library
-   buttons, transition picker.
+5. **UI** — two stacks, crossfader strip, `[A][B]` library buttons, transition
+   picker: **done** `40d257d` + `86257a6`. Run and confirmed working: an iris
+   wipe rendering deck B over deck A mid-fader, the picker swapping shaders
+   live, the early-out showing deck A alone at rest.
+
+   **Still open:** the flanking previews are placeholders —
+   `deck_preview_texture_ids` is read by the UI but nothing publishes it. Needs
+   a `pub` accessor for a group's `group_out`, kovvboj publishing the two deck
+   textures, and the host creating the destinations and doing the copy on the
+   render thread.
+
+   The [`KOVVBOJ_UI.md`] nested-panel bug did **not** bite: the crossfader strip
+   is another nested `Panel::bottom` inside the same child `Ui` and it lays out
+   correctly. What did bite was a deck drawing its own group header inside its
+   own column — unreadable at half width.
 6. **TAKE** — wire `AutoCrossfade` / `BeatSyncCrossfade` / sequencer to the
    crossfader base value. Already built; this only connects it.
 7. **Savable decks** — `SavedGroup` nesting, `instantiate_into(deck_uuid)`.
