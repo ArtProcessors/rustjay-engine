@@ -363,6 +363,30 @@ exists.
    wipe rendering deck B over deck A mid-fader, the picker swapping shaders
    live, the early-out showing deck A alone at rest.
 
+   **The crossfader dying after a deck edit was not a deck bug at all.**
+   `Mixer::decks`, both deck groups, their `rendered` flags and the deck
+   anchor were all intact through every edit — instrumented and read off a
+   live run. What broke was one layer down:
+   `CompositePipeline` caches bind groups on `(slot, dest_is_a)` for a
+   `generation`, on the assumption that a slot's source texture is fixed
+   while that key is. The deck slot is fed deck A's `group_out`, deck B's,
+   or the transition output purely according to the fader, and none of
+   those moves bumps `generation` — so the master kept sampling whichever
+   texture the entry was first built from. Parked at A it froze on deck A's
+   output, which is live, so the picture kept moving and only the fader
+   looked dead; the next unrelated edit invalidated the cache and the
+   picture jumped, which is what made an edit look like the cause. Fixed by
+   storing the source texture's allocation id with the cache entry
+   (`ae651c1`), with a GPU regression test. The same staleness covered a
+   group reallocating `group_out` after a mute, and a source swapped in
+   place.
+
+   **The library `[B]` button was unclickable** because the rows laid out
+   right-to-left against the panel edge that carries the scroll bar and the
+   resize grip — two buttons did not fit where one `➕` had, and the second
+   was clipped past the visible width at any panel size. The buttons moved
+   to the left gutter beside the star (`ce8072f`).
+
    **Still open:** the flanking previews are placeholders —
    `deck_preview_texture_ids` is read by the UI but nothing publishes it. Needs
    a `pub` accessor for a group's `group_out`, kovvboj publishing the two deck
