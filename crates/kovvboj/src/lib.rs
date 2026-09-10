@@ -25,6 +25,35 @@ pub const DECK_B: &str = "deck_b";
 #[cfg(feature = "mixer")]
 pub const DEFAULT_TRANSITION: &str = "transition_dissolve.fs";
 
+/// Every transition shader the app ships, sorted, dissolve first.
+///
+/// Named by convention (`transition_*.fs`) rather than by a manifest: the
+/// folder is the list, so dropping one in is all it takes.
+#[cfg(feature = "mixer")]
+pub fn transition_shaders() -> Vec<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(shaders_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|e| e.to_str()) == Some("fs")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("transition_"))
+        })
+        .collect();
+    found.sort();
+    // The default first, so the list opens on what a crossfader normally does.
+    if let Some(i) = found
+        .iter()
+        .position(|p| p.file_name().and_then(|n| n.to_str()) == Some(DEFAULT_TRANSITION))
+    {
+        found.swap(0, i);
+    }
+    found
+}
+
 /// Load `path` as the mixer's transition effect.
 #[cfg(feature = "mixer")]
 fn set_transition(
@@ -55,6 +84,16 @@ fn set_transition(
 /// as it has something to hold.
 #[cfg(feature = "mixer")]
 fn ensure_decks(mixer: &mut Mixer) {
+    // A deck exists as soon as a layer claims it — `group_channels` wants two
+    // members, but a deck is furniture, not a grouping gesture.
+    for (uuid, name) in [(DECK_A, "Deck A"), (DECK_B, "Deck B")] {
+        let claimed = mixer.channels.iter().any(|c| c.group.as_deref() == Some(uuid));
+        let exists = mixer.groups.iter().any(|g| g.uuid == uuid);
+        if claimed && !exists {
+            mixer.groups.push(rustjay_mixer::ChannelGroup::new(uuid, name));
+            mixer.invalidate_composite_cache();
+        }
+    }
     let present = |m: &Mixer, uuid: &str| m.groups.iter().any(|g| g.uuid == uuid);
     if present(mixer, DECK_A) && present(mixer, DECK_B) {
         mixer.decks = Some([DECK_A.to_string(), DECK_B.to_string()]);
@@ -257,6 +296,11 @@ pub struct KovvbojAppState {
     #[serde(skip)]
     #[cfg(feature = "mixer")]
     pub pending_source_swaps: Vec<PendingSourceSwap>,
+    /// A transition shader picked in the UI, loaded in `prepare()` where the
+    /// device is available.
+    #[serde(skip)]
+    #[cfg(feature = "mixer")]
+    pub pending_transition: Option<std::path::PathBuf>,
     /// Text-layer edits waiting for `prepare`, where the mixer is reachable.
     #[serde(skip)]
     pub pending_text: Vec<(String, TextEdit)>,
@@ -369,6 +413,8 @@ pub struct PendingLayer {
     /// A saved layer to rebuild instead of a bare source: its FX chain, mix
     /// settings, and parameter values. `None` for a plain library ➕.
     pub saved: Option<crate::scene::SavedLayer>,
+    /// Which deck to land in. `None` when a set has no decks.
+    pub deck: Option<usize>,
 }
 
 /// An FX slot queued for removal.
@@ -939,6 +985,8 @@ impl Default for KovvbojAppState {
             pending_fx_removals: Vec::new(),
             #[cfg(feature = "mixer")]
             pending_source_swaps: Vec::new(),
+            #[cfg(feature = "mixer")]
+            pending_transition: None,
             pending_text: Vec::new(),
             pending_clip: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_font: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -2425,6 +2473,15 @@ impl EffectPlugin for KovvbojRootPlugin {
                 }
             }
 
+            // A transition picked in the UI: loaded here, where the device is.
+            if let Some(path) = state.pending_transition.take()
+                && let Ok(mut mixer) = self.mixer.lock()
+            {
+                set_transition(&mut mixer, &path, device, queue, engine);
+                // Its inputs are new parameters under the same stable prefix.
+                self.params_dirty = true;
+            }
+
             // The crossfader *is* the transition's progress — one control, one
             // uniform, so a plain dissolve is just the dissolve shader at the
             // fader's position. `prepare` holds `&EngineState`, so the write
@@ -2900,6 +2957,17 @@ impl EffectPlugin for KovvbojRootPlugin {
                         let Ok(mut mixer) = state.mixer.lock() else {
                             continue;
                         };
+                        // Which deck it joins. An unnamed deck means the caller
+                        // had no opinion — a dropped file, a stream URL — and
+                        // deck A is where a set that has decks starts.
+                        if mixer.decks.is_some() {
+                            let deck = match req.deck {
+                                Some(1) => DECK_B,
+                                _ => DECK_A,
+                            };
+                            channel.group = Some(deck.to_string());
+                        }
+
                         // New layers go on top of the stack, which is where you
                         // expect a thing you just added to appear.
                         if mixer.add_channel(channel).is_err() {
@@ -2911,6 +2979,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                             );
                             continue;
                         }
+                        // A deck that did not exist yet does now: the layer
+                        // that claims it is what brings it into being.
+                        ensure_decks(&mut mixer);
                         drop(mixer);
                         state.layer_sources.insert(uuid, entry.clone());
                         self.params_dirty = true;

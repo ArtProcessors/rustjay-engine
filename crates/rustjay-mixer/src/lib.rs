@@ -749,7 +749,16 @@ impl Mixer {
     }
 
     /// Which deck a group belongs to, if either: 0 for A, 1 for B.
-    fn deck_of(&self, uuid: &str) -> Option<usize> {
+    ///
+    /// Resolves through nesting, so a layer three groups deep still reports the
+    /// deck it ultimately lives on.
+    pub fn deck_of_channel(&self, index: usize) -> Option<usize> {
+        let gid = self.channels.get(index)?.group.as_deref()?;
+        self.deck_of(gid)
+    }
+
+    /// Which deck a group belongs to, if either: 0 for A, 1 for B.
+    pub fn deck_of(&self, uuid: &str) -> Option<usize> {
         let decks = self.decks.as_ref()?;
         let top = self.top_level_ancestor(uuid);
         decks.iter().position(|d| *d == top)
