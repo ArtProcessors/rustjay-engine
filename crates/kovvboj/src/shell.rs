@@ -623,13 +623,13 @@ impl AnyEguiShell for KovvbojShell {
                             right.min.x = mid + 4.0;
 
                             ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
-                                Self::deck_heading(ui, "DECK A");
+                                Self::deck_heading(ui, "DECK A", app_state, 0);
                                 egui::ScrollArea::vertical()
                                     .id_salt("deck_a_scroll")
                                     .show(ui, |ui| tab(&mut self.deck_a, ui, app_state, &engine));
                             });
                             ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                                Self::deck_heading(ui, "DECK B");
+                                Self::deck_heading(ui, "DECK B", app_state, 1);
                                 egui::ScrollArea::vertical()
                                     .id_salt("deck_b_scroll")
                                     .show(ui, |ui| tab(&mut self.deck_b, ui, app_state, &engine))
@@ -1357,8 +1357,12 @@ impl KovvbojShell {
         }
     }
 
-    /// A deck column's heading.
-    fn deck_heading(ui: &mut egui::Ui, label: &str) {
+    /// A deck column's heading, with the one verb a deck has of its own.
+    ///
+    /// A deck draws no group row — the column *is* the header — so 💾 lives
+    /// here instead, where a group's would be.
+    #[cfg_attr(not(feature = "mixer"), allow(unused_variables))]
+    fn deck_heading(ui: &mut egui::Ui, label: &str, app_state: &mut dyn std::any::Any, deck: usize) {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(label)
@@ -1366,6 +1370,30 @@ impl KovvbojShell {
                     .monospace()
                     .color(rustjay_gui::egui_theme::colors::ink_4()),
             );
+            #[cfg(feature = "mixer")]
+            if ui
+                .small_button("💾")
+                .on_hover_text("Save this deck to the library, layers and all")
+                .clicked()
+                && let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>()
+            {
+                let uuid = if deck == 1 { crate::DECK_B } else { crate::DECK_A };
+                // Under the deck's own name, exactly as a group saves under
+                // its: renaming the deck in the inspector is how you save a
+                // second look without overwriting the first.
+                let name = state
+                    .mixer
+                    .lock()
+                    .ok()
+                    .and_then(|m| {
+                        m.groups
+                            .iter()
+                            .find(|g| g.uuid == uuid)
+                            .map(|g| g.name.clone())
+                    })
+                    .unwrap_or_else(|| label.to_string());
+                state.pending_group_save = Some((uuid.to_string(), name));
+            }
         });
         ui.separator();
     }

@@ -708,7 +708,7 @@ impl Mixer {
     }
 
     /// The outermost group `uuid` belongs to — itself when it is top level.
-    fn top_level_ancestor(&self, uuid: &str) -> String {
+    pub fn top_level_ancestor(&self, uuid: &str) -> String {
         let mut cur = uuid.to_string();
         for _ in 0..=self.groups.len() {
             let Some(g) = self.groups.iter().find(|g| g.uuid == cur) else {

@@ -416,7 +416,9 @@ pub struct KovvbojAppState {
     /// A saved group to build into the stack.
     #[serde(skip)]
     #[cfg(feature = "mixer")]
-    pub pending_group_recall: Option<crate::scene::SavedGroup>,
+    /// A saved group to recall, and which deck to load it into. `None` puts it
+    /// in the free stack, as a group of its own.
+    pub pending_group_recall: Option<(crate::scene::SavedGroup, Option<usize>)>,
     /// A master chain the user asked to save, by name.
     #[serde(skip)]
     #[cfg(feature = "mixer")]
@@ -2098,6 +2100,62 @@ impl KovvbojRootPlugin {
     }
 }
 
+/// Every group nested under `gid`, at any depth, outermost first.
+///
+/// Bounded by the group count, so a corrupt parent cycle terminates instead of
+/// hanging the frame that saved it.
+#[cfg(feature = "mixer")]
+fn descendant_groups(
+    topo: &crate::scene::Topology,
+    gid: &str,
+) -> Vec<crate::scene::GroupDesc> {
+    let mut found: Vec<crate::scene::GroupDesc> = Vec::new();
+    let mut frontier = vec![gid.to_string()];
+    for _ in 0..topo.groups.len() {
+        let next: Vec<crate::scene::GroupDesc> = topo
+            .groups
+            .iter()
+            .filter(|g| {
+                g.parent.as_deref().is_some_and(|p| frontier.iter().any(|f| f == p))
+                    && !found.iter().any(|f| f.uuid == g.uuid)
+            })
+            .cloned()
+            .collect();
+        if next.is_empty() {
+            break;
+        }
+        frontier = next.iter().map(|g| g.uuid.clone()).collect();
+        found.extend(next);
+    }
+    found
+}
+
+/// Build a chain from descriptors, each slot under `<prefix>fx<uuid>_`.
+///
+/// The recall paths need this: they have fresh slot uuids and no live chain to
+/// reconcile against, so `reconcile_chain`'s diff has nothing to compare.
+#[cfg(feature = "mixer")]
+#[allow(clippy::too_many_arguments)]
+fn built_chain(
+    fx: &[crate::scene::FxDesc],
+    prefix: &str,
+    base: &std::path::Path,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    engine: &EngineState,
+) -> Vec<rustjay_mixer::EffectSlot> {
+    let mut chain = Vec::new();
+    for slot in fx {
+        if let Some(mut built) = build_fx_slot(slot, base, device, queue, engine) {
+            built
+                .effect
+                .set_param_prefix(&format!("{prefix}fx{}_", built.uuid));
+            chain.push(built);
+        }
+    }
+    chain
+}
+
 /// Reconcile one effect chain in place, rebuilding only slots that changed.
 ///
 /// `prefix` is the owner's parameter prefix — `ch_<uuid>_`, `grp_<uuid>_`, or
@@ -3099,15 +3157,27 @@ impl EffectPlugin for KovvbojRootPlugin {
                     let mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
                     let topo = crate::scene::Topology::from_mixer(&mixer, &state.layer_sources);
                     topo.groups.iter().find(|g| g.uuid == gid).map(|g| {
-                        let layers: Vec<crate::scene::LayerDesc> = g
+                        // Everything under it, at any depth: the nested groups,
+                        // and the layers they and it hold. A deck with a group
+                        // on it saved as a flat list of the deck's own layers
+                        // and quietly lost the rest.
+                        let nested = descendant_groups(&topo, &gid);
+                        let members: Vec<&String> = g
                             .members
                             .iter()
-                            .filter_map(|u| topo.layers.iter().find(|l| &l.uuid == u).cloned())
+                            .chain(nested.iter().flat_map(|n| n.members.iter()))
+                            .collect();
+                        let layers: Vec<crate::scene::LayerDesc> = topo
+                            .layers
+                            .iter()
+                            .filter(|l| members.contains(&&l.uuid))
+                            .cloned()
                             .collect();
                         crate::scene::SavedGroup::capture(
                             name.clone(),
                             g,
                             layers,
+                            nested,
                             &state.param_snapshot,
                         )
                     })
@@ -3136,16 +3206,69 @@ impl EffectPlugin for KovvbojRootPlugin {
                 }
             }
 
-            if let Some(saved) = state.pending_group_recall.take() {
+            if let Some((saved, into_deck)) = state.pending_group_recall.take() {
                 // Built here rather than queued as pending layers: that path
                 // mints its own uuid per layer, which would rekey a second time
                 // and strand the parameters this recall just rewrote.
-                let (layers, gid, fx, params) = saved.instantiate();
+                //
+                // Into a deck, the deck keeps its uuid — it is furniture, and a
+                // control surface mapped to `grp_deck_a_opacity` has to still
+                // find it afterwards — and its current layers are replaced,
+                // because recalling a deck means loading a deck, not stacking
+                // one on top of another. Into the free stack it adds, as it
+                // always has.
+                let deck_uuid = into_deck.map(|d| if d == 1 { DECK_B } else { DECK_A });
+                let recalled = match deck_uuid {
+                    Some(uuid) => saved.instantiate_into(uuid),
+                    None => saved.instantiate(),
+                };
+                let gid = recalled.group_uuid.clone();
+                let direct = recalled.direct_members();
                 let base = crate::scene::topology_base();
                 let mut members = Vec::new();
+
+                // Clear the deck first, with the same sweep a layer removal
+                // does, or the old layers' modulation outlives them.
+                if let Some(uuid) = deck_uuid {
+                    let doomed: Vec<String> = {
+                        let mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
+                        mixer
+                            .channels
+                            .iter()
+                            .filter(|c| {
+                                c.group
+                                    .as_deref()
+                                    .is_some_and(|g| mixer.top_level_ancestor(g) == uuid)
+                            })
+                            .map(|c| c.uuid.clone())
+                            .collect()
+                    };
+                    for layer in doomed {
+                        let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(i) = mixer.channels.iter().position(|c| c.uuid == layer) {
+                            let _ = mixer.remove_channel(i);
+                        }
+                        drop(mixer);
+                        state.layer_sources.remove(&layer);
+                        if let Ok(mut m) = engine.modulation.lock() {
+                            m.remove_assignments_with_prefix(&format!("ch_{layer}_"));
+                        }
+                    }
+                    // Groups that were nested in the deck have nothing left in
+                    // them; the recall brings its own.
+                    let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
+                    let nested: Vec<String> = mixer
+                        .groups
+                        .iter()
+                        .filter(|g| g.uuid != uuid && mixer.top_level_ancestor(&g.uuid) == uuid)
+                        .map(|g| g.uuid.clone())
+                        .collect();
+                    mixer.groups.retain(|g| !nested.contains(&g.uuid));
+                }
+
                 {
                     let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
-                    for desc in &layers {
+                    for desc in &recalled.layers {
                         let mut entry = desc.source.clone();
                         if let Some(path) = entry.path.take() {
                             entry.path = Some(crate::scene::resolve(&path, &base));
@@ -3184,36 +3307,84 @@ impl EffectPlugin for KovvbojRootPlugin {
                         members.push(desc.uuid.clone());
                     }
 
-                    if members.len() >= 2
-                        && mixer
-                            .group_channels(gid.clone(), saved.name.clone(), &members)
-                            .is_some()
-                    {
-                        let prefix = format!("grp_{gid}_");
-                        let mut chain = Vec::new();
-                        for slot in &fx {
-                            if let Some(mut built) =
-                                build_fx_slot(slot, &base, device, queue, engine)
-                            {
-                                built
-                                    .effect
-                                    .set_param_prefix(&format!("{prefix}fx{}_", built.uuid));
-                                chain.push(built);
+                    // The groups: the top one, then the nested ones, then who
+                    // belongs to whom. Every group exists before any parent
+                    // pointer is set, because `set_group_parent` refuses a
+                    // parent it cannot find.
+                    if !members.is_empty() {
+                        if !mixer.groups.iter().any(|g| g.uuid == gid) {
+                            mixer
+                                .groups
+                                .push(rustjay_mixer::ChannelGroup::new(&gid, &saved.name));
+                        }
+                        for g in &recalled.groups {
+                            if !mixer.groups.iter().any(|x| x.uuid == g.uuid) {
+                                mixer
+                                    .groups
+                                    .push(rustjay_mixer::ChannelGroup::new(&g.uuid, &g.name));
                             }
                         }
+                        for uuid in &direct {
+                            if members.iter().any(|m| m == uuid) {
+                                mixer.set_channel_group(uuid, Some(gid.clone()));
+                            }
+                        }
+                        for g in &recalled.groups {
+                            for uuid in &g.members {
+                                if members.iter().any(|m| m == uuid) {
+                                    mixer.set_channel_group(uuid, Some(g.uuid.clone()));
+                                }
+                            }
+                        }
+                        for g in &recalled.groups {
+                            if !mixer.set_group_parent(&g.uuid, g.parent.as_deref()) {
+                                log::warn!(
+                                    "[Group] '{}' could not nest inside {:?}",
+                                    g.name,
+                                    g.parent
+                                );
+                            }
+                        }
+
+                        // Chains and mix settings: the nested groups' own, then
+                        // the saved group's onto the top — which, for a deck, is
+                        // the deck.
+                        for g in &recalled.groups {
+                            let prefix = format!("grp_{}_", g.uuid);
+                            let chain = built_chain(&g.fx, &prefix, &base, device, queue, engine);
+                            if let Some(live) = mixer.groups.iter_mut().find(|x| x.uuid == g.uuid) {
+                                live.opacity = g.opacity;
+                                live.blend_mode = g.blend_mode;
+                                live.chain = chain;
+                            }
+                        }
+                        let prefix = format!("grp_{gid}_");
+                        let chain =
+                            built_chain(&recalled.fx, &prefix, &base, device, queue, engine);
                         if let Some(g) = mixer.groups.iter_mut().find(|g| g.uuid == gid) {
                             g.opacity = saved.opacity;
                             g.blend_mode = saved.blend_mode;
                             g.chain = chain;
                         }
                     }
+                    ensure_decks(&mut mixer);
+                    mixer.invalidate_composite_cache();
                 }
                 if let Ok(mut restore) = engine.param_restore.lock() {
-                    restore.extend(params);
+                    restore.extend(recalled.params);
                 }
                 self.params_dirty = true;
+                let where_to = match into_deck {
+                    Some(0) => " into deck A",
+                    Some(_) => " into deck B",
+                    None => "",
+                };
                 engine.notify(
-                    format!("Loaded group '{}' — {} layers", saved.name, members.len()),
+                    format!(
+                        "Loaded group '{}'{where_to} — {} layers",
+                        saved.name,
+                        members.len()
+                    ),
                     rustjay_core::NotificationLevel::Success,
                     std::time::Duration::from_secs(3),
                 );

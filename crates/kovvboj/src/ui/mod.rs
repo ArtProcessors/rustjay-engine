@@ -2919,9 +2919,10 @@ mod egui_impl {
                     > = None;
                     let mut queue_chain_delete: Option<String> = None;
                     #[cfg(feature = "mixer")]
-                    let mut queue_group_recall: Option<
+                    let mut queue_group_recall: Option<(
                         crate::scene::SavedGroup,
-                    > = None;
+                        Option<usize>,
+                    )> = None;
                     let mut queue_group_delete: Option<String> = None;
                     // One library row: label (optionally a drag source for FX
                     // strips) plus the "➕ new deck" button.
@@ -3331,22 +3332,23 @@ mod egui_impl {
                                 {
                                     toggle_fav_saved = Some(g.name.clone());
                                 }
+                                // Left gutter, like the source rows: two deck
+                                // buttons and a delete do not fit against the
+                                // panel's right edge — see `deck_add_buttons`.
                                 ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
+                                        if let Some(deck) =
+                                            super::deck_add_buttons(ui, decked, "Load this group")
+                                        {
+                                            queue_group_recall = Some(((*g).clone(), deck));
+                                        }
                                         if ui
                                             .small_button("✖")
                                             .on_hover_text("Delete this saved group")
                                             .clicked()
                                         {
                                             queue_group_delete = Some(g.name.clone());
-                                        }
-                                        if ui
-                                            .small_button("➕")
-                                            .on_hover_text("Add this group and its layers")
-                                            .clicked()
-                                        {
-                                            queue_group_recall = Some((*g).clone());
                                         }
                                         let n = g.layers.len();
                                         let size = egui::vec2(
