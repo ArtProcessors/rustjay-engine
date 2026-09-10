@@ -314,7 +314,31 @@ impl Mixer {
     }
 }
 
-/// Multi-channel compositor.
+/// Which deck the crossfader is parked on, if either.
+///
+/// `None` means run the transition pass. Parked is the common case — a fader
+/// sits at an end far more of the time than it spends moving — so this is what
+/// saves a full-screen pass most frames.
+fn parked_deck(crossfader: f32) -> Option<usize> {
+    let x = crossfader.clamp(0.0, 1.0);
+    if x <= 0.001 {
+        Some(0)
+    } else if x >= 0.999 {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// What the master should blend where the two decks sit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeckSource {
+    /// The fader is parked: one deck's own output, transition pass skipped.
+    Deck(String),
+    /// The two combined by the transition effect.
+    Transition,
+}
+
 /// One thing a group composites: a member layer, or a nested group's output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GroupItem {
@@ -428,6 +452,7 @@ impl ChannelGroup {
     }
 }
 
+/// Multi-channel compositor.
 pub struct Mixer {
     pub channels: Vec<Channel>,
     /// Bus groups over contiguous spans of `channels`.
@@ -447,6 +472,19 @@ pub struct Mixer {
     ///
     /// 1.0 is unity, so hosts that never touch it are unaffected.
     pub master_dim: f32,
+    /// The two groups the crossfader transitions between, by uuid: `[A, B]`.
+    ///
+    /// When this and [`transition`](Self::transition) are both set and both
+    /// groups rendered, the two are combined by the transition effect and the
+    /// result is blended into the master **once**, in place of blending each
+    /// deck separately. Unset — or with no transition loaded — the two are
+    /// ordinary groups and composite exactly as any other group does, which is
+    /// what makes this additive rather than a second blending path.
+    pub decks: Option<[String; 2]>,
+    /// The two-input effect combining the decks. Its `progress` is the
+    /// crossfader: there is no separate crossfade, a plain dissolve is just the
+    /// dissolve shader at the fader's position.
+    pub transition: Option<EffectSlot>,
     /// Master effect chain (REQ-06).
     pub master: Vec<EffectSlot>,
     pub auto: Option<AutoCrossfade>,
@@ -459,6 +497,9 @@ pub struct Mixer {
     acc_a: Option<Texture>,
     acc_b: Option<Texture>,
     master_ping: Option<Texture>,
+    /// Where the transition draws. Allocated only once decks are actually in
+    /// use, like a group's own textures.
+    transition_out: Option<Texture>,
     size: [u32; 2],
     /// Bumped whenever GPU textures are reallocated (resize) or the channel set
     /// changes. Drives the composite pipeline's bind-group cache invalidation
@@ -476,6 +517,8 @@ impl Mixer {
             crossfader: 0.5,
             use_crossfader: true,
             master_dim: 1.0,
+            decks: None,
+            transition: None,
             master: Vec::new(),
             auto: None,
             beat_sync: None,
@@ -485,6 +528,7 @@ impl Mixer {
             acc_a: None,
             acc_b: None,
             master_ping: None,
+            transition_out: None,
             size: [0, 0],
             generation: 0,
         }
@@ -693,6 +737,109 @@ impl Mixer {
             return true;
         }
         false
+    }
+
+    /// Which deck a group belongs to, if either: 0 for A, 1 for B.
+    fn deck_of(&self, uuid: &str) -> Option<usize> {
+        let decks = self.decks.as_ref()?;
+        let top = self.top_level_ancestor(uuid);
+        decks.iter().position(|d| *d == top)
+    }
+
+    /// Combine the two decks into one image, returning what the master should
+    /// blend in their place.
+    ///
+    /// `None` means there is nothing to special-case and the decks composite as
+    /// ordinary groups — no decks configured, no transition loaded, or one of
+    /// them did not render.
+    ///
+    /// At the ends of the fader the transition pass is skipped and the winning
+    /// deck is handed back directly. That is a full-screen pass saved whenever
+    /// the fader is parked, which is most of the time. It assumes
+    /// `transition(A, B, 0) == A`, which holds for the shipped set (`iris` is
+    /// 2/255 off at the centre, from edge softness).
+    ///
+    /// Returns a marker rather than the texture: handing back a `&Texture` would
+    /// keep the `&mut self` alive across the whole master pass.
+    fn render_transition(
+        &mut self,
+        ctx: &mut RenderCtx<'_>,
+        crossfader: f32,
+        engine: &EngineState,
+    ) -> Option<DeckSource> {
+        let [a, b] = self.decks.clone()?;
+        let rendered = |uuid: &str, groups: &[ChannelGroup]| {
+            groups
+                .iter()
+                .find(|g| g.uuid == uuid)
+                .filter(|g| g.rendered)
+                .is_some()
+        };
+        if !rendered(&a, &self.groups) || !rendered(&b, &self.groups) {
+            return None;
+        }
+        // Parked at either end: hand back that deck untouched.
+        if let Some(which) = parked_deck(crossfader) {
+            return Some(DeckSource::Deck(if which == 0 { a } else { b }));
+        }
+
+        self.transition.as_ref()?;
+        if self.transition_out.is_none()
+            || self.transition_out.as_ref().is_some_and(|t| {
+                t.texture.width() != self.size[0] || t.texture.height() != self.size[1]
+            })
+        {
+            self.transition_out = Some(Texture::create_render_target(
+                ctx.device,
+                self.size[0],
+                self.size[1],
+                "transition out",
+            ));
+        }
+
+        // Split the borrows: the effect needs `&mut`, the decks it samples and
+        // the target it draws into are other fields.
+        let Mixer {
+            transition,
+            transition_out,
+            groups,
+            size,
+            ..
+        } = &mut *self;
+        let slot = transition.as_mut()?;
+        let out = transition_out.as_ref()?;
+        let tex_of = |uuid: &String| {
+            groups
+                .iter()
+                .find(|g| &g.uuid == uuid)
+                .and_then(|g| g.group_out.as_ref())
+        };
+        let (ta, tb) = (tex_of(&a)?, tex_of(&b)?);
+        let inputs = [
+            EffectInput {
+                view: &ta.view,
+                sampler: &ta.sampler,
+                generation: ta.generation,
+                texture: Some(&ta.texture),
+            },
+            EffectInput {
+                view: &tb.view,
+                sampler: &tb.sampler,
+                generation: tb.generation,
+                texture: Some(&tb.texture),
+            },
+        ];
+        slot.effect.prepare(engine, ctx.device, ctx.queue);
+        slot.effect.render_to(
+            ctx,
+            &inputs,
+            RenderTarget {
+                view: &out.view,
+                size: *size,
+            },
+            engine,
+        );
+        Some(DeckSource::Transition)
     }
 
     /// Groups deepest-first, so a child is finished before its parent reads it.
@@ -1365,6 +1512,19 @@ impl EffectInstance for Mixer {
             }
             self.groups.insert(gi, g);
         }
+        // The two decks become one image before the master pass, so what
+        // reaches the composite is a single layer sitting where the decks sit.
+        let deck_source = self.render_transition(ctx, crossfader, engine);
+        let deck_src: Option<&Texture> = match &deck_source {
+            Some(DeckSource::Transition) => self.transition_out.as_ref(),
+            Some(DeckSource::Deck(uuid)) => self
+                .groups
+                .iter()
+                .find(|g| &g.uuid == uuid)
+                .and_then(|g| g.group_out.as_ref()),
+            None => None,
+        };
+
         let acc_a = self.acc_a.as_ref().unwrap();
         let acc_b = self.acc_b.as_ref().unwrap();
         let composite = self.composite.as_ref().unwrap();
@@ -1398,12 +1558,76 @@ impl EffectInstance for Mixer {
             }
         }
 
+        // With a transition running, the two decks arrive as one image, so they
+        // share one position in the stack: the higher of their two anchors.
+        let deck_anchor = self.decks.as_ref().filter(|_| deck_src.is_some()).and_then(|d| {
+            d.iter()
+                .filter_map(|uuid| group_anchor.get(uuid).copied())
+                .max()
+        });
+
         for &i in &active {
             // A grouped member is not blended on its own: its group already
             // composited it, and only the outermost group reaches the master —
             // a nested one was already folded into its parent.
             if let Some(gid) = self.channels[i].group.as_deref() {
                 let ancestor = self.top_level_ancestor(gid);
+
+                // Both decks resolve to the transition's output, blended once.
+                if let (Some(src), Some(anchor)) = (deck_src, deck_anchor)
+                    && self.deck_of(&ancestor).is_some()
+                {
+                    if i != anchor {
+                        continue;
+                    }
+                    // Each deck's own opacity still reads as a level, crossfaded
+                    // with the image: deck A's at 0, deck B's at 1.
+                    let level = |uuid: &String| {
+                        self.groups
+                            .iter()
+                            .find(|g| &g.uuid == uuid)
+                            .map(|g| {
+                                engine
+                                    .get_param(&g.opacity_key)
+                                    .unwrap_or(g.opacity)
+                                    .clamp(0.0, 1.0)
+                            })
+                            .unwrap_or(1.0)
+                    };
+                    let [da, db] = self.decks.as_ref().unwrap();
+                    let x = crossfader.clamp(0.0, 1.0);
+                    let opacity = (level(da) * (1.0 - x) + level(db) * x)
+                        * self.master_dim.clamp(0.0, 1.0);
+                    if opacity < 0.001 {
+                        continue;
+                    }
+                    let (read_acc, write_acc) = match written_acc {
+                        None => (acc_a, acc_b),
+                        Some(w) if std::ptr::eq(w as *const _, acc_a as *const _) => {
+                            (acc_a, acc_b)
+                        }
+                        _ => (acc_b, acc_a),
+                    };
+                    let dest_is_a = std::ptr::eq(read_acc as *const _, acc_a as *const _);
+                    composite.blend(
+                        ctx.device,
+                        ctx.queue,
+                        ctx.encoder,
+                        self.generation,
+                        i,
+                        dest_is_a,
+                        &src.view,
+                        &read_acc.view,
+                        &write_acc.view,
+                        opacity,
+                        BlendMode::Normal,
+                        KeyParams::default(),
+                        ctx.vertex_buffer,
+                    );
+                    written_acc = Some(write_acc);
+                    continue;
+                }
+
                 if group_anchor.get(&ancestor) != Some(&i) {
                     continue;
                 }
@@ -2189,5 +2413,84 @@ mod nesting_tests {
         for c in &m.channels {
             assert_eq!(m.top_level_ancestor(c.group.as_deref().unwrap()), "outer");
         }
+    }
+}
+
+/// Deck roles: which group the crossfader is transitioning, and when the
+/// transition pass is skipped.
+#[cfg(test)]
+mod deck_tests {
+    use super::tests::Stub;
+    use super::*;
+
+    fn two_decks() -> Mixer {
+        let mut m = Mixer::new();
+        m.use_crossfader = false;
+        for i in 0..4 {
+            m.add_channel(Channel::new(format!("c{i}"), format!("C{i}"), Box::new(Stub)))
+                .unwrap();
+        }
+        m.group_channels("deck_a", "A", &["c0".into(), "c1".into()])
+            .unwrap();
+        m.group_channels("deck_b", "B", &["c2".into(), "c3".into()])
+            .unwrap();
+        m.decks = Some(["deck_a".into(), "deck_b".into()]);
+        m
+    }
+
+    #[test]
+    fn the_fader_parks_at_both_ends() {
+        assert_eq!(parked_deck(0.0), Some(0));
+        assert_eq!(parked_deck(1.0), Some(1));
+        // Anything in between runs the pass.
+        assert_eq!(parked_deck(0.5), None);
+        assert_eq!(parked_deck(0.002), None);
+        assert_eq!(parked_deck(0.998), None);
+        // Out of range still parks rather than running a pass for nothing.
+        assert_eq!(parked_deck(-1.0), Some(0));
+        assert_eq!(parked_deck(2.0), Some(1));
+    }
+
+    #[test]
+    fn a_layer_resolves_to_the_deck_holding_it() {
+        let m = two_decks();
+        assert_eq!(m.deck_of("deck_a"), Some(0));
+        assert_eq!(m.deck_of("deck_b"), Some(1));
+    }
+
+    #[test]
+    fn a_layer_nested_deeper_still_resolves_to_its_deck() {
+        let mut m = two_decks();
+        // A group inside deck A — the case the whole nesting work exists for.
+        m.add_channel(Channel::new("c4", "C4", Box::new(Stub))).unwrap();
+        m.add_channel(Channel::new("c5", "C5", Box::new(Stub))).unwrap();
+        m.group_channels("inner", "Inner", &["c4".into(), "c5".into()])
+            .unwrap();
+        assert!(m.set_group_parent("inner", Some("deck_a")));
+
+        assert_eq!(
+            m.deck_of("inner"),
+            Some(0),
+            "a nested group belongs to the deck above it, not to itself"
+        );
+    }
+
+    #[test]
+    fn without_decks_nothing_is_special_cased() {
+        let mut m = two_decks();
+        m.decks = None;
+        assert_eq!(m.deck_of("deck_a"), None);
+        assert_eq!(m.deck_of("deck_b"), None);
+    }
+
+    #[test]
+    fn the_decks_still_solo_independently() {
+        // The nesting work's guarantee has to survive the deck roles.
+        let mut m = two_decks();
+        m.channels[0].solo = true;
+        let eff = m.effective_opacities();
+        assert!(eff[0] > 0.0);
+        assert_eq!(eff[1], 0.0, "silences its sibling in deck A");
+        assert!(eff[2] > 0.0 && eff[3] > 0.0, "deck B keeps playing");
     }
 }
