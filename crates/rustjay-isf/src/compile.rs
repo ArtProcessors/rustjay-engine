@@ -22,6 +22,7 @@
 //! Ceiling: pathological formatting (multi-line declarations, comments masquerading as
 //! code) can fool them; the corpus shows this is rare. Upgrade path = a real GLSL parser.
 
+use std::collections::HashMap;
 use isf::{InputType, Isf};
 
 /// GPU manifest: everything the runtime needs to build the bind group layout and
@@ -54,6 +55,10 @@ pub struct IsfManifest {
     /// — never goes through that rewrite, so flipping for it inverts the output
     /// once per pass.
     pub flip_frag_norm_coord: bool,
+    /// Location assigned to each user `varying`, in declaration order. A
+    /// companion `.vs` writes these, so its outputs have to land on the same
+    /// numbers — see [`compile_vertex`].
+    pub varying_locations: Vec<(String, u32)>,
 }
 
 /// One std140 field of the `IsfInputs` block.
@@ -135,7 +140,156 @@ pub fn compile(isf: &Isf, glsl_src: &str) -> Result<CompileOutput, String> {
         &crate::header::render_settings(glsl_src),
     );
 
-    // GLSL → SPIR-V (Vulkan 1.2, fragment, entry "main").
+    let wgsl = glsl_to_wgsl(&merged.glsl, shaderc::ShaderKind::Fragment, "isf.fs")?;
+    let frag_entry = naga::front::wgsl::parse_str(&wgsl)
+        .ok()
+        .and_then(|m| {
+            m.entry_points
+                .iter()
+                .find(|ep| ep.stage == naga::ShaderStage::Fragment)
+                .map(|ep| ep.name.clone())
+        })
+        .unwrap_or_else(|| "main".to_string());
+
+    let (input_fields, inputs_block_size) = layout_std140(&merged.members);
+    let manifest = IsfManifest {
+        input_fields,
+        inputs_block_size,
+        has_sampler: !merged.textures.is_empty(),
+        textures: merged.textures,
+        frag_entry,
+        generators: merged.generators,
+        laser: merged.laser,
+        flip_frag_norm_coord: merged.uses_img_macros,
+        varying_locations: merged.varying_locations,
+    };
+    Ok(CompileOutput { wgsl, manifest })
+}
+
+/// Transpile a shader's companion `.vs` into the pipeline's vertex stage.
+///
+/// ISF lets a shader ship its own vertex shader beside the fragment one — the
+/// VIDVOX blur and optical-flow families precompute their neighbour
+/// coordinates there and read them back as `varying`s. Without it those
+/// varyings are zero and every neighbour tap lands on the same texel.
+///
+/// Only the ISF dialect is handled: a `.vs` calling `isf_vertShaderInit()` (or
+/// its `vv_` spelling), which is what the host provides. MadMapper's vertex
+/// dialect (`in_Vertex`, `modelViewProjectionMatrix`) is a different shader
+/// entirely and is rejected here, leaving the generated vertex stage in place.
+///
+/// Locations come from `manifest`, so the outputs land where the fragment
+/// stage reads them.
+pub fn compile_vertex(vs_src: &str, manifest: &IsfManifest) -> Result<String, String> {
+    if !vs_src.contains("vertShaderInit") {
+        return Err("not an ISF vertex shader (no isf_vertShaderInit)".into());
+    }
+    let provided: Vec<&str> = manifest
+        .input_fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+
+    // Legacy varying name, as in the fragment path.
+    let vs_src = &vs_src.replace("vv_FragNormCoord", "isf_FragNormCoord");
+
+    // Strip what the prelude re-declares: the stage IO and the version line.
+    // A `varying` the fragment does not read becomes a plain global, so the
+    // body's assignments to it still compile.
+    let mut outs = String::new();
+    let mut declared: Vec<&str> = Vec::new();
+    let mut body = String::new();
+    let mut depth = 0i32;
+    for line in vs_src.lines() {
+        let trimmed = line.trim_start();
+        let decl = trimmed.strip_suffix(';').unwrap_or(trimmed);
+        let io = ["varying ", "out ", "in ", "attribute "]
+            .iter()
+            .find_map(|k| decl.strip_prefix(k));
+        let is_decl = depth == 0
+            && trimmed.ends_with(';')
+            && !decl.contains('(')
+            && !decl.contains('=');
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if trimmed.starts_with("#version") || trimmed.starts_with("precision ") {
+            continue;
+        }
+        if is_decl && let Some(rest) = io {
+            let name = io_decl_name(rest);
+            // `isf_FragNormCoord` is the prelude's, and the same varying often
+            // arrives twice — `#if __VERSION__ <= 120` / `#else`.
+            if name == "isf_FragNormCoord" || declared.contains(&name) {
+                continue;
+            }
+            declared.push(name);
+            match manifest.varying_locations.iter().find(|(n, _)| n == name) {
+                Some((_, loc)) => outs.push_str(&format!("layout(location = {loc}) out {rest};\n")),
+                None => outs.push_str(&format!("{rest};\n")),
+            }
+            continue;
+        }
+        // Bare uniforms are illegal in Vulkan GLSL; the ones the host provides
+        // are in the blocks below, and anything else fails the compile and
+        // leaves the generated vertex stage in place.
+        if is_decl
+            && let Some(rest) = decl.strip_prefix("uniform ")
+            && provided.contains(&io_decl_name(rest))
+        {
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+
+    let mut p = String::from("#version 450\n");
+    p.push_str(DEFINES);
+    p.push_str("#define vv_vertShaderInit isf_vertShaderInit\n");
+    p.push_str("layout(location = 0) in vec2 isf_vertPos;\n");
+    p.push_str("layout(location = 1) in vec2 isf_vertTexCoord;\n");
+    p.push_str("layout(location = 0) out vec2 isf_FragNormCoord;\n");
+    p.push_str(&outs);
+    p.push_str(
+        "layout(set = 0, binding = 0) uniform IsfData {\n    int PASSINDEX;\n    vec2 RENDERSIZE;\n    float TIME;\n    float TIMEDELTA;\n    vec4 DATE;\n    int FRAMEINDEX;\n};\n",
+    );
+    if !manifest.input_fields.is_empty() {
+        p.push_str("layout(set = 0, binding = 1) uniform IsfInputs {\n");
+        for f in &manifest.input_fields {
+            p.push_str(&format!("    {} {};\n", glsl_ty(f.ty), f.name));
+        }
+        p.push_str("};\n");
+    }
+    // Textures only when the body asks for one — an unused binding would still
+    // force the whole bind group to be visible to the vertex stage.
+    let sampled: Vec<&TextureBinding> = manifest
+        .textures
+        .iter()
+        .filter(|t| body.contains(&t.name))
+        .collect();
+    if !sampled.is_empty() {
+        p.push_str("layout(set = 0, binding = 2) uniform sampler img_sampler;\n");
+        for t in &sampled {
+            p.push_str(&format!(
+                "layout(set = 0, binding = {}) uniform texture2D {};\n",
+                t.binding, t.name
+            ));
+        }
+    }
+    let coord = if manifest.flip_frag_norm_coord {
+        "vec2(isf_vertTexCoord.x, 1.0 - isf_vertTexCoord.y)"
+    } else {
+        "isf_vertTexCoord"
+    };
+    p.push_str(&format!(
+        "void isf_vertShaderInit() {{\n    gl_Position = vec4(isf_vertPos, 0.0, 1.0);\n    isf_FragNormCoord = {coord};\n}}\n"
+    ));
+    p.push_str(&body);
+
+    let wgsl = glsl_to_wgsl(&p, shaderc::ShaderKind::Vertex, "isf.vs")?;
+    Ok(wgsl)
+}
+
+/// GLSL (already preluded) → SPIR-V → naga → WGSL, proved well-formed for wgpu.
+fn glsl_to_wgsl(glsl: &str, kind: shaderc::ShaderKind, name: &str) -> Result<String, String> {
     let compiler =
         shaderc::Compiler::new().map_err(|e| format!("shaderc: failed to create compiler: {e}"))?;
     let mut opts = shaderc::CompileOptions::new()
@@ -152,25 +306,29 @@ pub fn compile(isf: &Isf, glsl_src: &str) -> Result<CompileOutput, String> {
     // shaderc reports errors against the merged GLSL, which exists nowhere on
     // disk. `ISF_DUMP_GLSL=1` prints it numbered so those lines mean something.
     if std::env::var_os("ISF_DUMP_GLSL").is_some() {
-        for (i, line) in merged.glsl.lines().enumerate() {
+        for (i, line) in glsl.lines().enumerate() {
             eprintln!("{:5} {line}", i + 1);
         }
     }
     let artifact = compiler
-        .compile_into_spirv(&merged.glsl, shaderc::ShaderKind::Fragment, "isf.fs", "main", Some(&opts))
+        .compile_into_spirv(glsl, kind, name, "main", Some(&opts))
         .map_err(|e| trim_err(&e.to_string()))?;
 
     // SPIR-V → naga module → validate → WGSL.
     let words = artifact.as_binary();
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let module = naga::front::spv::parse_u8_slice(&bytes, &naga::front::spv::Options::default())
-        .map_err(|e| format!("naga spv-in: {}", trim_err(&format!("{e:?}"))))?;
-    let frag_entry = module
-        .entry_points
-        .iter()
-        .find(|ep| ep.stage == naga::ShaderStage::Fragment)
-        .map(|ep| ep.name.clone())
-        .unwrap_or_else(|| "main".to_string());
+    // naga otherwise negates `gl_Position.y` on the way in, for a vertex stage
+    // written against GL's clip space. A companion `.vs` gets its position
+    // straight from the engine's quad, which is already in wgpu's — adjusting
+    // it renders the shader upside down.
+    let module = naga::front::spv::parse_u8_slice(
+        &bytes,
+        &naga::front::spv::Options {
+            adjust_coordinate_space: false,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("naga spv-in: {}", trim_err(&format!("{e:?}"))))?;
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
@@ -189,19 +347,7 @@ pub fn compile(isf: &Isf, glsl_src: &str) -> Result<CompileOutput, String> {
     )
     .validate(&reparsed)
     .map_err(|e| format!("wgsl re-validate: {e:?}"))?;
-
-    let (input_fields, inputs_block_size) = layout_std140(&merged.members);
-    let manifest = IsfManifest {
-        input_fields,
-        inputs_block_size,
-        has_sampler: !merged.textures.is_empty(),
-        textures: merged.textures,
-        frag_entry,
-        generators: merged.generators,
-        laser: merged.laser,
-        flip_frag_norm_coord: merged.uses_img_macros,
-    };
-    Ok(CompileOutput { wgsl, manifest })
+    Ok(wgsl)
 }
 
 /// Keep error strings to a useful excerpt.
@@ -265,6 +411,8 @@ struct Merged {
     textures: Vec<TextureBinding>,
     /// See [`IsfManifest::flip_frag_norm_coord`].
     uses_img_macros: bool,
+    /// See [`IsfManifest::varying_locations`].
+    varying_locations: Vec<(String, u32)>,
 }
 
 fn build_glsl(
@@ -410,7 +558,8 @@ fn build_glsl(
 
     // 6. explicit locations for user-declared global in/out (incl. `varying`).
     //    isf_FragNormCoord takes in-location 0; FragColor takes out-location 0.
-    body = assign_io_locations(&body, needs_fragcolor_out);
+    let mut varying_locations = Vec::new();
+    body = assign_io_locations(&body, needs_fragcolor_out, &mut varying_locations);
 
     // 7. inline IMG_* sampling helpers (Y-flip aware), then pair any texture
     //    sampled directly (rather than through a macro) with the sampler.
@@ -545,6 +694,7 @@ fn build_glsl(
     Merged {
         glsl: p,
         members,
+        varying_locations,
         generators,
         laser,
         textures,
@@ -1102,9 +1252,18 @@ fn dedup_uniforms(
 
 /// Assign explicit `layout(location=K)` to global-scope `varying`/`in`/`out`
 /// declarations — Vulkan requires locations on all user IO.
-fn assign_io_locations(body: &str, out_loc_start_at_1: bool) -> String {
+fn assign_io_locations(
+    body: &str,
+    out_loc_start_at_1: bool,
+    in_locations: &mut Vec<(String, u32)>,
+) -> String {
     let mut in_loc = 1u32;
     let mut out_loc = if out_loc_start_at_1 { 1 } else { 0 };
+    // Locations go by name, not by order: this runs before the preprocessor, so
+    // a shader declaring the same varyings twice — `#if __VERSION__ <= 120` /
+    // `#else`, the VIDVOX house style — would otherwise burn two locations per
+    // varying and blow the inter-stage limit on the branch that survives.
+    let mut assigned: HashMap<String, u32> = HashMap::new();
     let mut depth = 0i32;
     let mut out = String::with_capacity(body.len());
     for line in body.lines() {
@@ -1124,15 +1283,26 @@ fn assign_io_locations(body: &str, out_loc_start_at_1: bool) -> String {
             let decl = &trimmed[..e];
             let after = &trimmed[e..]; // ";" plus any trailing comment
             let indent = &line[..line.len() - trimmed.len()];
-            if let Some(rest) = decl.strip_prefix("varying ") {
-                emit = format!("{indent}layout(location = {in_loc}) in {rest}{after}");
-                in_loc += array_slots(rest);
-            } else if let Some(rest) = decl.strip_prefix("in ") {
-                emit = format!("{indent}layout(location = {in_loc}) in {rest}{after}");
-                in_loc += array_slots(rest);
+            let mut place = |rest: &str, next: &mut u32| -> u32 {
+                match assigned.get(io_decl_name(rest)) {
+                    Some(loc) => *loc,
+                    None => {
+                        let loc = *next;
+                        assigned.insert(io_decl_name(rest).to_string(), loc);
+                        *next += array_slots(rest);
+                        loc
+                    }
+                }
+            };
+            if let Some(rest) = decl.strip_prefix("varying ").or(decl.strip_prefix("in ")) {
+                let loc = place(rest, &mut in_loc);
+                if !in_locations.iter().any(|(n, _)| n == io_decl_name(rest)) {
+                    in_locations.push((io_decl_name(rest).to_string(), loc));
+                }
+                emit = format!("{indent}layout(location = {loc}) in {rest}{after}");
             } else if let Some(rest) = decl.strip_prefix("out ") {
-                emit = format!("{indent}layout(location = {out_loc}) out {rest}{after}");
-                out_loc += array_slots(rest);
+                let loc = place(rest, &mut out_loc);
+                emit = format!("{indent}layout(location = {loc}) out {rest}{after}");
             }
         }
         depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
@@ -1140,6 +1310,13 @@ fn assign_io_locations(body: &str, out_loc_start_at_1: bool) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The declared name in an in/out declaration body (`vec2 left_coord` → `left_coord`,
+/// `vec2 offsets[5]` → `offsets`).
+fn io_decl_name(rest: &str) -> &str {
+    let name = rest.split_whitespace().next_back().unwrap_or("");
+    name.split('[').next().unwrap_or(name)
 }
 
 /// How many locations a global in/out declaration occupies (arrays take one per element).

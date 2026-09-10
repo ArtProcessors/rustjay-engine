@@ -57,6 +57,24 @@ pub const TIME_DIV: &str = "time_div";
 /// so the UI (or a mapped MIDI button) just toggles it.
 pub const TIME_RESET: &str = "time_reset";
 
+/// The `.fs` to load from what the user picked.
+///
+/// ISF downloads unzip to a bundle folder named `Whatever.fs` holding
+/// `Whatever.fs.fs` (plus a `.vs` and sample images), so the thing that looks
+/// like the shader is a directory. Point at either and get the shader.
+fn resolve_shader_path(path: &Path) -> PathBuf {
+    if !path.is_dir() {
+        return path.to_path_buf();
+    }
+    std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "fs"))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
 /// Whether the shader's output moves on its own. Only a shader that reads the
 /// clock — the TIME built-ins, a `PHASE_INPUTS` accumulator, or a MadMapper
 /// time generator — has any pacing to control; a filter that just tints its
@@ -183,12 +201,21 @@ pub struct IsfEffect {
     pipeline: Option<wgpu::RenderPipeline>,
     bind_group_layout: Option<wgpu::BindGroupLayout>,
     vertex_buffer: Option<wgpu::Buffer>,
-    /// IsfData block (binding 0), always 64 bytes.
-    data_buffer: Option<wgpu::Buffer>,
+    /// IsfData block (binding 0), always 64 bytes — one per pass, because
+    /// PASSINDEX differs per pass and a queue write only lands once per submit.
+    data_buffers: Vec<wgpu::Buffer>,
     /// IsfInputs block (binding 1), present when inputs_block_size > 0.
     inputs_buffer: Option<wgpu::Buffer>,
     /// 1×1 black placeholder for unbound texture inputs.
     placeholder_view: Option<wgpu::TextureView>,
+    /// One offscreen texture per `PASSES` target, in header order.
+    pass_targets: Vec<PassTarget>,
+    /// Copies the last pass's target to the engine's view, for a shader whose
+    /// last pass renders into a buffer (`Test-PersistentBuffer` and every other
+    /// one-pass feedback shader). Only built when that is the case.
+    blit: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    /// Which half of each persistent target is this frame's write side.
+    ping: usize,
     /// Our own filtering sampler (the GLSL constructs sampler2D(t, img_sampler)).
     sampler: Option<wgpu::Sampler>,
 
@@ -199,6 +226,32 @@ pub struct IsfEffect {
     /// Texture input that receives the upstream frame: "inputImage" when present,
     /// else the first image/audio input. None for pure generators.
     primary_texture: Option<String>,
+}
+
+/// One `PASSES` target: an offscreen texture the shader renders into and can
+/// sample by name.
+///
+/// A persistent target is double-buffered: the pass writes `views[ping]` while
+/// every sample of that target reads `views[ping ^ 1]`, last frame's content.
+/// That is the ISF feedback idiom, and it is also what makes a delay line work
+/// (`bufC <- bufB`, `bufB <- bufA`, `bufA <- input`) regardless of pass order.
+/// A non-persistent target is a within-frame temporary: one texture, read back
+/// as whatever an earlier pass wrote this frame.
+struct PassTarget {
+    name: String,
+    persistent: bool,
+    size: [u32; 2],
+    /// One view for a temporary, two for a persistent (write/read halves).
+    views: Vec<wgpu::TextureView>,
+}
+
+impl PassTarget {
+    fn write_view(&self, ping: usize) -> &wgpu::TextureView {
+        &self.views[ping % self.views.len()]
+    }
+    fn read_view(&self, ping: usize) -> &wgpu::TextureView {
+        &self.views[(ping ^ 1) % self.views.len()]
+    }
 }
 
 /// A std140 field with its precomputed state/param lookup keys.
@@ -273,6 +326,90 @@ fn parse_phase_inputs(glsl_src: &str) -> Vec<PhaseInput> {
 }
 
 impl IsfEffect {
+    /// Allocate (or resize) one texture per `PASSES` target.
+    ///
+    /// ponytail: every target gets the render size and the working format —
+    /// a pass's WIDTH/HEIGHT expressions and FLOAT flag are ignored. Add them
+    /// when a shader needs a half-res or HDR intermediate (FLOAT also needs a
+    /// second pipeline, since the format is baked into it).
+    fn ensure_pass_targets(
+        &mut self,
+        device: &wgpu::Device,
+        size: [u32; 2],
+        lookup: &dyn Fn(&str) -> Option<f32>,
+    ) {
+        let want: Vec<(String, bool, [u32; 2])> = self
+            .isf
+            .passes
+            .iter()
+            .filter_map(|p| {
+                let dim = |expr: &Option<String>, i: usize| {
+                    expr.as_deref()
+                        .and_then(|e| eval_size_expr(e, size, lookup))
+                        .map_or(size[i], |v| (v as u32).clamp(1, 16384))
+                };
+                Some((
+                    p.target.clone()?,
+                    p.persistent,
+                    [dim(&p.width, 0), dim(&p.height, 1)],
+                ))
+            })
+            .collect();
+        let fresh = self.pass_targets.len() == want.len()
+            && self
+                .pass_targets
+                .iter()
+                .zip(&want)
+                .all(|(t, (_, _, s))| t.size == *s);
+        if fresh {
+            return;
+        }
+        let format = self
+            .offscreen_format
+            .unwrap_or_else(rustjay_core::working_format);
+        self.pass_targets = want
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, persistent, size))| {
+                let views = (0..if persistent { 2 } else { 1 })
+                    .map(|half| {
+                        device
+                            .create_texture(&wgpu::TextureDescriptor {
+                                label: Some(&format!("ISF Pass {i} {name} {half}")[..]),
+                                size: wgpu::Extent3d {
+                                    width: size[0],
+                                    height: size[1],
+                                    depth_or_array_layers: 1,
+                                },
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format,
+                                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                                view_formats: &[],
+                            })
+                            .create_view(&wgpu::TextureViewDescriptor::default())
+                    })
+                    .collect();
+                PassTarget {
+                    name,
+                    persistent,
+                    size,
+                    views,
+                }
+            })
+            .collect();
+    }
+
+    /// Whether `name` is one of the shader's `image` inputs.
+    fn is_image_input(&self, name: &str) -> bool {
+        self.isf
+            .inputs
+            .iter()
+            .any(|i| i.name == name && matches!(i.ty, isf::InputType::Image))
+    }
+
     /// What the shader compiled to, once [`EffectPlugin::init`] has run.
     ///
     /// `None` before init, or when compilation failed — see `transpile_error`.
@@ -281,6 +418,7 @@ impl IsfEffect {
     }
 
     pub fn from_path(path: &Path) -> anyhow::Result<Self> {
+        let path = &resolve_shader_path(path);
         let glsl_src = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Cannot read {}: {}", path.display(), e))?;
         let isf = crate::header::parse(&glsl_src)
@@ -316,9 +454,12 @@ impl IsfEffect {
             pipeline: None,
             bind_group_layout: None,
             vertex_buffer: None,
-            data_buffer: None,
+            data_buffers: Vec::new(),
             inputs_buffer: None,
             placeholder_view: None,
+            pass_targets: Vec::new(),
+            blit: None,
+            ping: 0,
             sampler: None,
             manifest: None,
             generators: Vec::new(),
@@ -484,6 +625,137 @@ impl IsfEffect {
         put_f32(&mut buf, 44, s); // DATE = (year, month, day, seconds since midnight)
         put_i32(&mut buf, 48, frame as i32); // FRAMEINDEX
         buf
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass size expressions
+// ---------------------------------------------------------------------------
+
+/// Evaluate an ISF pass `WIDTH`/`HEIGHT` expression against the render size.
+///
+/// The grammar is what the corpus actually uses and nothing more: numbers,
+/// `$WIDTH` / `$HEIGHT`, `$someInput` (looked up as a parameter), the four
+/// arithmetic operators, parentheses, and `floor` / `min` / `max`. Anything
+/// else returns `None`, and the target falls back to the render size.
+fn eval_size_expr(expr: &str, size: [u32; 2], lookup: &dyn Fn(&str) -> Option<f32>) -> Option<f32> {
+    let mut ev = SizeExpr {
+        b: expr.as_bytes(),
+        i: 0,
+        size,
+        lookup,
+    };
+    let v = ev.expr()?;
+    ev.space();
+    (ev.i == ev.b.len() && v.is_finite()).then_some(v)
+}
+
+struct SizeExpr<'a> {
+    b: &'a [u8],
+    i: usize,
+    size: [u32; 2],
+    lookup: &'a dyn Fn(&str) -> Option<f32>,
+}
+
+impl<'a> SizeExpr<'a> {
+    fn space(&mut self) {
+        while self.b.get(self.i).is_some_and(|c| c.is_ascii_whitespace()) {
+            self.i += 1;
+        }
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        self.space();
+        let hit = self.b.get(self.i) == Some(&c);
+        self.i += usize::from(hit);
+        hit
+    }
+    fn expr(&mut self) -> Option<f32> {
+        let mut v = self.term()?;
+        loop {
+            if self.eat(b'+') {
+                v += self.term()?;
+            } else if self.eat(b'-') {
+                v -= self.term()?;
+            } else {
+                return Some(v);
+            }
+        }
+    }
+    fn term(&mut self) -> Option<f32> {
+        let mut v = self.unary()?;
+        loop {
+            if self.eat(b'*') {
+                v *= self.unary()?;
+            } else if self.eat(b'/') {
+                v /= self.unary()?;
+            } else {
+                return Some(v);
+            }
+        }
+    }
+    fn unary(&mut self) -> Option<f32> {
+        if self.eat(b'-') {
+            return Some(-self.unary()?);
+        }
+        self.primary()
+    }
+    fn primary(&mut self) -> Option<f32> {
+        self.space();
+        if self.eat(b'(') {
+            let v = self.expr()?;
+            return self.eat(b')').then_some(v);
+        }
+        match self.b.get(self.i)? {
+            b'$' => {
+                self.i += 1;
+                let name = self.ident();
+                match name {
+                    "WIDTH" => Some(self.size[0] as f32),
+                    "HEIGHT" => Some(self.size[1] as f32),
+                    _ => (self.lookup)(name),
+                }
+            }
+            c if c.is_ascii_digit() || *c == b'.' => {
+                let start = self.i;
+                while self
+                    .b
+                    .get(self.i)
+                    .is_some_and(|c| c.is_ascii_digit() || *c == b'.')
+                {
+                    self.i += 1;
+                }
+                std::str::from_utf8(&self.b[start..self.i]).ok()?.parse().ok()
+            }
+            _ => {
+                let name = self.ident();
+                if name.is_empty() || !self.eat(b'(') {
+                    return None;
+                }
+                let a = self.expr()?;
+                let b = self.eat(b',').then(|| self.expr()).flatten();
+                if !self.eat(b')') {
+                    return None;
+                }
+                match (name, b) {
+                    ("floor", None) => Some(a.floor()),
+                    ("ceil", None) => Some(a.ceil()),
+                    ("min", Some(b)) => Some(a.min(b)),
+                    ("max", Some(b)) => Some(a.max(b)),
+                    _ => None,
+                }
+            }
+        }
+    }
+    fn ident(&mut self) -> &'a str {
+        let start = self.i;
+        while self
+            .b
+            .get(self.i)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        {
+            self.i += 1;
+        }
+        std::str::from_utf8(&self.b[start..self.i]).unwrap_or("")
     }
 }
 
@@ -712,7 +984,7 @@ impl EffectPlugin for IsfEffect {
         // Check for a new path requested via the "Load Shader" button.
         if let Ok(mut guard) = self.pending_path.lock()
             && let Some(new_path) = guard.take() {
-                self.shader_path = new_path;
+                self.shader_path = resolve_shader_path(&new_path);
                 // Derive and broadcast the new display name immediately.
                 let name = self
                     .shader_path
@@ -731,6 +1003,10 @@ impl EffectPlugin for IsfEffect {
             return;
         };
         let Ok(mtime) = meta.modified() else { return };
+        // A companion `.vs` is part of the shader, so editing it reloads too.
+        let mtime = std::fs::metadata(self.shader_path.with_extension("vs"))
+            .and_then(|m| m.modified())
+            .map_or(mtime, |vs| vs.max(mtime));
         if self.last_mtime == Some(mtime) {
             return;
         }
@@ -783,10 +1059,44 @@ impl EffectPlugin for IsfEffect {
         );
 
         // Compile shaders — wgpu panics on WGSL validation errors; catch_unwind prevents crash.
-        let vertex_wgsl = generate_vertex_wgsl(
-            &fragment_inputs(&transpiled.wgsl, &manifest.frag_entry),
-            manifest.flip_frag_norm_coord,
-        );
+        // A companion `.vs` beside the shader is its own vertex stage; anything
+        // wrong with it falls back to the generated one rather than failing the
+        // shader, since the generated stage is what every other shader uses.
+        let companion = std::fs::read_to_string(self.shader_path.with_extension("vs"))
+            .ok()
+            .map(|src| compile::compile_vertex(&src, &manifest));
+        let vertex_wgsl = match &companion {
+            Some(Ok(wgsl)) => wgsl.clone(),
+            other => {
+                if let Some(Err(e)) = other {
+                    log::info!(
+                        "ISF: ignoring companion .vs for {}: {e}",
+                        self.shader_name
+                    );
+                }
+                generate_vertex_wgsl(
+                    &fragment_inputs(&transpiled.wgsl, &manifest.frag_entry),
+                    manifest.flip_frag_norm_coord,
+                )
+            }
+        };
+        // Its stage reads the uniform blocks, so they have to be visible to it.
+        let stages = if matches!(companion, Some(Ok(_))) {
+            wgpu::ShaderStages::VERTEX_FRAGMENT
+        } else {
+            wgpu::ShaderStages::FRAGMENT
+        };
+        // glslang names the companion stage's entry `main`; the generated one is
+        // `vs_main`.
+        let vertex_entry = naga::front::wgsl::parse_str(&vertex_wgsl)
+            .ok()
+            .and_then(|m| {
+                m.entry_points
+                    .iter()
+                    .find(|ep| ep.stage == naga::ShaderStage::Vertex)
+                    .map(|ep| ep.name.clone())
+            })
+            .unwrap_or_else(|| "vs_main".to_string());
         let shader_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let frag = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("ISF Fragment Shader"),
@@ -813,7 +1123,7 @@ impl EffectPlugin for IsfEffect {
         // Dynamic bind group layout from the manifest.
         let mut bgl_entries = vec![wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
+            visibility: stages,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -824,7 +1134,7 @@ impl EffectPlugin for IsfEffect {
         if manifest.inputs_block_size > 0 {
             bgl_entries.push(wgpu::BindGroupLayoutEntry {
                 binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: stages,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -836,7 +1146,7 @@ impl EffectPlugin for IsfEffect {
         if manifest.has_sampler {
             bgl_entries.push(wgpu::BindGroupLayoutEntry {
                 binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: stages,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             });
@@ -844,7 +1154,7 @@ impl EffectPlugin for IsfEffect {
         for t in &manifest.textures {
             bgl_entries.push(wgpu::BindGroupLayoutEntry {
                 binding: t.binding,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: stages,
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: true },
                     view_dimension: wgpu::TextureViewDimension::D2,
@@ -869,7 +1179,7 @@ impl EffectPlugin for IsfEffect {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &vert_shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some(&vertex_entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[Some(Vertex::desc())],
             },
@@ -903,13 +1213,18 @@ impl EffectPlugin for IsfEffect {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        // Uniform buffers
-        let data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ISF IsfData Buffer"),
-            size: 64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Uniform buffers — one IsfData per pass (they differ only in PASSINDEX,
+        // but all of a frame's queue writes land before any of its passes run).
+        let data_buffers: Vec<wgpu::Buffer> = (0..self.isf.passes.len().max(1))
+            .map(|i| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("ISF IsfData Buffer {i}")[..]),
+                    size: 64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
         let inputs_buffer = (manifest.inputs_block_size > 0).then(|| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("ISF IsfInputs Buffer"),
@@ -1012,7 +1327,80 @@ impl EffectPlugin for IsfEffect {
         self.pipeline = Some(pipeline);
         self.bind_group_layout = Some(bgl);
         self.vertex_buffer = Some(vb);
-        self.data_buffer = Some(data_buffer);
+        // A last pass with a TARGET still has to reach the screen — see `blit`.
+        self.blit = self
+            .isf
+            .passes
+            .last()
+            .is_some_and(|p| p.target.is_some())
+            .then(|| {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("ISF Blit Shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("shaders/passthrough.wgsl").into(),
+                    ),
+                });
+                let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("ISF Blit BGL"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("ISF Blit Pipeline Layout"),
+                    bind_group_layouts: &[Some(&bgl)],
+                    immediate_size: 0,
+                });
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("ISF Blit Pipeline"),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("vs_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[Some(Vertex::desc())],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fs_main"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: self
+                                .offscreen_format
+                                .unwrap_or_else(rustjay_core::working_format),
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+                (pipeline, bgl)
+            });
+        self.data_buffers = data_buffers;
+        // Dropped so the next render reallocates against the new header.
+        self.pass_targets.clear();
         self.inputs_buffer = inputs_buffer;
         self.placeholder_view = Some(placeholder_view);
         self.sampler = Some(sampler);
@@ -1039,65 +1427,120 @@ impl EffectPlugin for IsfEffect {
     ) -> bool {
         if self.pipeline.is_none()
             || self.vertex_buffer.is_none()
-            || self.data_buffer.is_none()
+            || self.data_buffers.is_empty()
             || self.bind_group_layout.is_none()
             || self.manifest.is_none()
         {
             return true; // pipeline not ready — render black
         }
 
+        let size = self.offscreen_size.unwrap_or([
+            ctx.engine_state.resolution.internal_width,
+            ctx.engine_state.resolution.internal_height,
+        ]);
+        // `$someInput` in a pass size expression resolves like any parameter.
+        let lookup = |name: &str| {
+            ctx.engine_state
+                .get_param(name)
+                .or_else(|| app_state.values.get(name).copied())
+        };
+        self.ensure_pass_targets(ctx.device, size, &lookup);
+
         // Upload uniforms (std140-packed)
-        let data = self.pack_data(ctx.engine_state, app_state);
+        let mut data = self.pack_data(ctx.engine_state, app_state);
         let inputs = self.pack_inputs(app_state, ctx.engine_state);
         let pipeline = self.pipeline.as_ref().unwrap();
         let vb = self.vertex_buffer.as_ref().unwrap();
-        let data_buf = self.data_buffer.as_ref().unwrap();
         let bgl = self.bind_group_layout.as_ref().unwrap();
         let manifest = self.manifest.as_ref().unwrap();
-        ctx.queue.write_buffer(data_buf, 0, &data);
+        for (i, buf) in self.data_buffers.iter().enumerate() {
+            put_i32(&mut data, 0, i as i32); // PASSINDEX
+            // RENDERSIZE is the pass's own target, which is what a shader
+            // sampling a quarter-res buffer by pixel coordinate expects.
+            let pass_size = self
+                .isf
+                .passes
+                .get(i)
+                .and_then(|p| p.target.as_deref())
+                .and_then(|name| self.pass_targets.iter().find(|t| t.name == name))
+                .map_or(size, |t| t.size);
+            put_f32(&mut data, 8, pass_size[0] as f32);
+            put_f32(&mut data, 12, pass_size[1] as f32);
+            ctx.queue.write_buffer(buf, 0, &data);
+        }
         if let Some(inputs_buf) = &self.inputs_buffer {
             ctx.queue.write_buffer(inputs_buf, 0, &inputs);
         }
 
-        // Build the set-0 bind group fresh each frame (texture views may change).
-        let mut entries = vec![wgpu::BindGroupEntry {
-            binding: 0,
-            resource: data_buf.as_entire_binding(),
-        }];
-        if let Some(inputs_buf) = &self.inputs_buffer {
-            entries.push(wgpu::BindGroupEntry {
-                binding: 1,
-                resource: inputs_buf.as_entire_binding(),
-            });
-        }
-        if manifest.has_sampler {
-            entries.push(wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::Sampler(self.sampler.as_ref().unwrap()),
-            });
-        }
-        for t in &manifest.textures {
-            // Filters with no upstream texture sample black (ISF host behavior).
-            let view = match (&ctx.input, &self.primary_texture) {
-                (Some(input), Some(primary)) if *primary == t.name => input.view,
-                _ => self.placeholder_view.as_ref().unwrap(),
-            };
-            entries.push(wgpu::BindGroupEntry {
-                binding: t.binding,
-                resource: wgpu::BindingResource::TextureView(view),
-            });
-        }
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ISF Bind Group"),
-            layout: bgl,
-            entries: &entries,
-        });
+        let ping = self.ping;
+        // One draw per PASSES entry (a shader with no PASSES is one pass to
+        // the engine's target).
+        for (i, data_buf) in self.data_buffers.iter().enumerate() {
+            let pass_def = self.isf.passes.get(i);
+            let own_target = pass_def.and_then(|p| p.target.as_deref());
 
-        {
+            // Build the set-0 bind group fresh each pass (views change per pass).
+            let mut entries = vec![wgpu::BindGroupEntry {
+                binding: 0,
+                resource: data_buf.as_entire_binding(),
+            }];
+            if let Some(inputs_buf) = &self.inputs_buffer {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: inputs_buf.as_entire_binding(),
+                });
+            }
+            if manifest.has_sampler {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(self.sampler.as_ref().unwrap()),
+                });
+            }
+            for t in &manifest.textures {
+                let placeholder = self.placeholder_view.as_ref().unwrap();
+                let view = match self.pass_targets.iter().find(|p| p.name == t.name) {
+                    // A temporary cannot be sampled by the pass that renders
+                    // into it — that is a read of its own attachment — so that
+                    // one pass sees black. Make it PERSISTENT to read it back.
+                    Some(target) if own_target == Some(t.name.as_str()) && !target.persistent => {
+                        placeholder
+                    }
+                    Some(target) => target.read_view(ping),
+                    // The engine has one video input, so every image input of
+                    // a shader gets it — a two-input shader (a datamosh driven
+                    // by a `motionImage`, a transition) is otherwise dead in
+                    // the water with a black second input. Audio inputs, which
+                    // have no frame to give them, still sample black.
+                    None => match (&ctx.input, &self.primary_texture) {
+                        (Some(input), Some(primary))
+                            if *primary == t.name || self.is_image_input(&t.name) =>
+                        {
+                            input.view
+                        }
+                        _ => placeholder,
+                    },
+                };
+                entries.push(wgpu::BindGroupEntry {
+                    binding: t.binding,
+                    resource: wgpu::BindingResource::TextureView(view),
+                });
+            }
+            let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ISF Bind Group"),
+                layout: bgl,
+                entries: &entries,
+            });
+
+            // A pass with a TARGET renders into it; the one without (the last,
+            // by ISF convention) is what reaches the engine.
+            let target_view = own_target
+                .and_then(|name| self.pass_targets.iter().find(|p| p.name == name))
+                .map_or(ctx.target_view, |t| t.write_view(ping));
+
             let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ISF Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: ctx.target_view,
+                    view: target_view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -1115,8 +1558,77 @@ impl EffectPlugin for IsfEffect {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
+        if let Some((blit_pipeline, blit_bgl)) = &self.blit
+            && let Some(target) = self.pass_targets.last()
+        {
+            let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ISF Blit Bind Group"),
+                layout: blit_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(target.write_view(ping)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(self.sampler.as_ref().unwrap()),
+                    },
+                ],
+            });
+            let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ISF Blit Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: ctx.target_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(blit_pipeline);
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..6, 0..1);
+        }
+        self.ping ^= 1;
 
         true
+    }
+}
+
+#[cfg(test)]
+mod size_expr_tests {
+    use super::eval_size_expr;
+
+    fn ev(expr: &str) -> Option<f32> {
+        eval_size_expr(expr, [1920, 1080], &|name| (name == "buffQuality").then_some(0.5))
+    }
+
+    #[test]
+    fn the_forms_the_corpus_uses() {
+        assert_eq!(ev("$WIDTH"), Some(1920.0));
+        assert_eq!(ev("$HEIGHT/3.0"), Some(360.0));
+        assert_eq!(ev("floor($WIDTH/4.0)"), Some(480.0));
+        assert_eq!(ev("max(floor($HEIGHT*0.02),1.0)"), Some(21.0));
+        assert_eq!(ev("floor($WIDTH*min((0.2),1.0))"), Some(384.0));
+        assert_eq!(ev("$WIDTH / 100.0"), Some(19.2));
+        assert_eq!(ev("64"), Some(64.0));
+        assert_eq!(ev("floor($WIDTH*$buffQuality)"), Some(960.0));
+    }
+
+    #[test]
+    fn anything_else_falls_back_to_the_render_size() {
+        assert_eq!(ev("$WIDTH/"), None);
+        assert_eq!(ev("clamp($WIDTH, 1.0, 2.0)"), None); // unsupported function
+        assert_eq!(ev("$noSuchInput"), None);
+        assert_eq!(ev("$WIDTH 4"), None); // trailing junk
+        assert_eq!(ev("1.0/0.0"), None); // not finite
     }
 }
 

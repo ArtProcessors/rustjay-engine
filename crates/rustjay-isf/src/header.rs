@@ -20,9 +20,12 @@ use serde_json::{Map, Value};
 /// shader-error banner, never a match arm.
 pub fn parse(glsl_src: &str) -> Result<isf::Isf, String> {
     // A header that is already valid costs one parse and no repair, so the
-    // common case is unaffected by anything below.
+    // common case is unaffected by anything below. The exception is a `PASSES`
+    // key in lower case: serde reads that as *absent* rather than as an error,
+    // so `"persistent": true` would silently parse as a non-persistent pass.
     match isf::parse(glsl_src) {
-        Ok(isf) => return Ok(isf),
+        Ok(isf) if !has_lowercase_pass_key(glsl_src) => return Ok(isf),
+        Ok(_) => {}
         Err(isf::ParseError::MissingTopComment) => {
             return Err("no `/* */` header comment at the top of the file".into());
         }
@@ -34,6 +37,28 @@ pub fn parse(glsl_src: &str) -> Result<isf::Isf, String> {
         serde_json::from_str(&clean_json(comment)).map_err(|e| format!("header JSON: {e}"))?;
     repair(&mut value);
     serde_json::from_value(value).map_err(|e| format!("header JSON: {e}"))
+}
+
+/// Whether the source spells any `PASSES` key in lower case. A cheap
+/// pre-check — the repair itself is in [`repair`].
+fn has_lowercase_pass_key(glsl_src: &str) -> bool {
+    // As keys, not values: `"TYPE": "float"` is an input, not a pass.
+    let Some(comment) = top_comment(glsl_src) else {
+        return false;
+    };
+    [
+        "\"persistent\"",
+        "\"target\"",
+        "\"float\"",
+        "\"width\"",
+        "\"height\"",
+    ]
+    .iter()
+    .any(|k| {
+        comment
+            .match_indices(k)
+            .any(|(i, _)| comment[i + k.len()..].trim_start().starts_with(':'))
+    })
 }
 
 /// One entry of a MadMapper `GENERATORS` block: a named `float` uniform the
@@ -244,6 +269,26 @@ fn repair(root: &mut Value) {
     {
         for entry in entries.values_mut().filter_map(Value::as_object_mut) {
             keep_first_cube_face(entry);
+        }
+    }
+
+    // Pass keys are upper case in the spec, but a fair few shaders write
+    // `"persistent": true` — which serde reads as an unknown key, i.e. as a
+    // pass that is not persistent at all.
+    if let Some(passes) = root.get_mut("PASSES")
+        && let Some(passes) = passes.as_array_mut()
+    {
+        for pass in passes.iter_mut().filter_map(Value::as_object_mut) {
+            let lower: Vec<String> = pass
+                .keys()
+                .filter(|k| **k != k.to_uppercase())
+                .cloned()
+                .collect();
+            for key in lower {
+                if let Some(v) = pass.remove(&key) {
+                    pass.insert(key.to_uppercase(), v);
+                }
+            }
         }
     }
 
