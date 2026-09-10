@@ -522,3 +522,295 @@ fn i_time_base_generator_advances() {
         "generator did not advance over 120ms: {b_second}"
     );
 }
+
+/// (i) PERSISTENT pass targets: a two-pass delay line. Pass 0 copies the input
+/// into `buf1`; the final pass shows `buf1`, which by the double-buffer rule is
+/// what pass 0 wrote *last* frame. So the output trails the input by one frame.
+#[test]
+fn i_persistent_pass_delays_one_frame() {
+    let Some(gpu) = init_gpu() else { return };
+    let engine = engine_at(1, 1);
+    let (mut effect, mut state) = load_effect(&gpu, "delayline.fs");
+
+    let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Delay Input 1x1"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor::default());
+
+    let mut frame = |rgba: [u8; 4]| {
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let input = rustjay_core::EffectInput {
+            view: &view,
+            sampler: &sampler,
+            generation: 0,
+            texture: None,
+        };
+        render_loaded(
+            &gpu,
+            &mut effect,
+            "delayline.fs",
+            &engine,
+            &mut state,
+            Some(input),
+            (1, 1),
+        )
+        .rgba(0, 0)
+    };
+
+    let f1 = frame([255, 0, 0, 255]);
+    let f2 = frame([0, 255, 0, 255]);
+    let f3 = frame([0, 0, 255, 255]);
+    eprintln!("delay line: f1={f1:?} f2={f2:?} f3={f3:?}");
+    assert_eq!(f1, (0, 0, 0, 0), "frame 1 has no history yet — buf1 is a cleared texture");
+    assert_eq!(f2, (255, 0, 0, 255), "frame 2 must show frame 1's red");
+    assert_eq!(f3, (0, 255, 0, 255), "frame 3 must show frame 2's green");
+}
+
+/// (j) Delta.fs end to end: four chained persistent buffers. A static input has
+/// no motion to extract, so it comes out black; a frame that differs from its
+/// history does not.
+#[test]
+fn j_delta_extracts_motion() {
+    let Some(gpu) = init_gpu() else { return };
+    let engine = engine_at(1, 1);
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders/Delta.fs");
+    let mut effect = IsfEffect::from_path(&path).expect("Delta.fs");
+    EffectPlugin::init(&mut effect, &gpu.device, &gpu.queue);
+    assert!(effect.transpile_error.is_none(), "{:?}", effect.transpile_error);
+    let mut state = effect.default_state();
+
+    let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Delta Input 1x1"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor::default());
+
+    let mut frame = |rgba: [u8; 4]| {
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let input = rustjay_core::EffectInput {
+            view: &view,
+            sampler: &sampler,
+            generation: 0,
+            texture: None,
+        };
+        render_loaded(
+            &gpu,
+            &mut effect,
+            "Delta.fs",
+            &engine,
+            &mut state,
+            Some(input),
+            (1, 1),
+        )
+        .rgba(0, 0)
+    };
+
+    // Fill the whole history with white, so every tap agrees.
+    let mut static_out = (0, 0, 0, 0);
+    for _ in 0..8 {
+        static_out = frame([255, 255, 255, 255]);
+    }
+    // One black frame: the delayed taps still hold white, so motion appears.
+    let moving = frame([0, 0, 0, 255]);
+    eprintln!("delta: static={static_out:?} moving={moving:?}");
+    assert_eq!(
+        (static_out.0, static_out.1, static_out.2),
+        (0, 0, 0),
+        "a static image has no motion to extract"
+    );
+    assert!(
+        moving.0 as u32 + moving.1 as u32 + moving.2 as u32 > 100,
+        "a changed frame must light up at least one channel, got {moving:?}"
+    );
+}
+
+/// (k) The last pass rendering into a `PERSISTENT` target still reaches the
+/// screen, and a `WIDTH`/`HEIGHT` expression sizes that target. Half of white
+/// mixed with the buffer each frame converges on white: 128, 191, 223.
+#[test]
+fn k_last_pass_target_reaches_the_screen() {
+    let Some(gpu) = init_gpu() else { return };
+    let engine = engine_at(4, 4);
+    let (mut effect, mut state) = load_effect(&gpu, "feedbackblit.fs");
+
+    let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Feedback Input 4x4"),
+        size: wgpu::Extent3d {
+            width: 4,
+            height: 4,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &[255u8; 4 * 4 * 4],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(16),
+            rows_per_image: Some(4),
+        },
+        wgpu::Extent3d {
+            width: 4,
+            height: 4,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor::default());
+
+    let mut frame = || {
+        let input = rustjay_core::EffectInput {
+            view: &view,
+            sampler: &sampler,
+            generation: 0,
+            texture: None,
+        };
+        render_loaded(
+            &gpu,
+            &mut effect,
+            "feedbackblit.fs",
+            &engine,
+            &mut state,
+            Some(input),
+            (4, 4),
+        )
+        .rgba(1, 1)
+    };
+
+    let (f1, f2, f3) = (frame(), frame(), frame());
+    eprintln!("feedback: f1={f1:?} f2={f2:?} f3={f3:?}");
+    assert_channel(f1.0, 128, "frame 1 is half of white");
+    assert_channel(f2.0, 191, "frame 2 mixes white with frame 1");
+    assert_channel(f3.0, 223, "frame 3 mixes white with frame 2");
+}
+
+/// (l) An ISF bundle folder — `Whatever.fs/Whatever.fs.fs`, how a download
+/// unzips — loads by pointing at the folder.
+#[test]
+fn l_a_bundle_folder_loads_its_shader() {
+    let dir = std::env::temp_dir().join("rustjay-isf-bundle-test/Bundled.fs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/shaders/imgpassthrough.fs"),
+        dir.join("Bundled.fs.fs"),
+    )
+    .unwrap();
+    let effect = IsfEffect::from_path(&dir).expect("bundle folder should load");
+    assert_eq!(effect.shader_name, "Bundled.fs");
+    std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+}
+
+/// (m) A companion `.vs` is the shader's vertex stage: the `marker` varying is
+/// written there — from an input and from `RENDERSIZE` — and read back in the
+/// fragment. Without it the varying would be zero.
+#[test]
+fn m_companion_vertex_shader_writes_varyings() {
+    let Some(gpu) = init_gpu() else { return };
+    let engine = engine_at(64, 256);
+    let (_e, mut state) = load_effect(&gpu, "vsvarying.fs");
+    let f = render_shader(&gpu, "vsvarying.fs", &engine, &mut state, None, 64, 256);
+    let px = f.rgba(10, 10);
+    eprintln!("companion vs: {px:?}");
+    assert_channel(px.0, 128, "red is the `scale` input (0.5)");
+    assert_channel(px.1, 128, "green is 128/RENDERSIZE.y (256)");
+}
+
+/// (n) The companion vertex stage must not flip the image. Same corners as (d),
+/// but sampled through a coordinate the `.vs` computed — naga's SPIR-V frontend
+/// negates `gl_Position.y` by default, which renders the shader upside down.
+#[test]
+fn n_companion_vertex_shader_keeps_orientation() {
+    let Some(gpu) = init_gpu() else { return };
+    let (_tex, view, sampler) = input_texture_2x2(&gpu);
+    let engine = engine_at(2, 2);
+    let (_e, mut state) = load_effect(&gpu, "vspassthrough.fs");
+    let input = rustjay_core::EffectInput {
+        view: &view,
+        sampler: &sampler,
+        generation: 0,
+        texture: None,
+    };
+    let f = render_shader(
+        &gpu,
+        "vspassthrough.fs",
+        &engine,
+        &mut state,
+        Some(input),
+        2,
+        2,
+    );
+    assert_eq!(f.rgba(0, 0), (255, 0, 0, 255), "top-left must be red");
+    assert_eq!(f.rgba(1, 0), (0, 255, 0, 255), "top-right must be green");
+    assert_eq!(f.rgba(0, 1), (0, 0, 255, 255), "bottom-left must be blue");
+    assert_eq!(f.rgba(1, 1), (255, 255, 255, 255), "bottom-right must be white");
+}

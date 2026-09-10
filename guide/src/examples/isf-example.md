@@ -106,16 +106,67 @@ Because ISF's binding layout differs from the engine's standard layout, the view
 
 - `shader_source()` returns a minimal passthrough stub — the engine compiles it but never runs it
 - `init()` compiles the real compiled WGSL pipeline (vertex stage generated to match the fragment's declared inputs)
-- `render()` std140-packs and uploads uniforms (real `TIME`, `TIMEDELTA`, `FRAMEINDEX`, `DATE`), builds the bind group, runs the pass, and returns `true`
+- a companion `.vs` beside the shader becomes the vertex stage, if it is an ISF one — see below
+- `render()` std140-packs and uploads uniforms (real `TIME`, `TIMEDELTA`, `FRAMEINDEX`, `DATE`), then draws once per `PASSES` entry — each with its own `PASSINDEX` and bind group — and returns `true`
+
+### Companion vertex shaders
+
+A shader may ship `Whatever.vs` beside `Whatever.fs`. The VIDVOX blur,
+sharpen and optical-flow families use it to precompute neighbour coordinates
+(`left_coord`, `right_coord`, …) once per vertex and read them back as
+`varying`s — without it those varyings are zero and every neighbour tap lands
+on the same texel.
+
+The host supplies `isf_vertShaderInit()` (and its legacy `vv_` spelling), which
+sets `gl_Position` and `isf_FragNormCoord`; the vertex stage also sees
+`RENDERSIZE`, `PASSINDEX` and the shader's inputs. Varying locations come from
+the fragment stage, so the two agree. A `.vs` that is not an ISF one, or that
+fails to compile, is ignored and the generated vertex stage is used — the
+shader still runs.
+
+### Multi-pass and PERSISTENT buffers
+
+A pass with a `TARGET` renders into its own offscreen texture, which any pass can
+sample by that name. The last pass always reaches the engine's output: either it
+has no `TARGET` (the usual shape) or it has one and its buffer is copied to the
+output afterwards — which is what makes a one-pass feedback shader like
+`Test-PersistentBuffer` show anything at all.
+
+`WIDTH` / `HEIGHT` size a target: numbers, `$WIDTH`, `$HEIGHT`, `$someInput`,
+arithmetic, and `floor` / `min` / `max`. Anything else falls back to the render
+size. `RENDERSIZE` inside a pass is that pass's own target, so a shader sampling
+a quarter-res buffer by pixel coordinate lands where it means to.
+
+A `PERSISTENT` target is double-buffered: a pass writes this frame's half while
+every sample of that target reads *last* frame's. That is what makes feedback
+work, and it makes a delay line fall out for free — `buf2 <- buf1`, `buf1 <-
+inputImage` leaves `buf2` two frames behind, whatever order the passes are in.
+A non-persistent target is a within-frame temporary instead: it reads back as
+whatever an earlier pass wrote this frame, and the pass that renders into it
+samples black (that would be a read of its own attachment).
+
+The engine has a single video input, so every `image` input of a shader is bound
+to it — a two-input shader (a datamosh driven by a `motionImage`, a transition)
+would otherwise be dead in the water with a black second input.
+
+`shaders/Delta.fs` is the worked example — four chained persistent buffers give
+it the RGB frame delays that the [`delta` example](delta.md) gets from a Rust
+ring buffer.
 
 ## Known limitations
 
 The compiler handles the vast majority of stock ISF shaders (~96% of the VIDVOX test corpus compiles), but some won't load:
 
 - **Array-typed varyings** (e.g. convolution shaders declaring `varying vec2 texOffsets[5]`) — WGSL can't express array-typed stage IO; these fail at compile time.
-- **Multi-pass ISF** (`PASSES` array) and **`IMPORTED` images** — declared and bound to a placeholder texture, but not executed yet.
+- **`IMPORTED` images** — declared and bound to a placeholder texture, but not loaded yet.
+- **Pass `FLOAT`** — every `PASSES` target is allocated in the engine's working format, so a shader asking for a float intermediate still runs, just not at the precision it asked for. `WIDTH` / `HEIGHT` *are* honoured.
+- **MadMapper-dialect `.vs` files** (`in_Vertex`, `modelViewProjectionMatrix`) — rejected, and the shader falls back to the generated vertex stage. ISF-dialect ones (`isf_vertShaderInit()`) are used.
 - **`audio` / `audioFFT` inputs** — placeholder-bound, no live audio data yet.
 - A small number of shaders with constructs glslang/naga reject (unguarded redefinitions of GLSL builtins like `round`, and 2 files hitting a naga SPIR-V frontend bug).
+
+An ISF download unzips to a bundle *folder* named `Whatever.fs`, holding
+`Whatever.fs.fs` and often a `.vs` and sample images. Open either the folder or
+the `.fs` inside it.
 
 If a shader fails, the output window shows black and the tab name displays the error message.
 
