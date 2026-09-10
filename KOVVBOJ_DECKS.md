@@ -387,19 +387,51 @@ exists.
    was clipped past the visible width at any panel size. The buttons moved
    to the left gutter beside the star (`ce8072f`).
 
-   **Still open:** the flanking previews are placeholders —
-   `deck_preview_texture_ids` is read by the UI but nothing publishes it. Needs
-   a `pub` accessor for a group's `group_out`, kovvboj publishing the two deck
-   textures, and the host creating the destinations and doing the copy on the
-   render thread.
+   ~~**Still open:** the flanking previews are placeholders.~~ **Done.** A deck
+   is a group, so its preview is that group's thumbnail: `Thumbnails` already
+   owned a small render target per layer, blitted into it on the render hook and
+   registered the view with the host, so groups joined that loop and the shell
+   publishes the two ids into `deck_preview_texture_ids`. Not the host-side
+   `create_preview_texture` path: that copy crops rather than scales, so it
+   would mean two full-resolution copies a frame to look right —
+   `register_texture_view` exists for exactly this and says so.
+   `ChannelGroup::output()` is the accessor.
+
+   **The last unexplained report is closed.** "At the crossfader extremes the
+   deck faded to stops rendering new frames in the preview" does not reproduce
+   now that there is something to observe: parked hard at either end, three
+   screenshots a second apart differ in both previews. Both decks render every
+   frame, as designed.
 
    The [`KOVVBOJ_UI.md`] nested-panel bug did **not** bite: the crossfader strip
    is another nested `Panel::bottom` inside the same child `Ui` and it lays out
    correctly. What did bite was a deck drawing its own group header inside its
    own column — unreadable at half width.
-6. **TAKE** — wire `AutoCrossfade` / `BeatSyncCrossfade` / sequencer to the
-   crossfader base value. Already built; this only connects it.
-7. **Savable decks** — `SavedGroup` nesting, `instantiate_into(deck_uuid)`.
+6. ~~**TAKE** — wire `AutoCrossfade` / `BeatSyncCrossfade` / sequencer to the
+   crossfader base value.~~ **Done.** `prepare` decides who owns the fader each
+   frame: idle, the operator does and `mixer.crossfader` is synced *from* the
+   base, so the next TAKE starts where the fader sits; running, it publishes
+   what the tick produced *as* the base, never the modulated value.
+
+   Ownership outlives the transition by one frame — `tick_transitions` clears
+   `auto` on the same call that yields the final value, so "is one running"
+   alone drops the settle frame and the fader springs back.
+
+   TAKE is a button in the strip and ⌘T in the shell; its length is a
+   parameter (`take_seconds`), so it is mappable and rides in the scene's
+   existing `params`. A TAKE stops a running sequence, because the sequencer
+   outranks `auto` in the tick and a button that did nothing would read as
+   broken.
+7. ~~**Savable decks** — `SavedGroup` nesting, `instantiate_into(deck_uuid)`.~~
+   **Done.** `SavedGroup.groups` holds every nested group; `layers` now means
+   every layer at any depth, and membership is what the `members` lists say.
+   `instantiate` returns a `RecalledGroup` and remaps in two passes — fresh
+   names, then the `parent` / `members` pointers once every new name exists.
+   `instantiate_into(deck_uuid)` pins the top of the tree so
+   `grp_deck_a_opacity` survives a recall. Recalling into a deck replaces what
+   is on it (with the modulation sweep a removal does); into the free stack it
+   still adds. 💾 on the deck column heading saves; the library's GROUPS rows
+   grew the same `[A][B]` buttons the source rows have.
 
 ## Note on provenance
 
