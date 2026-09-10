@@ -339,8 +339,13 @@ exists.
    declaration order in `rustjay-isf`, GPU pixel test.~~ **Done** `ca7bcb4`.
 2. ~~**Diff-based apply** replacing full topology replay, with unit tests.~~
    **Done** `f6a91ca`.
-3. **Nested groups** — `parent` on `ChannelGroup` / `GroupDesc`, depth-first
-   render, cycle guard, 8-group cap, lazy allocation, per-subtree solo.
+3. ~~**Nested groups** — `parent` on `ChannelGroup` / `GroupDesc`, depth-first
+   render, cycle guard, 8-group cap, lazy allocation, per-subtree solo.~~
+   **Done** `60681ef`. Solo scopes to *siblings* at each level, which is
+   stricter than "per deck subtree" and is the correct model. Fixed a second
+   pre-existing bug: the master pass anchored a group at its topmost member
+   outright, but only visits contributing channels — so muting the top layer of
+   a group stopped the whole group being blended.
 4. **Deck roles** — two permanent top-level groups, transition pass between
    their `group_out`, `"crossfader"` registered as a param, 0/1 early-out.
 5. **UI** — two stacks, crossfader strip, flanking previews, `[A][B]` library
