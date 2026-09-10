@@ -363,6 +363,20 @@ impl AnyEguiShell for KovvbojShell {
         #[cfg(feature = "mixer")]
         if let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>() {
             state.thumbs.sync(host);
+            // A deck is a group, so its preview is that group's thumbnail. The
+            // ids go where every other live preview publishes one, so the
+            // crossfader strip reads them the same way the Stage canvas reads
+            // the master output.
+            let ids = [crate::DECK_A, crate::DECK_B].map(|uuid| {
+                state.thumbs.ids.get(uuid).map(|id| match id {
+                    egui::TextureId::Managed(n) | egui::TextureId::User(n) => *n,
+                })
+            });
+            if let Ok(mut eng) = host.engine().lock()
+                && eng.deck_preview_texture_ids != ids
+            {
+                eng.deck_preview_texture_ids = ids;
+            }
         }
 
         // ⌘Z / ⇧⌘Z. Structural edits only — see `KovvbojAppState::push_undo_from`.
@@ -1350,6 +1364,9 @@ impl KovvbojShell {
         let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>() else {
             return;
         };
+        // The strip is on screen, so the deck thumbnails are being drawn: say so,
+        // or they go idle and freeze the moment the layer list is closed.
+        state.thumbs.mark_wanted();
 
         // Which transitions are on offer, and which is loaded.
         let current = state

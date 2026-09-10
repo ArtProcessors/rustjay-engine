@@ -429,6 +429,16 @@ impl ChannelGroup {
         }
     }
 
+    /// This frame's finished image — members composited, chain applied — or
+    /// `None` when the group has not rendered one.
+    ///
+    /// `group_out` stays private because the master pass ping-pongs around it;
+    /// what a caller outside can safely do is read the finished picture, which
+    /// is what a deck preview wants.
+    pub fn output(&self) -> Option<&Texture> {
+        self.group_out.as_ref().filter(|_| self.rendered)
+    }
+
     fn ensure_resources(&mut self, device: &wgpu::Device, size: [u32; 2]) {
         if self.size == size && self.composite.is_some() {
             return;
@@ -755,6 +765,11 @@ impl Mixer {
     pub fn deck_of_channel(&self, index: usize) -> Option<usize> {
         let gid = self.channels.get(index)?.group.as_deref()?;
         self.deck_of(gid)
+    }
+
+    /// One group's finished image, by uuid. See [`ChannelGroup::output`].
+    pub fn group_output(&self, uuid: &str) -> Option<&Texture> {
+        self.groups.iter().find(|g| g.uuid == uuid)?.output()
     }
 
     /// Which deck a group belongs to, if either: 0 for A, 1 for B.
