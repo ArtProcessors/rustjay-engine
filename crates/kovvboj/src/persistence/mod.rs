@@ -443,7 +443,10 @@ pub struct UiPrefs {
 }
 
 fn default_library_width() -> f32 {
-    200.0
+    // Wide enough for a name plus both deck buttons and the scroll bar. At 200
+    // the second button fell off the edge and could not be clicked. A saved
+    // width from an older prefs file still wins — drag the edge if it is tight.
+    240.0
 }
 
 fn default_inspector_width() -> f32 {

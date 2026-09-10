@@ -442,6 +442,12 @@ impl AnyEguiShell for KovvbojShell {
                             self.show_library = false;
                         }
                     });
+                    // egui's scroll bar floats over the content by default, and
+                    // a library row lays out right-to-left — so the rightmost
+                    // button sat under the bar and could not be clicked at all.
+                    // Taking layout space costs a few pixels of width and makes
+                    // every row's last control reachable.
+                    ui.spacing_mut().scroll.floating = false;
                     egui::ScrollArea::vertical()
                         .show(ui, |ui| tab(&mut self.library, ui, app_state, &engine));
                     new_width = Self::edge_drag(
