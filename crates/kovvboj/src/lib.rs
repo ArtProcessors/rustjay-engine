@@ -1430,6 +1430,17 @@ fn same_resource(a: &crate::sources::SourceEntry, b: &crate::sources::SourceEntr
     a.kind == b.kind && a.path == b.path && a.device_index == b.device_index && a.text == b.text
 }
 
+/// Does recalling this onto a deck replace what is already there?
+///
+/// Only a saved deck replaces a deck: loading a deck means loading a deck, not
+/// stacking one on another. A saved group is an addition wherever it lands —
+/// answering this by destination alone emptied the deck and left the recalled
+/// group wearing the deck's identity.
+#[cfg(feature = "mixer")]
+pub(crate) fn recall_replaces(saved_is_deck: bool, into_deck: Option<usize>) -> bool {
+    into_deck.is_some() && saved_is_deck
+}
+
 /// What reconciling decided to do with one desired layer.
 #[cfg(feature = "mixer")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3244,14 +3255,23 @@ impl EffectPlugin for KovvbojRootPlugin {
                 // mints its own uuid per layer, which would rekey a second time
                 // and strand the parameters this recall just rewrote.
                 //
-                // Into a deck, the deck keeps its uuid — it is furniture, and a
-                // control surface mapped to `grp_deck_a_opacity` has to still
-                // find it afterwards — and its current layers are replaced,
-                // because recalling a deck means loading a deck, not stacking
-                // one on top of another. Into the free stack it adds, as it
-                // always has.
+                // What is being recalled decides this, not where it is going.
+                //
+                // A saved *deck* onto a deck replaces it: the deck keeps its
+                // uuid — it is furniture, and a control surface mapped to
+                // `grp_deck_a_opacity` has to still find it afterwards — and
+                // its layers give way, because recalling a deck means loading a
+                // deck, not stacking one on top of another.
+                //
+                // A saved *group* onto a deck is an addition: it takes a fresh
+                // uuid and nests inside the deck, and nothing already there is
+                // touched. Sending it down the deck path emptied the deck and
+                // made the group *become* the deck.
+                //
+                // Into the free stack, either one adds, as it always has.
                 let deck_uuid = into_deck.map(|d| if d == 1 { DECK_B } else { DECK_A });
-                let recalled = match deck_uuid {
+                let replace = recall_replaces(saved.is_deck(), into_deck);
+                let recalled = match deck_uuid.filter(|_| replace) {
                     Some(uuid) => saved.instantiate_into(uuid),
                     None => saved.instantiate(),
                 };
@@ -3261,8 +3281,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                 let mut members = Vec::new();
 
                 // Clear the deck first, with the same sweep a layer removal
-                // does, or the old layers' modulation outlives them.
-                if let Some(uuid) = deck_uuid {
+                // does, or the old layers' modulation outlives them. Only when
+                // a deck is being loaded over a deck.
+                if let Some(uuid) = deck_uuid.filter(|_| replace) {
                     let doomed: Vec<String> = {
                         let mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
                         mixer
@@ -3377,6 +3398,14 @@ impl EffectPlugin for KovvbojRootPlugin {
                                     g.parent
                                 );
                             }
+                        }
+
+                        // A group added to a deck lives inside it. A deck
+                        // recall *is* the deck and has no parent to set.
+                        if let Some(uuid) = deck_uuid.filter(|_| !replace)
+                            && !mixer.set_group_parent(&gid, Some(uuid))
+                        {
+                            log::warn!("[Group] '{}' could not join {uuid}", saved.name);
                         }
 
                         // Chains and mix settings: the nested groups' own, then
@@ -5426,5 +5455,59 @@ mod grouping_inside_a_deck_tests {
         let mut plain = Mixer::new();
         plain.add_channel(Channel::new("x", "x", Box::new(Stub))).unwrap();
         assert!(plain.channels_off_deck().is_empty());
+    }
+}
+
+/// Recalling a saved thing onto a deck.
+///
+/// A saved group added to a deck must leave the deck's layers alone. It once
+/// took the deck-load path, which swept the deck empty and pinned the group's
+/// uuid to the deck — so the group did not join the deck, it replaced it.
+#[cfg(all(test, feature = "mixer"))]
+mod recall_tests {
+    use super::*;
+
+    #[test]
+    fn a_group_added_to_a_deck_keeps_what_is_there() {
+        assert!(
+            !recall_replaces(false, Some(0)),
+            "a saved group joins a deck; it does not empty it"
+        );
+        assert!(!recall_replaces(false, Some(1)));
+    }
+
+    #[test]
+    fn a_deck_loaded_onto_a_deck_replaces_it() {
+        assert!(recall_replaces(true, Some(0)));
+        assert!(recall_replaces(true, Some(1)));
+    }
+
+    #[test]
+    fn nothing_replaces_the_free_stack() {
+        // No deck named, nothing to replace — both kinds simply add.
+        assert!(!recall_replaces(true, None));
+        assert!(!recall_replaces(false, None));
+    }
+
+    #[test]
+    fn a_recalled_group_can_never_wear_a_decks_identity() {
+        // `instantiate` mints fresh uuids, so a group recalled anywhere is a
+        // new group — it cannot collide with the permanent deck uuids and be
+        // mistaken for furniture.
+        let saved = crate::scene::SavedGroup {
+            version: 1,
+            name: "Beds".into(),
+            group_uuid: "whatever".into(),
+            layers: Vec::new(),
+            groups: Vec::new(),
+            fx: Vec::new(),
+            opacity: 1.0,
+            blend_mode: rustjay_mixer::BlendMode::Normal,
+            params: std::collections::HashMap::new(),
+        };
+        assert!(!saved.is_deck());
+        let fresh = saved.instantiate().group_uuid;
+        assert_ne!(fresh, DECK_A);
+        assert_ne!(fresh, DECK_B);
     }
 }

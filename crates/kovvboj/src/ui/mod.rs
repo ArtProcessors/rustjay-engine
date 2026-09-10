@@ -3400,8 +3400,8 @@ mod egui_impl {
                     // is `SavedGroup::is_deck` — the top-level uuid, derived.
                     #[cfg(feature = "mixer")]
                     for (title, hint, decks_only) in [
-                        ("DECKS", "A / B loads it onto a deck", true),
-                        ("GROUPS", "A / B adds its layers", false),
+                        ("DECKS", "A / B replaces that deck", true),
+                        ("GROUPS", "A / B adds it to that deck", false),
                     ] {
                         if !state
                             .saved_groups
@@ -3439,10 +3439,14 @@ mod egui_impl {
                                         if let Some(deck) = super::deck_add_buttons(
                                             ui,
                                             decked,
+                                            // One replaces, the other adds.
+                                            // Say which: a destructive click
+                                            // should not look identical to an
+                                            // additive one sitting above it.
                                             if decks_only {
-                                                "Load this deck onto"
+                                                "Replace everything on deck"
                                             } else {
-                                                "Load this group onto"
+                                                "Add this group to deck"
                                             },
                                         ) {
                                             queue_group_recall = Some(((*g).clone(), deck));
