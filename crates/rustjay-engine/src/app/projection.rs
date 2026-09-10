@@ -522,6 +522,10 @@ fn create_intermediate(
 /// Subsystem that manages all projector outputs.
 pub struct ProjectionSubsystem {
     pub projectors: Vec<ProjectorOutput>,
+    /// Preview windows the host opened to look at something. Built exactly as
+    /// projectors are, but kept off `projectors` so they never take an index
+    /// the host addresses projectors by.
+    previews: Vec<ProjectorOutput>,
     /// Active headless outputs (offscreen texture + async readback).
     pub headless_outputs: Vec<HeadlessOutput>,
     /// Per-headless output managers (recorder + NDI/Syphon/Spout/V4L2 senders),
@@ -550,6 +554,9 @@ struct PendingProjector {
     stage_factory: StageFactory,
     /// Monitor index for fullscreen, or `None` for windowed.
     fullscreen_monitor: Option<usize>,
+    /// A preview window rather than a projector; see
+    /// [`ProjectionSubsystem::add_preview`].
+    preview: bool,
 }
 
 /// A projector-creation outcome that should be shown to the user.
@@ -593,6 +600,7 @@ impl ProjectionSubsystem {
             headless_managers: Vec::new(),
             sampler_outputs: std::collections::HashMap::new(),
             next_sampler_id: 1,
+            previews: Vec::new(),
             pending: Vec::new(),
             last_render: None,
             device: None,
@@ -617,6 +625,28 @@ impl ProjectionSubsystem {
             window_attrs,
             stage_factory: Box::new(stage_factory),
             fullscreen_monitor,
+            preview: false,
+        });
+    }
+
+    /// Queue a preview window: a plain window showing whatever the stages
+    /// draw, closed by its own close button.
+    ///
+    /// Built like a projector — same surface, stage chain and pacing — but it
+    /// keeps the cursor, and it is not one of [`Self::projectors`], so opening
+    /// one cannot shift the index of a real output.
+    pub fn add_preview(
+        &mut self,
+        window_attrs: winit::window::WindowAttributes,
+        stage_factory: impl FnOnce(&wgpu::Device, wgpu::TextureFormat) -> Vec<Box<dyn ProjectionStage>>
+            + Send
+            + 'static,
+    ) {
+        self.pending.push(PendingProjector {
+            window_attrs,
+            stage_factory: Box::new(stage_factory),
+            fullscreen_monitor: None,
+            preview: true,
         });
     }
 
@@ -669,7 +699,9 @@ impl ProjectionSubsystem {
                     notifications.push(notification);
                 }
             }
-            window.set_cursor_visible(false);
+            if !pending.preview {
+                window.set_cursor_visible(false);
+            }
 
             // Create a temporary surface just to query the format for the factory.
             let temp_surface = match instance.create_surface(Arc::clone(&window)) {
@@ -691,7 +723,11 @@ impl ProjectionSubsystem {
             match ProjectorOutput::new(window, instance, &device, adapter, stages, fullscreen) {
                 Ok(proj) => {
                     log::info!("Projector window created ({}x{})", proj.width, proj.height);
-                    self.projectors.push(proj);
+                    if pending.preview {
+                        self.previews.push(proj);
+                    } else {
+                        self.projectors.push(proj);
+                    }
                 }
                 Err(e) => {
                     let notification =
@@ -712,6 +748,20 @@ impl ProjectionSubsystem {
         device: &wgpu::Device,
         shift_pressed: &mut bool,
     ) -> bool {
+        // A preview only needs sizing and closing; the projector handling below
+        // (cursor hiding, fullscreen keys) is not for it.
+        if let Some(i) = self.previews.iter().position(|p| p.owns_window(window_id)) {
+            match event {
+                winit::event::WindowEvent::Resized(size) => {
+                    self.previews[i].resize(size.width, size.height, device);
+                }
+                winit::event::WindowEvent::CloseRequested => {
+                    self.previews.remove(i);
+                }
+                _ => {}
+            }
+            return false;
+        }
         let mut remove_id: Option<winit::window::WindowId> = None;
         for proj in &mut self.projectors {
             if proj.owns_window(window_id) {
@@ -869,6 +919,9 @@ impl ProjectionSubsystem {
         self.last_render = Some(now);
         for proj in &mut self.projectors {
             proj.render(device, queue, source_view, source_texture, source_size);
+        }
+        for preview in &mut self.previews {
+            preview.render(device, queue, source_view, source_texture, source_size);
         }
         for i in 0..self.headless_outputs.len() {
             self.headless_outputs[i].render(device, queue, source_view, source_texture, source_size);

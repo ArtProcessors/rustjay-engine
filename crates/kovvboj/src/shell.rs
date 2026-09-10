@@ -1480,12 +1480,18 @@ impl KovvbojShell {
         let a = column(full.center().x - block / 2.0 - gap - side, side);
         let middle = column(a.max.x + gap, block);
         let b = column(middle.max.x + gap, side);
-        ui.scope_builder(egui::UiBuilder::new().max_rect(a), |ui| {
-            Self::deck_preview(ui, engine, 0, side)
-        });
-        ui.scope_builder(egui::UiBuilder::new().max_rect(b), |ui| {
-            Self::deck_preview(ui, engine, 1, side)
-        });
+        let clicked = [
+            ui.scope_builder(egui::UiBuilder::new().max_rect(a), |ui| {
+                Self::deck_preview(ui, engine, 0, side)
+            })
+            .inner
+            .clicked(),
+            ui.scope_builder(egui::UiBuilder::new().max_rect(b), |ui| {
+                Self::deck_preview(ui, engine, 1, side)
+            })
+            .inner
+            .clicked(),
+        ];
         ui.scope_builder(egui::UiBuilder::new().max_rect(middle), |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("A").strong().monospace());
@@ -1576,16 +1582,56 @@ impl KovvbojShell {
         if let Some(path) = pick {
             state.pending_transition = Some(path);
         }
+
+        // A click on a deck's preview pops that deck out into its own window.
+        #[cfg(feature = "projection")]
+        for deck in (0..2).filter(|&d| clicked[d]) {
+            Self::pop_out_deck(state, deck);
+        }
+        #[cfg(not(feature = "projection"))]
+        let _ = clicked;
     }
 
-    /// One deck's live output, aspect-fit into `width`.
+    /// Open a deck's image in its own small OS window.
+    ///
+    /// The engine builds it as it builds a projector — surface, stage chain,
+    /// close button — but keeps it on its preview list, so it never takes a
+    /// projector's index. The deck is downsampled straight into the window:
+    /// low resolution by window size, not by an extra texture.
+    // ponytail: the image stretches if the window is resized off 16:9;
+    // letterbox in `DeckPopoutStage` if that ever matters.
+    #[cfg(all(feature = "projection", feature = "mixer"))]
+    fn pop_out_deck(state: &mut crate::KovvbojAppState, deck: usize) {
+        // An open window's stage holds the slot's only other handle, so a
+        // second click on an open deck opens nothing.
+        if Arc::strong_count(&state.deck_popouts[deck]) > 1 {
+            return;
+        }
+        let slot = state.deck_popouts[deck].clone();
+        let Some(handle) = state.projection_handle.as_ref() else {
+            return;
+        };
+        let mut guard = handle.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sub) = guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>() else {
+            return;
+        };
+        let attrs = winit::window::WindowAttributes::default()
+            .with_title(format!("KOVVBOJ — Deck {}", ["A", "B"][deck]))
+            .with_inner_size(winit::dpi::LogicalSize::new(480.0, 270.0));
+        sub.add_preview(attrs, move |device, format| {
+            vec![Box::new(crate::stage::DeckPopoutStage::new(device, format, slot))]
+        });
+    }
+
+    /// One deck's live output, aspect-fit into `width`. Clicking it pops the
+    /// deck out into its own window.
     #[cfg(feature = "mixer")]
     fn deck_preview(
         ui: &mut egui::Ui,
         engine: &Arc<Mutex<EngineState>>,
         deck: usize,
         width: f32,
-    ) {
+    ) -> egui::Response {
         let (id, w, h) = {
             let state = engine.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -1600,17 +1646,17 @@ impl KovvbojShell {
             16.0 / 9.0
         };
         let size = egui::vec2(width, width / aspect);
-        match id {
-            Some(raw) => {
-                ui.add(
-                    egui::Image::new((egui::TextureId::User(raw), size)).fit_to_exact_size(size),
-                );
-            }
+        let resp = match id {
+            Some(raw) => ui.add(
+                egui::Image::new((egui::TextureId::User(raw), size))
+                    .fit_to_exact_size(size)
+                    .sense(egui::Sense::click()),
+            ),
             // Nothing published yet: hold the space so the fader does not jump
             // sideways on the frame the previews arrive. Dark and outlined —
             // a light slab reads as a blown-out image rather than an empty one.
             None => {
-                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
                 let painter = ui.painter();
                 painter.rect_filled(rect, 2.0, ui.style().visuals.extreme_bg_color);
                 painter.rect_stroke(
@@ -1619,7 +1665,14 @@ impl KovvbojShell {
                     egui::Stroke::new(1.0, rustjay_gui::egui_theme::colors::ink_2()),
                     egui::StrokeKind::Inside,
                 );
+                resp
             }
+        };
+        if cfg!(feature = "projection") {
+            resp.on_hover_text("Open in its own window")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+        } else {
+            resp
         }
     }
 

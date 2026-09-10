@@ -41,6 +41,10 @@ const IDLE_GRACE_FRAMES: u64 = 30;
 
 pub const ASPECT: f32 = THUMB_W as f32 / THUMB_H as f32;
 
+/// What a deck's pop-out window samples: the texture holding that deck's
+/// image this frame, handed over by the render hook while a window is open.
+pub type DeckSlot = std::sync::Arc<std::sync::Mutex<Option<wgpu::TextureView>>>;
+
 struct Entry {
     #[allow(dead_code)] // Keeps the texture alive for the registered view.
     texture: wgpu::Texture,

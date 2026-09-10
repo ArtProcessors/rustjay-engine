@@ -218,6 +218,10 @@ pub struct KovvbojAppState {
     #[serde(skip)]
     #[cfg(feature = "mixer")]
     pub thumbs: crate::thumbs::Thumbnails,
+    /// One per deck, for its pop-out window. See `shell::pop_out_deck`.
+    #[serde(skip)]
+    #[cfg(feature = "mixer")]
+    pub deck_popouts: [crate::thumbs::DeckSlot; 2],
     /// Analysed shader library: thumbnails, weights and compile status. Loaded
     /// from the workspace on open, so it is rebuilt rather than serialised.
     #[serde(skip)]
@@ -950,6 +954,8 @@ impl Default for KovvbojAppState {
             mixer: Arc::new(Mutex::new(Mixer::new())),
             #[cfg(feature = "mixer")]
             thumbs: crate::thumbs::Thumbnails::default(),
+            #[cfg(feature = "mixer")]
+            deck_popouts: Default::default(),
             previs: crate::previs::Previs::default(),
             scan: None,
             previs_analyzer: None,
@@ -4360,6 +4366,18 @@ impl EffectPlugin for KovvbojRootPlugin {
             app_state
                 .thumbs
                 .update(ctx.device, ctx.encoder, ctx.vertex_buffer, &mixer);
+
+            // A deck pop-out samples the deck's own texture, whichever one holds
+            // its image this frame. Only while a window is open — its stage
+            // holds the slot's only other handle.
+            if let Some(decks) = &mixer.decks {
+                for (slot, deck) in app_state.deck_popouts.iter().zip(decks) {
+                    if std::sync::Arc::strong_count(slot) > 1 {
+                        *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                            mixer.group_output(deck).map(|t| t.view.clone());
+                    }
+                }
+            }
 
             // One library shader analysed per frame, if a scan is running.
             // Deliberately after the mixer: the scan is a pre-show job and must

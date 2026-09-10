@@ -1553,6 +1553,83 @@ impl rustjay_projection::ProjectionStage for KovvbojEdgeBlendStage {
     }
 }
 
+/// One deck's image in its own window: what a click on a deck preview beside
+/// the crossfader opens.
+///
+/// It ignores the projection input (the master) and samples the deck's own
+/// texture through a [`crate::thumbs::DeckSlot`]. The blit is the downscale to
+/// the small window, so a pop-out costs one draw a frame and no texture.
+#[cfg(all(feature = "projection", feature = "mixer"))]
+pub struct DeckPopoutStage {
+    blit: rustjay_mixer::blit::BlitPipeline,
+    quad: wgpu::Buffer,
+    source: crate::thumbs::DeckSlot,
+}
+
+#[cfg(all(feature = "projection", feature = "mixer"))]
+impl DeckPopoutStage {
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        source: crate::thumbs::DeckSlot,
+    ) -> Self {
+        let quad = wgpu::util::DeviceExt::create_buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Deck pop-out quad"),
+                contents: bytemuck::cast_slice(&rustjay_core::Vertex::quad_vertices()),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        );
+        Self {
+            blit: rustjay_mixer::blit::BlitPipeline::new(device, format),
+            quad,
+            source,
+        }
+    }
+}
+
+#[cfg(all(feature = "projection", feature = "mixer"))]
+impl rustjay_projection::ProjectionStage for DeckPopoutStage {
+    fn label(&self) -> &str {
+        "deck-popout"
+    }
+
+    fn render(
+        &mut self,
+        ctx: &mut rustjay_core::RenderCtx<'_>,
+        _input: &wgpu::TextureView,
+        _input_texture: Option<&wgpu::Texture>,
+        output: &wgpu::TextureView,
+        _output_size: [u32; 2],
+    ) {
+        let source = self.source.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match source {
+            Some(view) => self.blit.blit(ctx.device, ctx.encoder, &view, output, &self.quad),
+            // A deck with nothing rendering shows black, not whatever the
+            // surface last held.
+            None => {
+                let _pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Deck pop-out clear"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: output,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
