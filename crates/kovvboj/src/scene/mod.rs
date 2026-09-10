@@ -211,6 +211,11 @@ pub struct Topology {
     /// Master FX applied after compositing.
     #[serde(default)]
     pub master_fx: Vec<FxDesc>,
+    /// The transition the crossfader drives, stored relative to the crate root
+    /// when possible. Absent in scenes saved before decks existed, and in those
+    /// the default dissolve is loaded.
+    #[serde(default)]
+    pub transition: Option<PathBuf>,
     /// Bus groups over the layers. Absent in scenes saved before groups
     /// existed, which then load as a flat stack.
     #[serde(default)]
@@ -592,6 +597,11 @@ impl Topology {
             version: TOPOLOGY_VERSION,
             layers,
             master_fx: capture_fx(&mixer.master),
+            transition: mixer
+                .transition
+                .as_ref()
+                .and_then(|slot| slot.source_path.as_ref())
+                .map(|path| relativize(path, &base)),
             groups: mixer
                 .groups
                 .iter()
@@ -769,6 +779,7 @@ mod tests {
     #[test]
     fn a_group_survives_a_topology_round_trip() {
         let topo = Topology {
+            transition: None,
             version: TOPOLOGY_VERSION,
             layers: vec![desc_with_fx("a", &[]), desc_with_fx("b", &[])],
             master_fx: Vec::new(),
@@ -938,5 +949,32 @@ mod tests {
         let back: GroupDesc =
             serde_json::from_str(&serde_json::to_string(&group).unwrap()).unwrap();
         assert_eq!(back.parent.as_deref(), Some("outer"));
+    }
+
+    /// A scene saved before decks existed must still load, and get the default.
+    #[test]
+    fn a_topology_without_a_transition_still_parses() {
+        let topo: Topology = serde_json::from_str(
+            r#"{"version":1,"layers":[],"master_fx":[],"groups":[]}"#,
+        )
+        .expect("older topology must still parse");
+        assert_eq!(topo.transition, None);
+    }
+
+    #[test]
+    fn the_chosen_transition_survives_a_round_trip() {
+        let topo = Topology {
+            version: TOPOLOGY_VERSION,
+            layers: Vec::new(),
+            master_fx: Vec::new(),
+            groups: Vec::new(),
+            transition: Some(PathBuf::from("shaders/transition_iris.fs")),
+        };
+        let back: Topology =
+            serde_json::from_str(&serde_json::to_string(&topo).unwrap()).unwrap();
+        assert_eq!(
+            back.transition,
+            Some(PathBuf::from("shaders/transition_iris.fs"))
+        );
     }
 }

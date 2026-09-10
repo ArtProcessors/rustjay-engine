@@ -11,6 +11,60 @@ pub fn shaders_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders")
 }
 
+/// The two decks are permanent furniture: created on first run, never deleted,
+/// never nested. Their uuids are fixed so `grp_deck_a_opacity` — and any MIDI
+/// bound to it — survives every scene load and every deck recall.
+#[cfg(feature = "mixer")]
+pub const DECK_A: &str = "deck_a";
+/// See [`DECK_A`].
+#[cfg(feature = "mixer")]
+pub const DECK_B: &str = "deck_b";
+
+/// The transition loaded when a scene names none. A plain dissolve is what a
+/// crossfader does when nobody has picked anything else.
+#[cfg(feature = "mixer")]
+pub const DEFAULT_TRANSITION: &str = "transition_dissolve.fs";
+
+/// Load `path` as the mixer's transition effect.
+#[cfg(feature = "mixer")]
+fn set_transition(
+    mixer: &mut Mixer,
+    path: &std::path::Path,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    engine: &EngineState,
+) {
+    match rustjay_isf::IsfEffect::from_path(path) {
+        Ok(isf) => {
+            let name = isf.shader_name.clone();
+            let node = EffectNode::new(isf, &name, device, queue, engine);
+            let mut slot = rustjay_mixer::EffectSlot::new(Box::new(node));
+            slot.source_path = Some(path.to_path_buf());
+            slot.effect
+                .set_param_prefix(rustjay_mixer::TRANSITION_PREFIX);
+            mixer.transition = Some(slot);
+        }
+        Err(e) => log::warn!("[Decks] transition {} failed to load: {e}", path.display()),
+    }
+}
+
+/// Make sure both decks exist, and that the transition is loaded.
+///
+/// Called after any graph rebuild. Grouping needs two members, so a deck with
+/// fewer layers than that simply is not formed yet — it becomes a deck as soon
+/// as it has something to hold.
+#[cfg(feature = "mixer")]
+fn ensure_decks(mixer: &mut Mixer) {
+    let present = |m: &Mixer, uuid: &str| m.groups.iter().any(|g| g.uuid == uuid);
+    if present(mixer, DECK_A) && present(mixer, DECK_B) {
+        mixer.decks = Some([DECK_A.to_string(), DECK_B.to_string()]);
+    } else {
+        // Without both, the groups that do exist composite as ordinary groups —
+        // no special casing, no half-configured transition.
+        mixer.decks = None;
+    }
+}
+
 /// The images-and-videos folder the registry scans alongside [`shaders_dir`].
 pub fn assets_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets")
@@ -1576,8 +1630,9 @@ impl KovvbojRootPlugin {
         let shaders_dir = crate::shaders_dir();
         let mut sources = std::collections::HashMap::new();
 
-        // Two layers to open on: a generator underneath, a camera over it.
-        let defaults: [(&str, crate::sources::SourceEntry); 2] = [
+        // Four layers to open on, two per deck, so both decks exist from the
+        // first frame and the crossfader has something to transition.
+        let defaults: [(&str, crate::sources::SourceEntry); 4] = [
             (
                 "ColorCycle",
                 crate::sources::SourceEntry {
@@ -1595,6 +1650,28 @@ impl KovvbojRootPlugin {
                     id: "camera".to_string(),
                     name: "Camera".to_string(),
                     kind: crate::sources::SourceKind::Camera,
+                    path: None,
+                    device_index: 0,
+                    text: None,
+                },
+            ),
+            (
+                "ColorCycleB",
+                crate::sources::SourceEntry {
+                    id: "colorcycle_b".to_string(),
+                    name: "ColorCycle".to_string(),
+                    kind: crate::sources::SourceKind::Isf,
+                    path: Some(shaders_dir.join("ColorCycle.fs")),
+                    device_index: 0,
+                    text: None,
+                },
+            ),
+            (
+                "SolidB",
+                crate::sources::SourceEntry {
+                    id: "solid_b".to_string(),
+                    name: "Solid".to_string(),
+                    kind: crate::sources::SourceKind::SolidColor,
                     path: None,
                     device_index: 0,
                     text: None,
@@ -1618,6 +1695,15 @@ impl KovvbojRootPlugin {
         }
 
         self.layer_sources_init = sources;
+
+        // The decks themselves. Bottom two layers are deck A, top two deck B,
+        // and the fader opens on A.
+        mixer.group_channels(DECK_A, "Deck A", &["ColorCycle".into(), "Camera".into()]);
+        mixer.group_channels(DECK_B, "Deck B", &["ColorCycleB".into(), "SolidB".into()]);
+        ensure_decks(&mut mixer);
+        mixer.crossfader = 0.0;
+        let transition = shaders_dir.join(DEFAULT_TRANSITION);
+        set_transition(&mut mixer, &transition, device, queue, &dummy_engine);
 
         // Phase 12 demo: pre-populate sequencer with a beat-synced sequence
         mixer.sequencer.steps = vec![
@@ -1861,6 +1947,32 @@ impl KovvbojRootPlugin {
             queue,
             &dummy_engine,
         );
+
+        // The transition the scene named, or the default dissolve. Reloaded only
+        // when the path actually changed, so a scene load does not rebuild a
+        // shader that is already running.
+        let want = crate::scene::resolve(
+            topo.transition
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(DEFAULT_TRANSITION)),
+            &if topo.transition.is_some() {
+                base.clone()
+            } else {
+                crate::shaders_dir()
+            },
+        );
+        let have = mixer
+            .transition
+            .as_ref()
+            .and_then(|s| s.source_path.clone());
+        if have.as_deref() != Some(want.as_path()) {
+            set_transition(&mut mixer, &want, device, queue, &dummy_engine);
+        }
+
+        // Deck roles follow the groups: if a scene rebuilt both deck groups,
+        // the crossfader transitions them again; if it did not, they are
+        // ordinary groups and nothing is special-cased.
+        ensure_decks(&mut mixer);
 
         // Unconditional: every path into here has moved channels between
         // indices or replaced what sits behind one, and the composite cache is
@@ -2310,6 +2422,31 @@ impl EffectPlugin for KovvbojRootPlugin {
                     && let Ok(mut restore) = engine.param_restore.lock()
                 {
                     restore.extend(scene.params.clone());
+                }
+            }
+
+            // The crossfader *is* the transition's progress — one control, one
+            // uniform, so a plain dissolve is just the dissolve shader at the
+            // fader's position. `prepare` holds `&EngineState`, so the write
+            // goes through the queue the renderer drains each frame.
+            //
+            // Writing the modulated crossfader into a *different* param's base
+            // does not ratchet the way writing it back into its own would: the
+            // value is recomputed from the fader every frame, never accumulated.
+            {
+                let decked = self
+                    .mixer
+                    .lock()
+                    .map(|m| m.decks.is_some() && m.transition.is_some())
+                    .unwrap_or(false);
+                if decked
+                    && let Some(x) = engine.get_param("crossfader")
+                    && let Ok(mut restore) = engine.param_restore.lock()
+                {
+                    restore.push((
+                        rustjay_mixer::TRANSITION_PROGRESS.to_string(),
+                        x.clamp(0.0, 1.0),
+                    ));
                 }
             }
 

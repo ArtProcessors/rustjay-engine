@@ -314,6 +314,15 @@ impl Mixer {
     }
 }
 
+/// Parameter prefix for the transition effect.
+///
+/// Fixed rather than uuid-keyed: there is exactly one transition, and a stable
+/// prefix means a MIDI binding to its softness survives swapping the shader.
+pub const TRANSITION_PREFIX: &str = "transition_";
+
+/// The transition's progress parameter, driven from the crossfader each frame.
+pub const TRANSITION_PROGRESS: &str = "transition_progress";
+
 /// Which deck the crossfader is parked on, if either.
 ///
 /// `None` means run the transition pass. Parked is the common case — a fader
@@ -1319,6 +1328,15 @@ impl EffectInstance for Mixer {
                 for p in slot.effect.parameters() {
                     out.push(prefix_descriptor(&chain_prefix, &p));
                 }
+            }
+        }
+
+        // The transition's own inputs — wipe angle, softness — are mappable like
+        // any effect param. Its `progress` is among them, and the host drives
+        // that one from the crossfader every frame.
+        if let Some(slot) = self.transition.as_ref() {
+            for p in slot.effect.parameters() {
+                out.push(prefix_descriptor(TRANSITION_PREFIX, &p));
             }
         }
 
