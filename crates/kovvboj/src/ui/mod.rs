@@ -2413,42 +2413,6 @@ mod egui_impl {
                                         .response
                                         .on_hover_text("Drag to restack");
 
-                                        // What the layer is actually putting out. Absent
-                                        // for the first frame of a new layer, and while a
-                                        // layer has no source at all.
-                                        let thumb_h = 22.0;
-                                        let thumb_size =
-                                            egui::vec2(thumb_h * crate::thumbs::ASPECT, thumb_h);
-                                        match thumb_ids.get(uuid) {
-                                            Some(id) => {
-                                                if ui
-                                                    .add(
-                                                        egui::Image::new((*id, thumb_size))
-                                                            .fit_to_exact_size(thumb_size)
-                                                            .corner_radius(2.0)
-                                                            .sense(egui::Sense::click()),
-                                                    )
-                                                    .on_hover_text("Layer output")
-                                                    .clicked()
-                                                {
-                                                    new_selection = Some(crate::Selection::Layer {
-                                                        layer: uuid.clone(),
-                                                    });
-                                                }
-                                            }
-                                            None => {
-                                                let (rect, _) = ui.allocate_exact_size(
-                                                    thumb_size,
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter().rect_filled(
-                                                    rect,
-                                                    2.0,
-                                                    rustjay_gui::egui_theme::colors::bg_widget(),
-                                                );
-                                            }
-                                        }
-
                                         let name = mixer.channels[idx].name.clone();
                                         // The control group on the right (✖, blend,
                                         // slider at minimum, M, S + gaps) needs about
@@ -2466,6 +2430,25 @@ mod egui_impl {
                                             egui::vec2(name_w, ui.available_height()),
                                         );
                                         let multi = picked.contains(uuid);
+                                        // What the layer is putting out, in the same
+                                        // button as its name: one select target, so the
+                                        // thumbnail picks, cmd-picks and opens the menu
+                                        // exactly as the name does, and stays a target
+                                        // when a narrow column squeezes the name to "…".
+                                        // Absent for the first frame of a new layer and
+                                        // while a layer has no source; a dark slot holds
+                                        // its place.
+                                        let thumb_h = 22.0;
+                                        let thumb_size =
+                                            egui::vec2(thumb_h * crate::thumbs::ASPECT, thumb_h);
+                                        let slot = ui.id().with("thumb_slot");
+                                        let thumb: egui::Atom<'_> = match thumb_ids.get(uuid) {
+                                            Some(id) => egui::Image::new((*id, thumb_size))
+                                                .fit_to_exact_size(thumb_size)
+                                                .corner_radius(2.0)
+                                                .into(),
+                                            None => egui::Atom::custom(slot, thumb_size),
+                                        };
                                         let resp = ui
                                             .scope_builder(
                                                 egui::UiBuilder::new().max_rect(name_rect).layout(
@@ -2474,13 +2457,25 @@ mod egui_impl {
                                                     ),
                                                 ),
                                                 |ui| {
-                                                    ui.add(
-                                                        egui::Button::selectable(
-                                                            layer_selected || multi,
-                                                            &name,
-                                                        )
-                                                        .truncate(),
+                                                    // Tight padding: the thumbnail sets the
+                                                    // height, and a narrow column needs the
+                                                    // width.
+                                                    ui.spacing_mut().button_padding =
+                                                        egui::vec2(4.0, 1.0);
+                                                    let out = egui::Button::selectable(
+                                                        layer_selected || multi,
+                                                        (thumb, name.as_str()),
                                                     )
+                                                    .truncate()
+                                                    .atom_ui(ui);
+                                                    if let Some(r) = out.rect(slot) {
+                                                        ui.painter().rect_filled(
+                                                            r,
+                                                            2.0,
+                                                            rustjay_gui::egui_theme::colors::bg_widget(),
+                                                        );
+                                                    }
+                                                    out.response
                                                 },
                                             )
                                             .inner;
