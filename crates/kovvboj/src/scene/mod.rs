@@ -180,6 +180,10 @@ pub struct GroupDesc {
     pub name: String,
     /// Member layer uuids, bottom of the group first.
     pub members: Vec<String>,
+    /// The group this one nests inside. Absent in scenes saved before groups
+    /// could nest, which then load as a flat set of top-level groups.
+    #[serde(default)]
+    pub parent: Option<String>,
     pub opacity: f32,
     pub blend_mode: rustjay_mixer::BlendMode,
     #[serde(default)]
@@ -594,6 +598,7 @@ impl Topology {
                 .map(|g| GroupDesc {
                     uuid: g.uuid.clone(),
                     name: g.name.clone(),
+                    parent: g.parent.clone(),
                     members: mixer
                         .group_members(&g.uuid)
                         .into_iter()
@@ -768,6 +773,7 @@ mod tests {
             layers: vec![desc_with_fx("a", &[]), desc_with_fx("b", &[])],
             master_fx: Vec::new(),
             groups: vec![GroupDesc {
+                parent: None,
                 uuid: "g1".into(),
                 name: "Backdrop".into(),
                 members: vec!["a".into(), "b".into()],
@@ -810,6 +816,7 @@ mod tests {
         params.insert("grp_G_fxZ_amount".to_string(), 0.2);
         params.insert("ch_OTHER_opacity".to_string(), 1.0); // not in the group
         let group = GroupDesc {
+            parent: None,
             uuid: "G".into(),
             name: "Backdrop".into(),
             members: vec!["L1".into(), "L2".into()],
@@ -889,5 +896,47 @@ mod tests {
             .remove("audio_routing");
         let back: Scene = serde_json::from_value(value).expect("deserialise");
         assert!(back.audio_routing.matrix.is_empty());
+    }
+
+    /// A scene saved before groups could nest must still load.
+    ///
+    /// `parent` defaults to `None`, so every group in an older file comes back
+    /// as top level — the flat arrangement it was saved in. No version bump and
+    /// no migration: the addition is purely additive and defaults correctly.
+    #[test]
+    fn a_group_saved_before_nesting_loads_at_top_level() {
+        let json = r#"{
+            "uuid": "g1",
+            "name": "Beds",
+            "members": ["a", "b"],
+            "opacity": 0.8,
+            "blend_mode": "Normal",
+            "solo": false,
+            "mute": false,
+            "collapsed": false,
+            "fx": []
+        }"#;
+        let group: GroupDesc = serde_json::from_str(json).expect("older group must still parse");
+        assert_eq!(group.parent, None);
+        assert_eq!(group.members, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn nesting_survives_a_round_trip() {
+        let group = GroupDesc {
+            uuid: "inner".into(),
+            name: "Inner".into(),
+            parent: Some("outer".into()),
+            members: vec!["a".into(), "b".into()],
+            opacity: 1.0,
+            blend_mode: rustjay_mixer::BlendMode::Normal,
+            solo: false,
+            mute: false,
+            collapsed: false,
+            fx: Vec::new(),
+        };
+        let back: GroupDesc =
+            serde_json::from_str(&serde_json::to_string(&group).unwrap()).unwrap();
+        assert_eq!(back.parent.as_deref(), Some("outer"));
     }
 }

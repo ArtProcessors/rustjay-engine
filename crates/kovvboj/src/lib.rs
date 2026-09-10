@@ -1838,6 +1838,20 @@ impl KovvbojRootPlugin {
             mixer.groups.push(group);
         }
 
+        // Nesting last: a parent may be declared after its child, and
+        // `set_group_parent` refuses a parent that does not exist yet. It also
+        // refuses a cycle, so a corrupt scene costs the nesting, not the layers.
+        for desc in &topo.groups {
+            let parent = desc.parent.as_deref();
+            if parent.is_some() && !mixer.set_group_parent(&desc.uuid, parent) {
+                log::warn!(
+                    "[Topology] group '{}' could not nest inside {:?}; left at top level",
+                    desc.name,
+                    parent
+                );
+            }
+        }
+
         reconcile_chain(
             &mut mixer.master,
             &topo.master_fx,
