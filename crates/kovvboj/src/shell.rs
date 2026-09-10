@@ -399,6 +399,27 @@ impl AnyEguiShell for KovvbojShell {
             }
         }
 
+        // ⌘T — TAKE. A modifier combo, so it cannot fire while a name is being
+        // typed into a text field.
+        #[cfg(feature = "mixer")]
+        {
+            let take_pressed = ui
+                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T));
+            if take_pressed {
+                let secs = host
+                    .engine()
+                    .lock()
+                    .ok()
+                    .and_then(|e| e.get_param_base(crate::TAKE_SECONDS))
+                    .unwrap_or(1.0);
+                if let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>()
+                    && let Ok(mut m) = state.mixer.lock()
+                {
+                    crate::take(&mut m, secs);
+                }
+            }
+        }
+
         // A folder picked by the File menu last frame.
         if let Some((action, dir)) = self
             .pending_workspace
@@ -1432,6 +1453,36 @@ impl KovvbojShell {
                                 }
                             }
                         });
+
+                    // TAKE: an action, not a value. It arms the auto-crossfade,
+                    // which writes the fader's *base* as it runs, so anything
+                    // modulating the crossfader still applies once and not
+                    // twice. The length is a parameter, so it is mappable.
+                    let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut secs = eng
+                        .get_param_base(crate::TAKE_SECONDS)
+                        .unwrap_or(1.0);
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut secs)
+                                .speed(0.05)
+                                .range(0.05..=10.0)
+                                .suffix("s"),
+                        )
+                        .on_hover_text("How long a TAKE runs")
+                        .changed()
+                    {
+                        eng.set_param_base(crate::TAKE_SECONDS, secs);
+                    }
+                    drop(eng);
+                    if ui
+                        .button(egui::RichText::new("TAKE").strong().monospace())
+                        .on_hover_text("Crossfade to the other deck (⌘T)")
+                        .clicked()
+                        && let Ok(mut m) = state.mixer.lock()
+                    {
+                        crate::take(&mut m, secs);
+                    }
                 });
             });
 

@@ -97,6 +97,45 @@ fn ensure_decks(mixer: &mut Mixer) {
     mixer.decks = Some([DECK_A.to_string(), DECK_B.to_string()]);
 }
 
+/// How long a TAKE takes, in seconds.
+///
+/// A registered parameter rather than a field, so the length of a take is
+/// MIDI-, OSC- and preset-reachable like every other knob, and rides in the
+/// scene's `params` with no new persistence.
+#[cfg(feature = "mixer")]
+pub const TAKE_SECONDS: &str = "take_seconds";
+
+/// Where a TAKE from `x` lands: the far end of the fader.
+///
+/// Exactly half sends it to A, so a TAKE from the centre commits rather than
+/// dithering.
+#[cfg(feature = "mixer")]
+pub fn take_target(from: f32) -> f32 {
+    if from < 0.5 { 1.0 } else { 0.0 }
+}
+
+/// Start an automatic crossfade to the other deck.
+///
+/// Writes no fader value itself: it arms [`AutoCrossfade`], which
+/// `Mixer::render_to` ticks, and `prepare` publishes as the crossfader's *base*
+/// so modulation still adds on top exactly once.
+///
+/// A running sequence is stopped, because the sequencer outranks `auto` in
+/// `tick_transitions` and a TAKE that did nothing would read as a broken
+/// button.
+#[cfg(feature = "mixer")]
+pub fn take(mixer: &mut Mixer, seconds: f32) {
+    let from = mixer.crossfader.clamp(0.0, 1.0);
+    mixer.sequencer.playing = false;
+    mixer.beat_sync = None;
+    mixer.auto = Some(rustjay_mixer::AutoCrossfade::new(
+        from,
+        take_target(from),
+        seconds.max(0.05),
+        rustjay_mixer::Easing::EaseInOut,
+    ));
+}
+
 /// The images-and-videos folder the registry scans alongside [`shaders_dir`].
 pub fn assets_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets")
@@ -1538,6 +1577,14 @@ pub struct KovvbojRootPlugin {
     /// them after the rebuilt graph's params (re)register.
     #[cfg(feature = "mixer")]
     pending_params: Option<std::collections::HashMap<String, f32>>,
+    /// Whether an automatic crossfade owned the fader on the previous frame.
+    ///
+    /// It has to outlive the transition by one frame: `tick_transitions` clears
+    /// `auto` on the same call that produces the final value, so a check for
+    /// "is one running" would drop the settle frame and let the fader spring
+    /// back to where the base still sat.
+    #[cfg(feature = "mixer")]
+    crossfade_owned: bool,
     /// Per-projector warp state. Each projector gets its own sync so surface-
     /// specific warp edits don't leak across outputs.
     #[cfg(feature = "projection")]
@@ -1570,6 +1617,8 @@ impl KovvbojRootPlugin {
             pending_audio_routing: None,
             #[cfg(feature = "mixer")]
             pending_params: None,
+            #[cfg(feature = "mixer")]
+            crossfade_owned: false,
             #[cfg(feature = "projection")]
             warp_syncs: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "projection")]
@@ -2487,6 +2536,34 @@ impl EffectPlugin for KovvbojRootPlugin {
                 set_transition(&mut mixer, &path, device, queue, engine);
                 // Its inputs are new parameters under the same stable prefix.
                 self.params_dirty = true;
+            }
+
+            // An automatic crossfade — TAKE, beat-sync, the step sequencer —
+            // moves the fader for you. It writes the *base* value and lets
+            // `get_param` add modulation on top: writing the final value would
+            // apply an LFO assigned to the crossfader twice for as long as the
+            // TAKE lasted. `Mixer::render_to` ticks these and parks the result
+            // in `mixer.crossfader`; this is what turns that into the fader.
+            {
+                let base = engine.get_param_base("crossfader").unwrap_or(0.0);
+                let ticked = self.mixer.lock().ok().map(|mut m| {
+                    let running =
+                        m.sequencer.playing || m.auto.is_some() || m.beat_sync.is_some();
+                    if !(running || self.crossfade_owned) {
+                        // Nobody is driving: the fader is the operator's, and
+                        // the next TAKE starts from wherever they left it.
+                        m.crossfader = base;
+                    }
+                    (running, m.crossfader)
+                });
+                if let Some((running, value)) = ticked {
+                    if (running || self.crossfade_owned)
+                        && let Ok(mut restore) = engine.param_restore.lock()
+                    {
+                        restore.push(("crossfader".to_string(), value.clamp(0.0, 1.0)));
+                    }
+                    self.crossfade_owned = running;
+                }
             }
 
             // The crossfader *is* the transition's progress — one control, one
@@ -3825,6 +3902,16 @@ impl EffectPlugin for KovvbojRootPlugin {
             // it is a real parameter so a blackout fader is reachable from MIDI,
             // OSC and modulation like everything else.
             params.push(rustjay_core::ParameterDescriptor {
+                id: crate::TAKE_SECONDS.to_string(),
+                name: "Take Seconds".to_string(),
+                param_type: rustjay_core::ParamType::Float,
+                min: 0.05,
+                max: 10.0,
+                default: 1.0,
+                step: 0.05,
+                category: rustjay_core::ParamCategory::Custom("Mixer".to_string()),
+            });
+            params.push(rustjay_core::ParameterDescriptor {
                 id: crate::ui::MASTER_DIM.to_string(),
                 name: "Master Dim".to_string(),
                 param_type: rustjay_core::ParamType::Float,
@@ -4964,5 +5051,64 @@ mod deck_permanence_tests {
         assert!(m.set_group_parent("inner", Some(DECK_A)));
         assert_eq!(m.deck_of("inner"), Some(0));
         assert_eq!(m.deck_of_channel(1), Some(0));
+    }
+}
+
+/// TAKE: one gesture that hands the show to the other deck.
+#[cfg(all(test, feature = "mixer"))]
+mod take_tests {
+    use super::*;
+
+    struct Stub;
+    impl rustjay_core::EffectInstance for Stub {
+        fn render_to(
+            &mut self,
+            _ctx: &mut rustjay_core::RenderCtx<'_>,
+            _inputs: &[rustjay_core::EffectInput<'_>],
+            _target: rustjay_core::RenderTarget<'_>,
+            _engine: &EngineState,
+        ) {
+        }
+    }
+
+    fn mixer_at(x: f32) -> Mixer {
+        let mut m = Mixer::new();
+        m.use_crossfader = false;
+        m.add_channel(Channel::new("a", "a", Box::new(Stub))).unwrap();
+        m.crossfader = x;
+        m
+    }
+
+    #[test]
+    fn a_take_goes_to_the_far_end() {
+        assert_eq!(take_target(0.0), 1.0);
+        assert_eq!(take_target(0.2), 1.0);
+        assert_eq!(take_target(1.0), 0.0);
+        assert_eq!(take_target(0.8), 0.0);
+        // Dead centre commits rather than dithering.
+        assert_eq!(take_target(0.5), 0.0);
+    }
+
+    #[test]
+    fn take_runs_the_fader_from_where_it_sits_to_the_other_end() {
+        let mut m = mixer_at(0.25);
+        take(&mut m, 1.0);
+        let auto = m.auto.as_mut().expect("a take arms the auto crossfade");
+        // Half a second in, a quarter to one has covered ground and not arrived.
+        let mid = auto.tick(0.5).expect("still running");
+        assert!(mid > 0.25 && mid < 1.0, "mid-take value was {mid}");
+        assert_eq!(auto.target(), 1.0);
+    }
+
+    #[test]
+    fn take_stops_a_running_sequence_rather_than_being_ignored() {
+        let mut m = mixer_at(0.0);
+        m.sequencer.steps = vec![rustjay_mixer::TransitionStep::hold(4.0)];
+        m.sequencer.playing = true;
+        m.beat_sync = Some(rustjay_mixer::BeatSyncCrossfade::new(0.0, 4.0));
+        take(&mut m, 1.0);
+        assert!(!m.sequencer.playing, "the sequencer outranks auto in the tick");
+        assert!(m.beat_sync.is_none());
+        assert!(m.auto.is_some());
     }
 }
