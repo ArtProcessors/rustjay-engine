@@ -2374,11 +2374,19 @@ mod egui_impl {
                     );
 
                     ui.push_id(uuid, |ui| {
-                        // Enough to read as nesting, small enough that a half
-                        // window still fits the row's controls. A margin, not
-                        // `add_space`: the drop zone lays out top-down, so that
-                        // was a gap above the row rather than an indent.
-                        let indent: i8 = if nested { 12 } else { 0 };
+                        // A margin, not `add_space`: the drop zone lays out
+                        // top-down, so that was a gap above the row rather than
+                        // an indent. Only where there is room, though: in a
+                        // narrower column the row's controls already fill it, and
+                        // an indent pushes the solo button over the name. The
+                        // rail still marks the nesting there.
+                        // ponytail: fixed threshold, measured at 1200/1700pt
+                        // windows — derive it from the controls if they change.
+                        let indent: i8 = if nested && ui.available_width() > 340.0 {
+                            12
+                        } else {
+                            0
+                        };
                         let row_top = ui.cursor().top();
                         let (_, dropped) =
                             ui.dnd_drop_zone::<LayerDrag, _>(egui::Frame::NONE, |ui| {
