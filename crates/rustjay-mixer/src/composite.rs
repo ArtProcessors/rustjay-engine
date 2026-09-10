@@ -11,6 +11,7 @@ use std::num::NonZeroU64;
 use crate::blend::BlendMode;
 use crate::preset::MAX_CHANNELS;
 use rustjay_core::Vertex;
+use rustjay_render::Texture;
 
 /// Key parameters for chroma/luma keying. Passed to [`CompositePipeline::blend`].
 #[derive(Copy, Clone)]
@@ -76,8 +77,13 @@ pub struct CompositePipeline {
     uniform_buffer: wgpu::Buffer,
     /// Per-slot stride, aligned to `min_uniform_buffer_offset_alignment`.
     slot_stride: u32,
-    /// Bind groups keyed by `(slot, dest_is_acc_a)`; valid for `cache_generation`.
-    cache: RefCell<HashMap<(usize, bool), wgpu::BindGroup>>,
+    /// Bind groups keyed by `(slot, dest_is_acc_a)`; valid for
+    /// `cache_generation`. The stored `u64` is the source texture's allocation
+    /// id: one slot can be fed by different textures from frame to frame — the
+    /// deck slot alternates between deck A, deck B and the transition output as
+    /// the crossfader moves — and rebinding on that is what keeps the cache from
+    /// serving the previous frame's picture.
+    cache: RefCell<HashMap<(usize, bool), (u64, wgpu::BindGroup)>>,
     /// The generation the cached bind groups were built for.
     cache_generation: Cell<u64>,
 }
@@ -208,6 +214,12 @@ impl CompositePipeline {
     /// reallocated (resize) or the channel set changes; on a new generation the
     /// whole cache is dropped so no stale view is ever sampled (REQ-11.1).
     ///
+    /// `source` is taken whole rather than as a view so its allocation id is
+    /// part of the cache entry: a slot whose source texture changes without a
+    /// generation bump — the deck slot every time the crossfader leaves or
+    /// reaches an end — rebinds instead of redrawing the texture it was first
+    /// given.
+    ///
     /// Steady-state cost: one `queue.write_buffer` (no GPU allocation) plus a
     /// cached bind-group lookup. Nothing is allocated per frame (REQ-11.2).
     #[allow(clippy::too_many_arguments)]
@@ -219,7 +231,7 @@ impl CompositePipeline {
         generation: u64,
         slot: usize,
         dest_is_a: bool,
-        source: &wgpu::TextureView,
+        source: &Texture,
         dest: &wgpu::TextureView,
         out: &wgpu::TextureView,
         opacity: f32,
@@ -258,10 +270,16 @@ impl CompositePipeline {
         };
         queue.write_buffer(&self.uniform_buffer, offset, bytemuck::bytes_of(&params));
 
-        // The bind group depends only on (source, dest) views, which are stable
-        // for a fixed (slot, dest_is_a) within one generation — so cache it.
+        // The dest view is stable for a fixed (slot, dest_is_a) within one
+        // generation, but the source is not: rebind when the texture behind it
+        // is a different allocation than the one the entry was built from.
         let key = (slot, dest_is_a);
-        if !self.cache.borrow().contains_key(&key) {
+        let stale = self
+            .cache
+            .borrow()
+            .get(&key)
+            .is_none_or(|(id, _)| *id != source.generation);
+        if stale {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Mixer Composite Bind Group"),
                 layout: &self.bind_group_layout,
@@ -272,7 +290,7 @@ impl CompositePipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(source),
+                        resource: wgpu::BindingResource::TextureView(&source.view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -288,10 +306,12 @@ impl CompositePipeline {
                     },
                 ],
             });
-            self.cache.borrow_mut().insert(key, bind_group);
+            self.cache
+                .borrow_mut()
+                .insert(key, (source.generation, bind_group));
         }
         let cache = self.cache.borrow();
-        let bind_group = cache.get(&key).expect("bind group just inserted");
+        let (_, bind_group) = cache.get(&key).expect("bind group just inserted");
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Mixer Composite Pass"),
