@@ -318,27 +318,24 @@ pub fn deck_add_buttons(ui: &mut egui::Ui, decked: bool, what: &str) -> Option<O
             .clicked()
             .then_some(None);
     }
-    // Library rows lay out right-to-left, so B goes in first for A to end up
-    // on the left — the order they read in everywhere else.
-    //
-    // Tight, because two buttons have to fit where one ➕ did: at the stock
-    // library width the second was clipped off the panel edge entirely.
+    // A before B, in the order they read everywhere else. Tight, because two
+    // buttons sit where one ➕ did.
     ui.spacing_mut().item_spacing.x = 2.0;
     ui.spacing_mut().button_padding.x = 3.0;
     let mut picked = None;
-    if ui
-        .small_button("B")
-        .on_hover_text(format!("{what} on deck B"))
-        .clicked()
-    {
-        picked = Some(Some(1));
-    }
     if ui
         .small_button("A")
         .on_hover_text(format!("{what} on deck A"))
         .clicked()
     {
         picked = Some(Some(0));
+    }
+    if ui
+        .small_button("B")
+        .on_hover_text(format!("{what} on deck B"))
+        .clicked()
+    {
+        picked = Some(Some(1));
     }
     picked
 }
@@ -3001,12 +2998,17 @@ mod egui_impl {
                             {
                                 toggle_fav = Some(entry.id.clone());
                             }
-                            // Right-to-left so ➕ claims its space first and a
-                            // long name truncates. Laid out the other way round,
-                            // an NDI source named after a hostname pushed the
-                            // button off the panel entirely.
+                            // Buttons first, in the left gutter beside the
+                            // star, so the name is what truncates — an NDI
+                            // source named after a hostname used to push the
+                            // button off the panel. They were laid out
+                            // right-to-left for that reason, which put them
+                            // against an edge that also carries the scroll bar
+                            // and the resize grip: with two of them the second
+                            // was clipped away entirely and could not be
+                            // clicked. The left gutter has no such neighbours.
                             ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
+                                egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     if is_effect {
                                         let enabled =
