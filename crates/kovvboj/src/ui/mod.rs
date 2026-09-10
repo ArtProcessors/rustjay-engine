@@ -2342,6 +2342,14 @@ mod egui_impl {
                     // reads as one block rather than rows that happen to be
                     // adjacent.
                     let in_group_uuid = mixer.channels.get(idx).and_then(|c| c.group.clone());
+                    // The rail says "this sits inside a group". A deck is a
+                    // group, so once decks existed every layer had one and the
+                    // rail marked everything — which is the same as marking
+                    // nothing. The column heading already says which deck you
+                    // are looking at; the rail is for the groups within it.
+                    let nested = in_group_uuid
+                        .as_deref()
+                        .is_some_and(|g| g != crate::DECK_A && g != crate::DECK_B);
                     let _ = idx;
                     let Some(idx) = mixer.channels.iter().position(|c| c.uuid == *uuid) else {
                         continue;
@@ -2365,7 +2373,7 @@ mod egui_impl {
                     );
 
                     ui.push_id(uuid, |ui| {
-                        let indent = if in_group_uuid.is_some() { 22.0 } else { 0.0 };
+                        let indent = if nested { 22.0 } else { 0.0 };
                         let row_top = ui.cursor().top();
                         let (_, dropped) =
                             ui.dnd_drop_zone::<LayerDrag, _>(egui::Frame::NONE, |ui| {
@@ -2665,8 +2673,7 @@ mod egui_impl {
                                     }
                                 });
                             });
-                        if let Some(gid) = &in_group_uuid {
-                            let _ = gid;
+                        if nested {
                             let rect = ui.min_rect();
                             let x = rect.left() + 8.0;
                             ui.painter().line_segment(
