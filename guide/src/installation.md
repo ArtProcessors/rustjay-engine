@@ -15,12 +15,33 @@
 
 rustjay-engine renders via **Metal**. No extra GPU drivers needed.
 
-For Syphon video sharing, install [Syphon.framework](https://github.com/Syphon/Syphon-Framework/releases) into `/Library/Frameworks/`. Many VJ apps (Resolume, VDMX, MadMapper) bundle it — if you've installed any of those, Syphon is already present.
+Syphon video sharing needs no install: the `syphon-core` crate ships a universal
+(arm64 + x86_64) Syphon.framework and the build scripts point the binary at it.
+
+One thing to watch for on an Apple Silicon Mac. A copy of Syphon.framework in
+`/Library/Frameworks/` — left by an old VJ app installer, say — is also on the
+runtime search path, and copies from before the Apple Silicon transition are
+x86_64-only. dyld picks the *first* match rather than the first *loadable* one,
+so a stale system copy that comes earlier in the path aborts the launch:
+
+```
+dyld[…]: Library not loaded: @rpath/Syphon.framework/Versions/A/Syphon
+  Reason: … (mach-o file, but is an incompatible architecture (have 'x86_64', need 'arm64'))
+```
+
+The bundled framework is searched ahead of `/Library/Frameworks`, so this only
+bites if that ordering is lost. Check what you have with:
 
 ```sh
-# Verify the framework is installed
-ls /Library/Frameworks/Syphon.framework
+# Should list arm64 (a bare `x86_64` is the stale case above)
+lipo -archs /Library/Frameworks/Syphon.framework/Versions/A/Syphon
 ```
+
+Fix it by replacing that copy with a [current
+release](https://github.com/Syphon/Syphon-Framework/releases), or removing it and
+letting the bundled one be found. To force a specific copy, point
+`SYPHON_FRAMEWORK_DIR` at the directory *containing* `Syphon.framework` and
+rebuild.
 
 ### Windows
 

@@ -3,7 +3,9 @@
 // its OUT_DIR — nothing here is needed to build. But `-rpath` link-args do NOT
 // propagate across crates, so every leaf binary (and every lib whose own test
 // binaries link Syphon) re-emits the runtime search paths: a locally available
-// framework for `cargo run`/`cargo test`, /Library/Frameworks for system-wide
+// framework for `cargo run`/`cargo test` (syphon-core hands us its OUT_DIR
+// copy via DEP_SYPHON_FRAMEWORK_DIR, which is why every one of these crates
+// takes a direct macOS dependency on it), /Library/Frameworks for system-wide
 // installs, and bundle-relative rpaths for packaged .apps (release packaging
 // copies Syphon.framework into <app>.app/Contents/Frameworks).
 fn main() {
@@ -35,6 +37,7 @@ fn main() {
 
         println!("cargo:rerun-if-changed=build.rs");
         println!("cargo:rerun-if-env-changed=SYPHON_FRAMEWORK_DIR");
+        println!("cargo:rerun-if-env-changed=DEP_SYPHON_FRAMEWORK_DIR");
     }
 }
 
@@ -50,7 +53,19 @@ fn local_syphon_framework() -> Option<std::path::PathBuf> {
         }
     }
 
-    // 2. syphon-rs checkout next to this repo
+    // 2. The universal framework syphon-core ships and reassembles in its
+    //    OUT_DIR. Exposed because it declares `links = "Syphon"`; only its
+    //    *direct* dependents get the var, hence the dependency in Cargo.toml.
+    //    Preferred over a system install, which may be an older or
+    //    x86_64-only copy from the standalone Syphon installer.
+    if let Ok(dir) = std::env::var("DEP_SYPHON_FRAMEWORK_DIR") {
+        let p = std::path::PathBuf::from(dir);
+        if p.join("Syphon.framework").exists() {
+            return Some(p);
+        }
+    }
+
+    // 3. syphon-rs checkout next to this repo
     //    (crate dirs are two levels below the repo root)
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let candidate = manifest.ancestors().nth(3)?.join("syphon-rs/syphon-lib");

@@ -24,7 +24,7 @@ The Input tab scans the LAN and shows available sources. Low latency, high resol
 
 Receive frames from any Syphon server on the same machine — VDMX, Resolume, Final Cut Pro, another rustjay-engine app.
 
-Requires Syphon.framework in `/Library/Frameworks/`. No feature flag (always compiled on macOS).
+No feature flag (always compiled on macOS) and no separate install — the framework ships with the `syphon-core` crate. See [Installation](installation.md) if a stale system-wide copy gets in the way.
 
 Zero-copy GPU texture sharing — no CPU round-trip.
 

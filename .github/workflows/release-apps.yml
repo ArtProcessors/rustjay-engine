@@ -99,10 +99,11 @@ jobs:
         with:
           key: ${{ matrix.app }}
 
-      # The engine's macOS build scripts hunt for Syphon.framework (the
-      # published syphon-core crate ships it flattened, which the linker can't
-      # use). The syphon-rs repo commits the real framework — clone it and
-      # point SYPHON_FRAMEWORK_DIR at it; packaging bundles it from here too.
+      # Linking needs no help — syphon-core reassembles its bundled universal
+      # framework in OUT_DIR and the build scripts find it there. This clone is
+      # for *packaging*: the bundling step below copies a framework into the
+      # .app, and OUT_DIR is a build-cache path we'd have to go hunting for.
+      # SYPHON_FRAMEWORK_DIR also pins the build to this same copy.
       - name: Get Syphon.framework (macOS)
         if: runner.os == 'macOS'
         run: |

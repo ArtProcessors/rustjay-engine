@@ -22,3 +22,9 @@ uuid           = { workspace = true }
 # WGSL front-end only, for the shader-validation test (no GPU required).
 naga = { version = "29", features = ["wgsl-in"] }
 pollster = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Not used in code: a direct dependency is what makes syphon-core's
+# `links = "Syphon"` metadata (DEP_SYPHON_FRAMEWORK_DIR) visible to build.rs,
+# which needs it to emit the runtime rpath for the bundled Syphon.framework.
+syphon-core = { workspace = true }
