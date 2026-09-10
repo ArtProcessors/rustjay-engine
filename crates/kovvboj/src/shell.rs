@@ -1428,6 +1428,11 @@ impl KovvbojShell {
         ui.separator();
     }
 
+    /// The widest the block between the deck previews gets — the fader and
+    /// the transition row under it — in points.
+    #[cfg(feature = "mixer")]
+    const CROSSFADER_MAX: f32 = 480.0;
+
     /// The crossfader, flanked by what it is fading between.
     ///
     /// The fader position *is* the transition's progress, so there is one
@@ -1460,20 +1465,21 @@ impl KovvbojShell {
 
         let mut pick: Option<std::path::PathBuf> = None;
 
-        // Deck A's output pinned to the left edge, deck B's to the right, and
-        // the fader filling the span between. Equal previews at both edges put
-        // the fader's centre on the seam between the deck columns at any width;
-        // packed in from the left, it drifted off-centre, further the wider
-        // the window.
+        // Deck A's output, the fader, deck B's output: one unit, centred on the
+        // seam between the deck columns at any width. The fader stretches with
+        // the window up to `CROSSFADER_MAX` and stops there — past that a longer
+        // throw is only more mouse travel, and the previews drift away from the
+        // fader they flank.
         let full = ui.available_rect_before_wrap();
         let side = (full.width() * 0.22).clamp(80.0, 200.0);
         let gap = ui.spacing().item_spacing.x;
-        let a = egui::Rect::from_min_size(full.min, egui::vec2(side, full.height()));
-        let b = egui::Rect::from_min_max(egui::pos2(full.max.x - side, full.min.y), full.max);
-        let middle = egui::Rect::from_min_max(
-            egui::pos2(a.max.x + gap, full.min.y),
-            egui::pos2(b.min.x - gap, full.max.y),
-        );
+        let block = (full.width() - 2.0 * (side + gap)).min(Self::CROSSFADER_MAX);
+        let column = |x: f32, w: f32| {
+            egui::Rect::from_min_size(egui::pos2(x, full.min.y), egui::vec2(w, full.height()))
+        };
+        let a = column(full.center().x - block / 2.0 - gap - side, side);
+        let middle = column(a.max.x + gap, block);
+        let b = column(middle.max.x + gap, side);
         ui.scope_builder(egui::UiBuilder::new().max_rect(a), |ui| {
             Self::deck_preview(ui, engine, 0, side)
         });
@@ -1867,7 +1873,7 @@ mod crossfader_tests {
     use egui_kittest::kittest::Queryable as _;
 
     /// The fader sits on the seam between the two deck columns at any window
-    /// width, and stretches across the span between the previews. It used to
+    /// width, and stretches with the window up to `CROSSFADER_MAX`. It used to
     /// be packed in from the left, and the width it was handed through
     /// `add_sized` was ignored, so it stayed at the theme's 200pt and drifted
     /// off-centre as the window grew.
@@ -1896,10 +1902,9 @@ mod crossfader_tests {
                 strip.center().x
             );
             assert!(
-                fader.width() > strip.width() * 0.4,
-                "at {width}pt the fader is {}pt of a {}pt strip",
-                fader.width(),
-                strip.width()
+                fader.width() > 200.0 && fader.width() <= KovvbojShell::CROSSFADER_MAX,
+                "at {width}pt the fader is {}pt: past the old fixed 200, within the cap",
+                fader.width()
             );
         }
     }
