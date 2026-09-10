@@ -21,3 +21,9 @@ imgui          = { workspace = true }
 default = ["webcam"]
 ndi     = ["rustjay-engine/ndi"]
 webcam  = ["rustjay-engine/webcam"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Not used in code: a direct dependency is what makes syphon-core's
+# `links = "Syphon"` metadata (DEP_SYPHON_FRAMEWORK_DIR) visible to build.rs,
+# which needs it to emit the runtime rpath for the bundled Syphon.framework.
+syphon-core = { workspace = true }

@@ -1468,6 +1468,7 @@ dependencies = [
  "objc",
  "rustjay-engine",
  "serde",
+ "syphon-core",
  "wgpu",
 ]
 
@@ -1482,6 +1483,7 @@ dependencies = [
  "log",
  "rustjay-engine",
  "serde",
+ "syphon-core",
  "wgpu",
 ]
 
@@ -2096,6 +2098,7 @@ dependencies = [
  "rustjay-engine",
  "rustjay-io",
  "serde",
+ "syphon-core",
  "wgpu",
 ]
 
@@ -3074,6 +3077,7 @@ dependencies = [
  "rfd",
  "rustjay-engine",
  "rustjay-isf",
+ "syphon-core",
 ]
 
 [[package]]
@@ -3340,6 +3344,7 @@ dependencies = [
  "rustjay-render",
  "serde",
  "serde_json",
+ "syphon-core",
  "sysinfo",
  "uuid",
  "wgpu",
@@ -3735,6 +3740,7 @@ dependencies = [
  "rustjay-mixer",
  "rustjay-render",
  "serde",
+ "syphon-core",
  "wgpu",
 ]
 
@@ -5513,6 +5519,7 @@ dependencies = [
  "rustjay-sync",
  "serde",
  "serde_json",
+ "syphon-core",
  "tokio",
  "wayland-sys",
  "wgpu",
@@ -5542,6 +5549,7 @@ dependencies = [
  "rustjay-presets",
  "serde",
  "serde_json",
+ "syphon-core",
  "wgpu",
  "winit",
 ]
@@ -5646,6 +5654,7 @@ dependencies = [
  "rustjay-render",
  "serde",
  "serde_json",
+ "syphon-core",
  "uuid",
  "wgpu",
 ]
@@ -5938,6 +5947,7 @@ dependencies = [
  "rustjay-render",
  "serde",
  "serde_json",
+ "syphon-core",
  "wgpu",
 ]
 
@@ -6172,6 +6182,7 @@ dependencies = [
  "objc",
  "rustjay-engine",
  "serde",
+ "syphon-core",
  "wgpu",
 ]
 
@@ -6330,6 +6341,7 @@ dependencies = [
  "objc",
  "rustjay-engine",
  "serde",
+ "syphon-core",
 ]
 
 [[package]]
@@ -6995,6 +7007,7 @@ dependencies = [
  "rustjay-projection",
  "serde",
  "serde_json",
+ "syphon-core",
  "wgpu",
  "winit",
 ]
@@ -7016,6 +7029,7 @@ dependencies = [
  "rustjay-mixer",
  "serde",
  "serde_json",
+ "syphon-core",
  "wgpu",
 ]
 
@@ -7033,6 +7047,7 @@ dependencies = [
  "rustjay-engine",
  "serde",
  "serde_json",
+ "syphon-core",
  "wgpu",
 ]
 
