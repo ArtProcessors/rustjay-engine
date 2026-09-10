@@ -630,10 +630,9 @@ impl AnyEguiShell for KovvbojShell {
                             // blend picker and the mix buttons do not shrink —
                             // and half a window can be under it. Scrolling
                             // sideways keeps a narrow column's rows reachable
-                            // *and* keeps them inside their own column: without
-                            // it the first row over the width silently widened
-                            // the ones after it, which painted deck A's layers
-                            // across deck B.
+                            // *and* keeps them inside their own column. A
+                            // vertical-only area clips to its parent's edge, not
+                            // its own, so an overflowing row paints across deck B.
                             ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
                                 self.deck_heading(ui, "DECK A", app_state, 0);
                                 egui::ScrollArea::both()

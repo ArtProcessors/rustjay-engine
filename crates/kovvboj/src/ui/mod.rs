@@ -2113,32 +2113,11 @@ mod egui_impl {
             let n = mixer.group_members(&uuid).len();
             let name = mixer.groups[gi].name.clone();
             // A deck column is half a window wide, and groups live inside decks
-            // now, so this row has to fit one. Laid out right-to-left it
-            // anchored to an edge the column does not have and spilled over its
-            // neighbour; bounded left-to-right, the name is what gives way.
-            const CONTROLS: f32 = 210.0;
-            let name_w = (ui.available_width() - CONTROLS).clamp(48.0, 260.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(name_w, ui.spacing().interact_size.y),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    if ui
-                        .selectable_label(
-                            selected,
-                            egui::RichText::new(format!("⛶ {name}")).strong().monospace(),
-                        )
-                        .on_hover_text(format!(
-                            "{n} layers composited together — select it, then add an effect from the library"
-                        ))
-                        .clicked()
-                    {
-                        acts.select = Some(uuid.clone());
-                    }
-                },
-            );
-
-            {
-                let ui = &mut *ui;
+            // now, so this row has to fit one. Its controls run right-to-left,
+            // as a layer row's do: anchored to the column's edge they can only
+            // crowd the name, never widen the row. The name goes in last, into
+            // exactly the gap they leave, and truncates to fit it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("✖")
                     .on_hover_text("Ungroup — the layers stay")
@@ -2162,12 +2141,17 @@ mod egui_impl {
                 let mut op = engine
                     .get_param_base(&key)
                     .unwrap_or(mixer.groups[gi].opacity);
-                let slider_w = (ui.available_width() - 56.0).clamp(40.0, 80.0);
+                // `slider_width`, not `add_sized`: a Slider always allocates the
+                // theme's 200pt and ignores the size it is handed. That pushed
+                // this row past a half-width column, egui widens a Ui to fit
+                // whatever overflows it, and every row after grew to match —
+                // which is what painted deck A's layers across deck B. M, S and
+                // a readable name still go to its left, so it only grows into
+                // what is spare after them.
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - 56.0 - 96.0).clamp(40.0, 80.0);
                 if ui
-                    .add_sized(
-                        [slider_w, 18.0],
-                        egui::Slider::new(&mut op, 0.0..=1.0).show_value(false),
-                    )
+                    .add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(false))
                     .on_hover_text("Group opacity")
                     .changed()
                 {
@@ -2184,7 +2168,24 @@ mod egui_impl {
                     solo = !solo;
                     mixer.groups[gi].solo = solo;
                 }
-            }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::selectable(
+                                selected,
+                                egui::RichText::new(format!("⛶ {name}")).strong().monospace(),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(format!(
+                            "{n} layers composited together — select it, then add an effect from the library"
+                        ))
+                        .clicked()
+                    {
+                        acts.select = Some(uuid.clone());
+                    }
+                });
+            });
         });
 
         // The group's own chain: what every member passes through together.
@@ -2373,12 +2374,20 @@ mod egui_impl {
                     );
 
                     ui.push_id(uuid, |ui| {
-                        let indent = if nested { 22.0 } else { 0.0 };
+                        // Enough to read as nesting, small enough that a half
+                        // window still fits the row's controls. A margin, not
+                        // `add_space`: the drop zone lays out top-down, so that
+                        // was a gap above the row rather than an indent.
+                        let indent: i8 = if nested { 12 } else { 0 };
                         let row_top = ui.cursor().top();
                         let (_, dropped) =
                             ui.dnd_drop_zone::<LayerDrag, _>(egui::Frame::NONE, |ui| {
-                                ui.add_space(indent);
-                                ui.group(|ui| {
+                                egui::Frame::group(ui.style())
+                                    .outer_margin(egui::Margin {
+                                        left: indent,
+                                        ..egui::Margin::ZERO
+                                    })
+                                    .show(ui, |ui| {
                                     // ── Row 1: restack, identity, mix ────────────────
                                     ui.horizontal(|ui| {
                                         // Dragging the handle carries the layer's uuid;
@@ -8194,6 +8203,65 @@ mod egui_impl {
             assert!(
                 clicked.load(Ordering::SeqCst),
                 "a chip must report clicks, or the inspector is unreachable"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod group_header_tests {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        /// A group's row has to fit its deck column. Its opacity slider went in
+        /// through `add_sized`, which a Slider ignores, so it took the theme's
+        /// 200pt and the row ran past half a window. egui widens a Ui to fit
+        /// whatever overflows it, so every layer row after the group grew to
+        /// match, and deck A's layers painted across deck B.
+        #[test]
+        fn group_header_fits_a_deck_column() {
+            // Half the centre of the window it was reported in.
+            const COLUMN: f32 = 318.0;
+            let mut mixer = rustjay_mixer::Mixer::new();
+            for id in ["a", "b"] {
+                mixer
+                    .add_channel(rustjay_mixer::Channel::new(
+                        id,
+                        id,
+                        Box::new(crate::sources::testing::StubSource),
+                    ))
+                    .unwrap();
+            }
+            let gid = mixer
+                .group_channels(
+                    "g",
+                    "a group named at far more length than a column holds",
+                    &["a".to_string(), "b".to_string()],
+                )
+                .expect("two layers make a group");
+            let gi = mixer.groups.iter().position(|g| g.uuid == gid).unwrap();
+            let mut engine = EngineState::new();
+
+            let seen = Arc::new(Mutex::new((egui::Rect::NOTHING, egui::Rect::NOTHING)));
+            let out = seen.clone();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size([COLUMN * 2.0, 200.0])
+                .build_ui(move |ui| {
+                    let mut column = ui.available_rect_before_wrap();
+                    column.set_width(COLUMN);
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(column), |ui| {
+                        let mut acts = GroupActions::default();
+                        group_header(ui, &mut mixer, gi, &mut engine, false, &mut acts);
+                        *out.lock().unwrap() = (column, ui.min_rect());
+                    });
+                });
+            // The app's spacing, not egui's: the 200pt slider is the theme's.
+            rustjay_gui::egui_theme::apply_professional_theme(&harness.ctx);
+            harness.run();
+
+            let (column, used) = *seen.lock().unwrap();
+            assert!(
+                used.left() >= column.left() - 0.5 && used.right() <= column.right() + 0.5,
+                "the group row spans {used:?}, outside its column {column:?}"
             );
         }
     }
