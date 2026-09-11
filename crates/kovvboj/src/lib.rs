@@ -106,7 +106,22 @@ fn set_transition(
                 .set_param_prefix(rustjay_mixer::TRANSITION_PREFIX);
             mixer.transition = Some(slot);
         }
-        Err(e) => log::warn!("[Decks] transition {} failed to load: {e}", path.display()),
+        Err(e) => {
+            log::warn!("[Decks] transition {} failed to load: {e}", path.display());
+            engine.notify(
+                format!("Transition {} could not be loaded.", transition_name(path)),
+                rustjay_core::NotificationLevel::Warning,
+                std::time::Duration::from_secs(8),
+            );
+            // With no transition at all the fader goes dead and the decks
+            // stack, so a scene naming one that is not here — added on another
+            // machine, or since deleted — falls back to the dissolve. A bad pick
+            // from the picker keeps whatever was already running.
+            let default = shaders_dir().join(DEFAULT_TRANSITION);
+            if mixer.transition.is_none() && path != default {
+                set_transition(mixer, &default, device, queue, engine);
+            }
+        }
     }
 }
 
