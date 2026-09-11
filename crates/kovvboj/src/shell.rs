@@ -65,6 +65,9 @@ pub struct KovvbojShell {
     /// when a set has no decks.
     deck_a: DeckTab,
     deck_b: DeckTab,
+    /// What each deck is about to be saved as, while it is being typed.
+    /// Cleared on save, and not persisted — a name in flight is not state.
+    deck_name: [String; 2],
     master: MixerTab,
     stage: StageTab,
     #[cfg(feature = "webcam")]
@@ -181,6 +184,7 @@ impl KovvbojShell {
             decks: DeckTab::default(),
             deck_a: DeckTab::for_deck(0),
             deck_b: DeckTab::for_deck(1),
+            deck_name: [String::new(), String::new()],
             master: MixerTab::default(),
             stage: StageTab::new(),
             #[cfg(feature = "webcam")]
@@ -363,6 +367,20 @@ impl AnyEguiShell for KovvbojShell {
         #[cfg(feature = "mixer")]
         if let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>() {
             state.thumbs.sync(host);
+            // A deck is a group, so its preview is that group's thumbnail. The
+            // ids go where every other live preview publishes one, so the
+            // crossfader strip reads them the same way the Stage canvas reads
+            // the master output.
+            let ids = [crate::DECK_A, crate::DECK_B].map(|uuid| {
+                state.thumbs.ids.get(uuid).map(|id| match id {
+                    egui::TextureId::Managed(n) | egui::TextureId::User(n) => *n,
+                })
+            });
+            if let Ok(mut eng) = host.engine().lock()
+                && eng.deck_preview_texture_ids != ids
+            {
+                eng.deck_preview_texture_ids = ids;
+            }
         }
 
         // ⌘Z / ⇧⌘Z. Structural edits only — see `KovvbojAppState::push_undo_from`.
@@ -382,6 +400,27 @@ impl AnyEguiShell for KovvbojShell {
                 state.redo();
             } else {
                 state.undo();
+            }
+        }
+
+        // ⌘T — TAKE. A modifier combo, so it cannot fire while a name is being
+        // typed into a text field.
+        #[cfg(feature = "mixer")]
+        {
+            let take_pressed = ui
+                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T));
+            if take_pressed {
+                let secs = host
+                    .engine()
+                    .lock()
+                    .ok()
+                    .and_then(|e| e.get_param_base(crate::TAKE_SECONDS))
+                    .unwrap_or(1.0);
+                if let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>()
+                    && let Ok(mut m) = state.mixer.lock()
+                {
+                    crate::take(&mut m, secs);
+                }
             }
         }
 
@@ -573,7 +612,7 @@ impl AnyEguiShell for KovvbojShell {
                                 .min_size(84.0)
                                 .resizable(false)
                                 .show(ui, |ui| {
-                                    self.crossfader_strip(ui, app_state, &engine);
+                                    Self::crossfader_strip(ui, app_state, &engine);
                                 });
                         }
 
@@ -587,15 +626,22 @@ impl AnyEguiShell for KovvbojShell {
                             let mut right = full;
                             right.min.x = mid + 4.0;
 
+                            // Both axes: a layer row has a minimum width — the
+                            // blend picker and the mix buttons do not shrink —
+                            // and half a window can be under it. Scrolling
+                            // sideways keeps a narrow column's rows reachable
+                            // *and* keeps them inside their own column. A
+                            // vertical-only area clips to its parent's edge, not
+                            // its own, so an overflowing row paints across deck B.
                             ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
-                                Self::deck_heading(ui, "DECK A");
-                                egui::ScrollArea::vertical()
+                                self.deck_heading(ui, "DECK A", app_state, 0);
+                                egui::ScrollArea::both()
                                     .id_salt("deck_a_scroll")
                                     .show(ui, |ui| tab(&mut self.deck_a, ui, app_state, &engine));
                             });
                             ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
-                                Self::deck_heading(ui, "DECK B");
-                                egui::ScrollArea::vertical()
+                                self.deck_heading(ui, "DECK B", app_state, 1);
+                                egui::ScrollArea::both()
                                     .id_salt("deck_b_scroll")
                                     .show(ui, |ui| tab(&mut self.deck_b, ui, app_state, &engine))
                             })
@@ -1322,8 +1368,22 @@ impl KovvbojShell {
         }
     }
 
-    /// A deck column's heading.
-    fn deck_heading(ui: &mut egui::Ui, label: &str) {
+    /// A deck column's heading, with the one verb a deck has of its own.
+    ///
+    /// A deck draws no group row — the column *is* the header — so saving lives
+    /// here instead, where a group's 💾 would be. Named on the way out, the way
+    /// the master chain is: a deck's own name is always "Deck A", so saving
+    /// under it wrote the same file every time and replaced the last look
+    /// silently. Typing a name and saving is one gesture, and a name already
+    /// taken says "replaces" *before* the click, not after.
+    #[cfg_attr(not(feature = "mixer"), allow(unused_variables))]
+    fn deck_heading(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        app_state: &mut dyn std::any::Any,
+        deck: usize,
+    ) {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(label)
@@ -1331,9 +1391,47 @@ impl KovvbojShell {
                     .monospace()
                     .color(rustjay_gui::egui_theme::colors::ink_4()),
             );
+            #[cfg(feature = "mixer")]
+            {
+                let typed = &mut self.deck_name[deck.min(1)];
+                let entry = ui.add(
+                    egui::TextEdit::singleline(typed)
+                        .hint_text("deck name")
+                        .desired_width(110.0),
+                );
+                let name = typed.trim().to_string();
+                let named = !name.is_empty();
+                // Enter saves, so naming and saving is one gesture.
+                let entered =
+                    entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && named;
+                let clicked = ui
+                    .add_enabled(named, egui::Button::new("💾").small())
+                    .on_hover_text("Save this deck to the library, layers and all")
+                    .on_disabled_hover_text("Give the deck a name first")
+                    .clicked();
+                if let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>() {
+                    if entered || clicked {
+                        let uuid = if deck == 1 { crate::DECK_B } else { crate::DECK_A };
+                        state.pending_group_save = Some((uuid.to_string(), name.clone()));
+                        self.deck_name[deck.min(1)].clear();
+                    } else if named && state.saved_groups.iter().any(|g| g.name == name) {
+                        // One name is one file, deck or group: say so first.
+                        ui.label(
+                            egui::RichText::new("replaces")
+                                .size(10.0)
+                                .color(rustjay_gui::egui_theme::colors::amber()),
+                        );
+                    }
+                }
+            }
         });
         ui.separator();
     }
+
+    /// The widest the block between the deck previews gets — the fader and
+    /// the transition row under it — in points.
+    #[cfg(feature = "mixer")]
+    const CROSSFADER_MAX: f32 = 480.0;
 
     /// The crossfader, flanked by what it is fading between.
     ///
@@ -1342,7 +1440,6 @@ impl KovvbojShell {
     /// same movement looks like.
     #[cfg(feature = "mixer")]
     fn crossfader_strip(
-        &mut self,
         ui: &mut egui::Ui,
         app_state: &mut dyn std::any::Any,
         engine: &Arc<Mutex<EngineState>>,
@@ -1350,6 +1447,9 @@ impl KovvbojShell {
         let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>() else {
             return;
         };
+        // The strip is on screen, so the deck thumbnails are being drawn: say so,
+        // or they go idle and freeze the moment the layer list is closed.
+        state.thumbs.mark_wanted();
 
         // Which transitions are on offer, and which is loaded.
         let current = state
@@ -1358,82 +1458,254 @@ impl KovvbojShell {
             .ok()
             .and_then(|m| m.transition.as_ref().and_then(|s| s.source_path.clone()));
         let current_name = current
-            .as_ref()
-            .and_then(|p| p.file_stem().and_then(|s| s.to_str()))
-            .map(|s| s.trim_start_matches("transition_").to_string())
+            .as_deref()
+            .map(crate::transition_name)
             .unwrap_or_else(|| "none".to_string());
 
         let mut pick: Option<std::path::PathBuf> = None;
+        let mut edit_transition = false;
+        let mut add_transition = false;
 
-        ui.horizontal(|ui| {
-            let side = (ui.available_width() * 0.22).clamp(80.0, 200.0);
-
-            // Deck A's output, then the fader, then deck B's.
-            Self::deck_preview(ui, engine, 0, side);
-
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("A").strong().monospace());
-                    let width = (ui.available_width() - 90.0).max(120.0);
+        // Deck A's output, the fader, deck B's output: one unit, centred on the
+        // seam between the deck columns at any width. The fader stretches with
+        // the window up to `CROSSFADER_MAX` and stops there — past that a longer
+        // throw is only more mouse travel, and the previews drift away from the
+        // fader they flank.
+        let full = ui.available_rect_before_wrap();
+        let side = (full.width() * 0.22).clamp(80.0, 200.0);
+        let gap = ui.spacing().item_spacing.x;
+        let block = (full.width() - 2.0 * (side + gap)).min(Self::CROSSFADER_MAX);
+        let column = |x: f32, w: f32| {
+            egui::Rect::from_min_size(egui::pos2(x, full.min.y), egui::vec2(w, full.height()))
+        };
+        let a = column(full.center().x - block / 2.0 - gap - side, side);
+        let middle = column(a.max.x + gap, block);
+        let b = column(middle.max.x + gap, side);
+        let clicked = [
+            ui.scope_builder(egui::UiBuilder::new().max_rect(a), |ui| {
+                Self::deck_preview(ui, engine, 0, side)
+            })
+            .inner
+            .clicked(),
+            ui.scope_builder(egui::UiBuilder::new().max_rect(b), |ui| {
+                Self::deck_preview(ui, engine, 1, side)
+            })
+            .inner
+            .clicked(),
+        ];
+        ui.scope_builder(egui::UiBuilder::new().max_rect(middle), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("A").strong().monospace());
+                // B goes in first, right-to-left, so the fader takes exactly
+                // the span between the two letters.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("B").strong().monospace());
+                    // `slider_width`, not `add_sized`: a Slider ignores the
+                    // size it is handed, so this sat at the theme's 200pt.
+                    ui.spacing_mut().slider_width = ui.available_width().max(40.0);
                     let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
                     let mut x = eng.get_param_base("crossfader").unwrap_or(0.0);
                     if ui
-                        .add_sized(
-                            [width, 20.0],
-                            egui::Slider::new(&mut x, 0.0..=1.0).show_value(false),
+                        .add(egui::Slider::new(&mut x, 0.0..=1.0).show_value(false))
+                        .on_hover_text(
+                            "Crossfade between the decks — this is the transition's progress",
                         )
-                        .on_hover_text("Crossfade between the decks — this is the transition's progress")
                         .changed()
                     {
                         eng.set_param_base("crossfader", x);
                     }
-                    drop(eng);
-                    ui.label(egui::RichText::new("B").strong().monospace());
-                });
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("transition")
-                            .size(10.0)
-                            .color(rustjay_gui::egui_theme::colors::ink_4()),
-                    );
-                    egui::ComboBox::from_id_salt("transition_pick")
-                        .selected_text(current_name)
-                        .width(140.0)
-                        .show_ui(ui, |ui| {
-                            for path in crate::transition_shaders() {
-                                let name = path
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("?")
-                                    .trim_start_matches("transition_")
-                                    .to_string();
-                                if ui
-                                    .selectable_label(current.as_deref() == Some(&*path), name)
-                                    .clicked()
-                                {
-                                    pick = Some(path.clone());
-                                }
-                            }
-                        });
                 });
             });
+            ui.horizontal(|ui| {
+                // The label opens the transition's own settings in the
+                // inspector: softness, seed, direction, whatever it declares.
+                // A clickable label rather than a button, whose padding pushed
+                // the picker under the TAKE length at a 1200pt window.
+                let editing = state.selection == crate::Selection::Transition;
+                let ink = if editing {
+                    rustjay_gui::egui_theme::colors::amber()
+                } else {
+                    rustjay_gui::egui_theme::colors::ink_4()
+                };
+                if ui
+                    .add(
+                        egui::Label::new(egui::RichText::new("transition").size(10.0).color(ink))
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Edit the transition's settings")
+                    .clicked()
+                {
+                    edit_transition = true;
+                }
+                egui::ComboBox::from_id_salt("transition_pick")
+                    .selected_text(current_name)
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        // First, not last: a library full of transitions puts
+                        // the end of this list a long scroll away.
+                        if ui
+                            .button("Add transition\u{2026}")
+                            .on_hover_text(
+                                "Any ISF transition: two image inputs and a float named progress",
+                            )
+                            .clicked()
+                        {
+                            add_transition = true;
+                        }
+                        ui.separator();
+                        for path in state.transitions() {
+                            if ui
+                                .selectable_label(
+                                    current.as_deref() == Some(path.as_path()),
+                                    crate::transition_name(path),
+                                )
+                                .clicked()
+                            {
+                                pick = Some(path.clone());
+                            }
+                        }
+                    });
 
-            Self::deck_preview(ui, engine, 1, side);
+                // Right-to-left, so TAKE sits under B.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // TAKE: an action, not a value. It arms the auto-crossfade,
+                    // which writes the fader's *base* as it runs, so anything
+                    // modulating the crossfader still applies once and not
+                    // twice. The length is a parameter, so it is mappable.
+                    let mut secs = engine
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_param_base(crate::TAKE_SECONDS)
+                        .unwrap_or(1.0);
+                    if ui
+                        .button(egui::RichText::new("TAKE").strong().monospace())
+                        .on_hover_text("Crossfade to the other deck (⌘T)")
+                        .clicked()
+                        && let Ok(mut m) = state.mixer.lock()
+                    {
+                        crate::take(&mut m, secs);
+                    }
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut secs)
+                                .speed(0.05)
+                                .range(0.05..=10.0)
+                                .suffix("s"),
+                        )
+                        .on_hover_text("How long a TAKE runs")
+                        .changed()
+                    {
+                        engine
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .set_param_base(crate::TAKE_SECONDS, secs);
+                    }
+                });
+            });
         });
 
         if let Some(path) = pick {
             state.pending_transition = Some(path);
         }
+        if edit_transition {
+            state.selection = crate::Selection::Transition;
+        }
+        if add_transition {
+            Self::add_transition(state, engine);
+        }
+
+        // A click on a deck's preview pops that deck out into its own window.
+        #[cfg(feature = "projection")]
+        for deck in (0..2).filter(|&d| clicked[d]) {
+            Self::pop_out_deck(state, deck);
+        }
+        #[cfg(not(feature = "projection"))]
+        let _ = clicked;
     }
 
-    /// One deck's live output, aspect-fit into `width`.
+    /// Pick a shader file and add it to the transitions: checked for the ISF
+    /// transition shape, copied into the shader library — so it is there on
+    /// the next launch — and loaded straight away.
+    #[cfg(feature = "mixer")]
+    fn add_transition(state: &mut crate::KovvbojAppState, engine: &Arc<Mutex<EngineState>>) {
+        let Some(picked) = rfd::FileDialog::new()
+            .set_title("Add a transition")
+            .add_filter("ISF shader", &["fs"])
+            .pick_file()
+        else {
+            return;
+        };
+        let notify = |message: String, level: rustjay_core::NotificationLevel| {
+            engine.lock().unwrap_or_else(|e| e.into_inner()).notify(
+                message,
+                level,
+                std::time::Duration::from_secs(6),
+            );
+        };
+        let name = crate::transition_name(&picked);
+        if !std::fs::read_to_string(&picked).is_ok_and(|src| crate::is_transition(&src)) {
+            notify(
+                format!(
+                    "{name} is not a transition: it needs exactly two image inputs and a float named progress."
+                ),
+                rustjay_core::NotificationLevel::Warning,
+            );
+            return;
+        }
+        match crate::sources::registry::install_shader(&picked, &crate::shaders_dir()) {
+            Ok(installed) => {
+                state.pending_transition = Some(installed);
+                // Into the list now, not whenever the folder watcher next looks.
+                state.rescan_library();
+            }
+            Err(e) => notify(
+                format!("Could not add {name}: {e}"),
+                rustjay_core::NotificationLevel::Error,
+            ),
+        }
+    }
+
+    /// Open a deck's image in its own small OS window.
+    ///
+    /// The engine builds it as it builds a projector — surface, stage chain,
+    /// close button — but keeps it on its preview list, so it never takes a
+    /// projector's index. The deck is downsampled straight into the window:
+    /// low resolution by window size, not by an extra texture.
+    // ponytail: the image stretches if the window is resized off 16:9;
+    // letterbox in `DeckPopoutStage` if that ever matters.
+    #[cfg(all(feature = "projection", feature = "mixer"))]
+    fn pop_out_deck(state: &mut crate::KovvbojAppState, deck: usize) {
+        // An open window's stage holds the slot's only other handle, so a
+        // second click on an open deck opens nothing.
+        if Arc::strong_count(&state.deck_popouts[deck]) > 1 {
+            return;
+        }
+        let slot = state.deck_popouts[deck].clone();
+        let Some(handle) = state.projection_handle.as_ref() else {
+            return;
+        };
+        let mut guard = handle.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sub) = guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>() else {
+            return;
+        };
+        let attrs = winit::window::WindowAttributes::default()
+            .with_title(format!("KOVVBOJ — Deck {}", ["A", "B"][deck]))
+            .with_inner_size(winit::dpi::LogicalSize::new(480.0, 270.0));
+        sub.add_preview(attrs, move |device, format| {
+            vec![Box::new(crate::stage::DeckPopoutStage::new(device, format, slot))]
+        });
+    }
+
+    /// One deck's live output, aspect-fit into `width`. Clicking it pops the
+    /// deck out into its own window.
     #[cfg(feature = "mixer")]
     fn deck_preview(
         ui: &mut egui::Ui,
         engine: &Arc<Mutex<EngineState>>,
         deck: usize,
         width: f32,
-    ) {
+    ) -> egui::Response {
         let (id, w, h) = {
             let state = engine.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -1448,17 +1720,17 @@ impl KovvbojShell {
             16.0 / 9.0
         };
         let size = egui::vec2(width, width / aspect);
-        match id {
-            Some(raw) => {
-                ui.add(
-                    egui::Image::new((egui::TextureId::User(raw), size)).fit_to_exact_size(size),
-                );
-            }
+        let resp = match id {
+            Some(raw) => ui.add(
+                egui::Image::new((egui::TextureId::User(raw), size))
+                    .fit_to_exact_size(size)
+                    .sense(egui::Sense::click()),
+            ),
             // Nothing published yet: hold the space so the fader does not jump
             // sideways on the frame the previews arrive. Dark and outlined —
             // a light slab reads as a blown-out image rather than an empty one.
             None => {
-                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
                 let painter = ui.painter();
                 painter.rect_filled(rect, 2.0, ui.style().visuals.extreme_bg_color);
                 painter.rect_stroke(
@@ -1467,7 +1739,14 @@ impl KovvbojShell {
                     egui::Stroke::new(1.0, rustjay_gui::egui_theme::colors::ink_2()),
                     egui::StrokeKind::Inside,
                 );
+                resp
             }
+        };
+        if cfg!(feature = "projection") {
+            resp.on_hover_text("Open in its own window")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+        } else {
+            resp
         }
     }
 
@@ -1713,4 +1992,47 @@ fn import_dialog(
         *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
         ctx.request_repaint();
     });
+}
+
+#[cfg(all(test, feature = "mixer"))]
+mod crossfader_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable as _;
+
+    /// The fader sits on the seam between the two deck columns at any window
+    /// width, and stretches with the window up to `CROSSFADER_MAX`. It used to
+    /// be packed in from the left, and the width it was handed through
+    /// `add_sized` was ignored, so it stayed at the theme's 200pt and drifted
+    /// off-centre as the window grew.
+    #[test]
+    fn crossfader_is_centred_on_the_decks_and_stretches() {
+        for width in [700.0_f32, 1600.0] {
+            let engine = Arc::new(Mutex::new(EngineState::new()));
+            let mut app = crate::KovvbojAppState::default();
+            let strip = Arc::new(Mutex::new(egui::Rect::NOTHING));
+            let seen = strip.clone();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size([width, 160.0])
+                .build_ui(move |ui| {
+                    *seen.lock().unwrap() = ui.available_rect_before_wrap();
+                    KovvbojShell::crossfader_strip(ui, &mut app, &engine);
+                });
+            rustjay_gui::egui_theme::apply_professional_theme(&harness.ctx);
+            harness.run();
+
+            let strip = *strip.lock().unwrap();
+            let fader = harness.get_by_role(egui::accesskit::Role::Slider).rect();
+            assert!(
+                (fader.center().x - strip.center().x).abs() < 1.0,
+                "at {width}pt the fader centres on {} but the decks meet at {}",
+                fader.center().x,
+                strip.center().x
+            );
+            assert!(
+                fader.width() > 200.0 && fader.width() <= KovvbojShell::CROSSFADER_MAX,
+                "at {width}pt the fader is {}pt: past the old fixed 200, within the cap",
+                fader.width()
+            );
+        }
+    }
 }

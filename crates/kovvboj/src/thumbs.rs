@@ -1,7 +1,9 @@
-//! Per-layer thumbnails.
+//! Per-layer (and per-group) thumbnails.
 //!
 //! Each layer owns a small render target that its output is blitted into once
-//! per frame, and egui draws that. The alternative — the engine's own preview
+//! per frame, and egui draws that. Groups get one on the same terms, which is
+//! where the two deck previews beside the crossfader come from — a deck is a
+//! group, so its preview is a group's preview. The alternative — the engine's own preview
 //! path — registers a full-resolution texture and copies into it, which is
 //! affordable for two or three previews and not for one per layer.
 //!
@@ -38,6 +40,10 @@ const REFRESH_EVERY: u64 = 3;
 const IDLE_GRACE_FRAMES: u64 = 30;
 
 pub const ASPECT: f32 = THUMB_W as f32 / THUMB_H as f32;
+
+/// What a deck's pop-out window samples: the texture holding that deck's
+/// image this frame, handed over by the render hook while a window is open.
+pub type DeckSlot = std::sync::Arc<std::sync::Mutex<Option<wgpu::TextureView>>>;
 
 struct Entry {
     #[allow(dead_code)] // Keeps the texture alive for the registered view.
@@ -94,11 +100,23 @@ impl Thumbnails {
             .pipeline
             .get_or_insert_with(|| BlitPipeline::new(device, wgpu::TextureFormat::Bgra8Unorm));
 
-        for channel in &mixer.channels {
-            let Some(source) = channel.output_texture() else {
-                continue;
-            };
-            if !self.entries.contains_key(&channel.uuid) {
+        // Layers by uuid, then groups by uuid. A group's finished image is what
+        // the deck previews draw; uuids are unique across both, so one map holds
+        // them.
+        let sources: Vec<(&String, &rustjay_render::Texture)> = mixer
+            .channels
+            .iter()
+            .filter_map(|c| c.output_texture().map(|t| (&c.uuid, t)))
+            .chain(
+                mixer
+                    .groups
+                    .iter()
+                    .filter_map(|g| g.output().map(|t| (&g.uuid, t))),
+            )
+            .collect();
+
+        for (uuid, source) in sources {
+            if !self.entries.contains_key(uuid) {
                 self.next_key += 1;
                 let key = self.next_key;
                 let entry = {
@@ -125,17 +143,20 @@ impl Thumbnails {
                         registered: false,
                     }
                 };
-                self.entries.insert(channel.uuid.clone(), entry);
+                self.entries.insert(uuid.clone(), entry);
             }
-            let entry = &self.entries[&channel.uuid];
+            let entry = &self.entries[uuid];
             // A blit samples, so this downscales; a plain texture copy would
             // take the top-left 160x90 corner instead.
             pipeline.blit(device, encoder, &source.view, &entry.view, vertex_buffer);
         }
 
-        // Deleted layers must not keep a texture (or a registered id) alive.
-        self.entries
-            .retain(|uuid, _| mixer.channels.iter().any(|c| &c.uuid == uuid));
+        // Deleted layers and groups must not keep a texture (or a registered
+        // id) alive.
+        self.entries.retain(|uuid, _| {
+            mixer.channels.iter().any(|c| &c.uuid == uuid)
+                || mixer.groups.iter().any(|g| &g.uuid == uuid)
+        });
     }
 
     /// Register anything new and refresh [`Self::ids`]. Only the shell is

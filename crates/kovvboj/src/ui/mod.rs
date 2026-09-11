@@ -1789,6 +1789,15 @@ mod egui_impl {
                     heading = format!("{name} · FX");
                     prefix = Some(format!("grp_{group}_fx{fx}_"));
                 }
+                crate::Selection::Transition => {
+                    heading = mixer
+                        .transition
+                        .as_ref()
+                        .and_then(|s| s.source_path.as_deref())
+                        .map(|p| format!("Transition · {}", crate::transition_name(p)))
+                        .unwrap_or_else(|| "Transition".to_string());
+                    prefix = Some(rustjay_mixer::TRANSITION_PREFIX.to_string());
+                }
             }
             let _ = &mut mixer;
         }
@@ -2033,6 +2042,11 @@ mod egui_impl {
             let mut any = pacing_block(ui, engine, &prefix, &heading);
             let descriptors = engine.param_descriptors.clone();
             for desc in descriptors.iter().filter(|d| d.id.starts_with(&prefix)) {
+                // The fader drives the transition's progress; a second control
+                // for it would only fight the first.
+                if desc.id == rustjay_mixer::TRANSITION_PROGRESS {
+                    continue;
+                }
                 if desc
                     .id
                     .strip_prefix(prefix.as_str())
@@ -2112,19 +2126,11 @@ mod egui_impl {
             }
             let n = mixer.group_members(&uuid).len();
             let name = mixer.groups[gi].name.clone();
-            if ui
-                .selectable_label(
-                    selected,
-                    egui::RichText::new(format!("⛶ {name}")).strong().monospace(),
-                )
-                .on_hover_text(format!(
-                    "{n} layers composited together — select it, then add an effect from the library"
-                ))
-                .clicked()
-            {
-                acts.select = Some(uuid.clone());
-            }
-
+            // A deck column is half a window wide, and groups live inside decks
+            // now, so this row has to fit one. Its controls run right-to-left,
+            // as a layer row's do: anchored to the column's edge they can only
+            // crowd the name, never widen the row. The name goes in last, into
+            // exactly the gap they leave, and truncates to fit it.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("✖")
@@ -2149,8 +2155,17 @@ mod egui_impl {
                 let mut op = engine
                     .get_param_base(&key)
                     .unwrap_or(mixer.groups[gi].opacity);
+                // `slider_width`, not `add_sized`: a Slider always allocates the
+                // theme's 200pt and ignores the size it is handed. That pushed
+                // this row past a half-width column, egui widens a Ui to fit
+                // whatever overflows it, and every row after grew to match —
+                // which is what painted deck A's layers across deck B. M, S and
+                // a readable name still go to its left, so it only grows into
+                // what is spare after them.
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - 56.0 - 96.0).clamp(40.0, 80.0);
                 if ui
-                    .add_sized([80.0, 18.0], egui::Slider::new(&mut op, 0.0..=1.0).show_value(false))
+                    .add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(false))
                     .on_hover_text("Group opacity")
                     .changed()
                 {
@@ -2167,6 +2182,23 @@ mod egui_impl {
                     solo = !solo;
                     mixer.groups[gi].solo = solo;
                 }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::selectable(
+                                selected,
+                                egui::RichText::new(format!("⛶ {name}")).strong().monospace(),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(format!(
+                            "{n} layers composited together — select it, then add an effect from the library"
+                        ))
+                        .clicked()
+                    {
+                        acts.select = Some(uuid.clone());
+                    }
+                });
             });
         });
 
@@ -2246,25 +2278,50 @@ mod egui_impl {
                 let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
 
                 // Drawn top-first so the list reads the way it composites.
-                // A deck column shows only what composites into that deck, at
-                // any nesting depth; an ungrouped layer belongs to neither and
-                // shows in the full stack only.
-                let order: Vec<String> = mixer
+                // A deck column shows what composites into that deck, at any
+                // nesting depth.
+                //
+                // A layer on *no* deck still renders — it blends straight into
+                // the master, above the transition, ignoring the fader — so it
+                // has to be somewhere you can see it. Deck A's column takes
+                // them, under a heading that says what they are. Nothing else
+                // in the deck layout lists them, and a layer nothing lists is
+                // indistinguishable from a deleted one: that is exactly what
+                // "grouping deleted my layers" turned out to be.
+                let off_deck = |m: &rustjay_mixer::Mixer, i: usize| {
+                    m.decks.is_some() && m.deck_of_channel(i).is_none()
+                };
+                let order: Vec<(String, bool)> = mixer
                     .channels
                     .iter()
                     .enumerate()
                     .rev()
                     .filter(|(i, _)| match self.deck {
                         None => true,
-                        Some(d) => mixer.deck_of_channel(*i) == Some(d),
+                        Some(d) => {
+                            mixer.deck_of_channel(*i) == Some(d)
+                                || (d == 0 && off_deck(&mixer, *i))
+                        }
                     })
-                    .map(|(_, c)| c.uuid.clone())
+                    .map(|(i, c)| (c.uuid.clone(), off_deck(&mixer, i)))
                     .collect();
+                let mut said_off_deck = false;
 
-                for uuid in order.iter() {
+                for (uuid, is_off_deck) in order.iter() {
                     let Some(idx) = mixer.channels.iter().position(|c| c.uuid == *uuid) else {
                         continue;
                     };
+                    if *is_off_deck && !said_off_deck {
+                        said_off_deck = true;
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("NOT ON A DECK — ignores the crossfader")
+                                .monospace()
+                                .size(10.0)
+                                .color(rustjay_gui::egui_theme::colors::ink_3()),
+                        );
+                        ui.separator();
+                    }
 
                     // A group announces itself above its topmost member, then
                     // its members follow indented — unless it is collapsed, in
@@ -2300,6 +2357,14 @@ mod egui_impl {
                     // reads as one block rather than rows that happen to be
                     // adjacent.
                     let in_group_uuid = mixer.channels.get(idx).and_then(|c| c.group.clone());
+                    // The rail says "this sits inside a group". A deck is a
+                    // group, so once decks existed every layer had one and the
+                    // rail marked everything — which is the same as marking
+                    // nothing. The column heading already says which deck you
+                    // are looking at; the rail is for the groups within it.
+                    let nested = in_group_uuid
+                        .as_deref()
+                        .is_some_and(|g| g != crate::DECK_A && g != crate::DECK_B);
                     let _ = idx;
                     let Some(idx) = mixer.channels.iter().position(|c| c.uuid == *uuid) else {
                         continue;
@@ -2323,12 +2388,28 @@ mod egui_impl {
                     );
 
                     ui.push_id(uuid, |ui| {
-                        let indent = if in_group_uuid.is_some() { 22.0 } else { 0.0 };
+                        // A margin, not `add_space`: the drop zone lays out
+                        // top-down, so that was a gap above the row rather than
+                        // an indent. Only where there is room, though: in a
+                        // narrower column the row's controls already fill it, and
+                        // an indent pushes the solo button over the name. The
+                        // rail still marks the nesting there.
+                        // ponytail: fixed threshold, measured at 1200/1700pt
+                        // windows — derive it from the controls if they change.
+                        let indent: i8 = if nested && ui.available_width() > 340.0 {
+                            12
+                        } else {
+                            0
+                        };
                         let row_top = ui.cursor().top();
                         let (_, dropped) =
                             ui.dnd_drop_zone::<LayerDrag, _>(egui::Frame::NONE, |ui| {
-                                ui.add_space(indent);
-                                ui.group(|ui| {
+                                egui::Frame::group(ui.style())
+                                    .outer_margin(egui::Margin {
+                                        left: indent,
+                                        ..egui::Margin::ZERO
+                                    })
+                                    .show(ui, |ui| {
                                     // ── Row 1: restack, identity, mix ────────────────
                                     ui.horizontal(|ui| {
                                         // Dragging the handle carries the layer's uuid;
@@ -2345,42 +2426,6 @@ mod egui_impl {
                                         )
                                         .response
                                         .on_hover_text("Drag to restack");
-
-                                        // What the layer is actually putting out. Absent
-                                        // for the first frame of a new layer, and while a
-                                        // layer has no source at all.
-                                        let thumb_h = 22.0;
-                                        let thumb_size =
-                                            egui::vec2(thumb_h * crate::thumbs::ASPECT, thumb_h);
-                                        match thumb_ids.get(uuid) {
-                                            Some(id) => {
-                                                if ui
-                                                    .add(
-                                                        egui::Image::new((*id, thumb_size))
-                                                            .fit_to_exact_size(thumb_size)
-                                                            .corner_radius(2.0)
-                                                            .sense(egui::Sense::click()),
-                                                    )
-                                                    .on_hover_text("Layer output")
-                                                    .clicked()
-                                                {
-                                                    new_selection = Some(crate::Selection::Layer {
-                                                        layer: uuid.clone(),
-                                                    });
-                                                }
-                                            }
-                                            None => {
-                                                let (rect, _) = ui.allocate_exact_size(
-                                                    thumb_size,
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter().rect_filled(
-                                                    rect,
-                                                    2.0,
-                                                    rustjay_gui::egui_theme::colors::bg_widget(),
-                                                );
-                                            }
-                                        }
 
                                         let name = mixer.channels[idx].name.clone();
                                         // The control group on the right (✖, blend,
@@ -2399,6 +2444,25 @@ mod egui_impl {
                                             egui::vec2(name_w, ui.available_height()),
                                         );
                                         let multi = picked.contains(uuid);
+                                        // What the layer is putting out, in the same
+                                        // button as its name: one select target, so the
+                                        // thumbnail picks, cmd-picks and opens the menu
+                                        // exactly as the name does, and stays a target
+                                        // when a narrow column squeezes the name to "…".
+                                        // Absent for the first frame of a new layer and
+                                        // while a layer has no source; a dark slot holds
+                                        // its place.
+                                        let thumb_h = 22.0;
+                                        let thumb_size =
+                                            egui::vec2(thumb_h * crate::thumbs::ASPECT, thumb_h);
+                                        let slot = ui.id().with("thumb_slot");
+                                        let thumb: egui::Atom<'_> = match thumb_ids.get(uuid) {
+                                            Some(id) => egui::Image::new((*id, thumb_size))
+                                                .fit_to_exact_size(thumb_size)
+                                                .corner_radius(2.0)
+                                                .into(),
+                                            None => egui::Atom::custom(slot, thumb_size),
+                                        };
                                         let resp = ui
                                             .scope_builder(
                                                 egui::UiBuilder::new().max_rect(name_rect).layout(
@@ -2407,13 +2471,25 @@ mod egui_impl {
                                                     ),
                                                 ),
                                                 |ui| {
-                                                    ui.add(
-                                                        egui::Button::selectable(
-                                                            layer_selected || multi,
-                                                            &name,
-                                                        )
-                                                        .truncate(),
+                                                    // Tight padding: the thumbnail sets the
+                                                    // height, and a narrow column needs the
+                                                    // width.
+                                                    ui.spacing_mut().button_padding =
+                                                        egui::vec2(4.0, 1.0);
+                                                    let out = egui::Button::selectable(
+                                                        layer_selected || multi,
+                                                        (thumb, name.as_str()),
                                                     )
+                                                    .truncate()
+                                                    .atom_ui(ui);
+                                                    if let Some(r) = out.rect(slot) {
+                                                        ui.painter().rect_filled(
+                                                            r,
+                                                            2.0,
+                                                            rustjay_gui::egui_theme::colors::bg_widget(),
+                                                        );
+                                                    }
+                                                    out.response
                                                 },
                                             )
                                             .inner;
@@ -2437,7 +2513,12 @@ mod egui_impl {
                                                 });
                                             }
                                         }
-                                        let in_group = mixer.group_of(idx).is_some();
+                                        // A deck is a group too, but not one to leave
+                                        // or dissolve from here: "Ungroup" on a deck's
+                                        // own layer moved the whole deck onto no deck
+                                        // at all, and "Remove from group" took the
+                                        // layer off it. Only real groups offer them.
+                                        let in_group = nested;
                                         resp.context_menu(|ui| {
                                             let n = picked.len();
                                             if ui
@@ -2623,8 +2704,7 @@ mod egui_impl {
                                     }
                                 });
                             });
-                        if let Some(gid) = &in_group_uuid {
-                            let _ = gid;
+                        if nested {
                             let rect = ui.min_rect();
                             let x = rect.left() + 8.0;
                             ui.painter().line_segment(
@@ -2712,21 +2792,49 @@ mod egui_impl {
 
                 // Grouping, before the restack invalidates indices.
                 if want_group && picked.len() > 1 {
-                    undo_snapshot.get_or_insert_with(|| {
-                        crate::scene::Topology::from_mixer(&mixer, &state.layer_sources)
-                    });
-                    let uuid = crate::scene::new_uuid();
-                    let name = format!("Group {}", mixer.groups.len() + 1);
                     let members: Vec<String> = picked.iter().cloned().collect();
-                    // Gathers them together; a scattered pick is grouped rather
-                    // than refused, which is what every editor does.
-                    state.params_dirty_request = true;
-                    if mixer.group_channels(uuid, name, &members).is_none() {
+                    // A group belongs to one deck. `group_channels` puts it
+                    // inside whatever its members shared, so a pick spanning
+                    // both decks — or one that includes a layer on no deck —
+                    // would land it at top level, where in deck mode no column
+                    // lists it and the transition does not composite it.
+                    // Refused, rather than silently moving layers between decks
+                    // during a gesture that says nothing about decks.
+                    let decks_of: Vec<Option<usize>> = members
+                        .iter()
+                        .map(|u| {
+                            mixer
+                                .channels
+                                .iter()
+                                .position(|c| &c.uuid == u)
+                                .and_then(|i| mixer.deck_of_channel(i))
+                        })
+                        .collect();
+                    let one_deck = decks_of.first().is_some_and(|d| d.is_some())
+                        && decks_of.windows(2).all(|w| w[0] == w[1]);
+                    if mixer.decks.is_some() && !one_deck {
                         engine.notify(
-                            "Pick at least two layers to group".to_string(),
+                            "A group lives on one deck — pick layers from a single deck"
+                                .to_string(),
                             rustjay_core::NotificationLevel::Error,
                             std::time::Duration::from_secs(4),
                         );
+                    } else {
+                        undo_snapshot.get_or_insert_with(|| {
+                            crate::scene::Topology::from_mixer(&mixer, &state.layer_sources)
+                        });
+                        let uuid = crate::scene::new_uuid();
+                        let name = format!("Group {}", mixer.groups.len() + 1);
+                        // Gathers them together; a scattered pick is grouped
+                        // rather than refused, which is what every editor does.
+                        state.params_dirty_request = true;
+                        if mixer.group_channels(uuid, name, &members).is_none() {
+                            engine.notify(
+                                "Pick at least two layers to group".to_string(),
+                                rustjay_core::NotificationLevel::Error,
+                                std::time::Duration::from_secs(4),
+                            );
+                        }
                     }
                     clear_picks = true;
                 }
@@ -2734,7 +2842,22 @@ mod egui_impl {
                     undo_snapshot.get_or_insert_with(|| {
                         crate::scene::Topology::from_mixer(&mixer, &state.layer_sources)
                     });
-                    mixer.set_channel_group(&layer, None);
+                    // Out of the group, into whatever held the group — the deck,
+                    // usually. `None` would take it off the deck entirely, and
+                    // off a deck there is no column to see it in.
+                    let parent = mixer
+                        .channels
+                        .iter()
+                        .find(|c| c.uuid == layer)
+                        .and_then(|c| c.group.clone())
+                        .and_then(|gid| {
+                            mixer
+                                .groups
+                                .iter()
+                                .find(|g| g.uuid == gid)
+                                .and_then(|g| g.parent.clone())
+                        });
+                    mixer.set_channel_group(&layer, parent);
                     state.params_dirty_request = true;
                 }
                 if let Some(uuid) = ungroup_at
@@ -2919,9 +3042,10 @@ mod egui_impl {
                     > = None;
                     let mut queue_chain_delete: Option<String> = None;
                     #[cfg(feature = "mixer")]
-                    let mut queue_group_recall: Option<
+                    let mut queue_group_recall: Option<(
                         crate::scene::SavedGroup,
-                    > = None;
+                        Option<usize>,
+                    )> = None;
                     let mut queue_group_delete: Option<String> = None;
                     // One library row: label (optionally a drag source for FX
                     // strips) plus the "➕ new deck" button.
@@ -3308,14 +3432,27 @@ mod egui_impl {
                         ui.add_space(4.0);
                     }
 
-                    // Saved groups: whole arrangements of layers.
+                    // Saved decks and saved groups: the same file on disk, but
+                    // a whole deck is not a group of layers and does not read
+                    // like one, so the library lists them apart. Which is which
+                    // is `SavedGroup::is_deck` — the top-level uuid, derived.
                     #[cfg(feature = "mixer")]
-                    if !state.saved_groups.is_empty() {
-                        let open = heading(ui, "GROUPS", "➕ adds its layers");
+                    for (title, hint, decks_only) in [
+                        ("DECKS", "A / B replaces that deck", true),
+                        ("GROUPS", "A / B adds it to that deck", false),
+                    ] {
+                        if !state
+                            .saved_groups
+                            .iter()
+                            .any(|g| g.is_deck() == decks_only)
+                        {
+                            continue;
+                        }
+                        let open = heading(ui, title, hint);
                         let mut groups: Vec<&crate::scene::SavedGroup> = state
                             .saved_groups
                             .iter()
-                            .filter(|g| open && hit(&g.name))
+                            .filter(|g| g.is_deck() == decks_only && open && hit(&g.name))
                             .collect();
                         groups.sort_by_key(|g| !favourites.contains(&g.name));
                         for g in groups {
@@ -3331,22 +3468,33 @@ mod egui_impl {
                                 {
                                     toggle_fav_saved = Some(g.name.clone());
                                 }
+                                // Left gutter, like the source rows: two deck
+                                // buttons and a delete do not fit against the
+                                // panel's right edge — see `deck_add_buttons`.
                                 ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
+                                        if let Some(deck) = super::deck_add_buttons(
+                                            ui,
+                                            decked,
+                                            // One replaces, the other adds.
+                                            // Say which: a destructive click
+                                            // should not look identical to an
+                                            // additive one sitting above it.
+                                            if decks_only {
+                                                "Replace everything on deck"
+                                            } else {
+                                                "Add this group to deck"
+                                            },
+                                        ) {
+                                            queue_group_recall = Some(((*g).clone(), deck));
+                                        }
                                         if ui
                                             .small_button("✖")
                                             .on_hover_text("Delete this saved group")
                                             .clicked()
                                         {
                                             queue_group_delete = Some(g.name.clone());
-                                        }
-                                        if ui
-                                            .small_button("➕")
-                                            .on_hover_text("Add this group and its layers")
-                                            .clicked()
-                                        {
-                                            queue_group_recall = Some((*g).clone());
                                         }
                                         let n = g.layers.len();
                                         let size = egui::vec2(
@@ -3357,8 +3505,13 @@ mod egui_impl {
                                             size,
                                             egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
+                                                // A stack for a deck, a frame
+                                                // for a group. Both are in the
+                                                // font the app ships with; 🎛
+                                                // was not, and drew as a box.
+                                                let icon = if decks_only { "≡" } else { "⛶" };
                                                 ui.add(
-                                                    egui::Label::new(format!("⛶ {}", g.name))
+                                                    egui::Label::new(format!("{icon} {}", g.name))
                                                         .truncate(),
                                                 )
                                                 .on_hover_text(format!("{n} layers"));
@@ -8072,6 +8225,65 @@ mod egui_impl {
             assert!(
                 clicked.load(Ordering::SeqCst),
                 "a chip must report clicks, or the inspector is unreachable"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod group_header_tests {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        /// A group's row has to fit its deck column. Its opacity slider went in
+        /// through `add_sized`, which a Slider ignores, so it took the theme's
+        /// 200pt and the row ran past half a window. egui widens a Ui to fit
+        /// whatever overflows it, so every layer row after the group grew to
+        /// match, and deck A's layers painted across deck B.
+        #[test]
+        fn group_header_fits_a_deck_column() {
+            // Half the centre of the window it was reported in.
+            const COLUMN: f32 = 318.0;
+            let mut mixer = rustjay_mixer::Mixer::new();
+            for id in ["a", "b"] {
+                mixer
+                    .add_channel(rustjay_mixer::Channel::new(
+                        id,
+                        id,
+                        Box::new(crate::sources::testing::StubSource),
+                    ))
+                    .unwrap();
+            }
+            let gid = mixer
+                .group_channels(
+                    "g",
+                    "a group named at far more length than a column holds",
+                    &["a".to_string(), "b".to_string()],
+                )
+                .expect("two layers make a group");
+            let gi = mixer.groups.iter().position(|g| g.uuid == gid).unwrap();
+            let mut engine = EngineState::new();
+
+            let seen = Arc::new(Mutex::new((egui::Rect::NOTHING, egui::Rect::NOTHING)));
+            let out = seen.clone();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size([COLUMN * 2.0, 200.0])
+                .build_ui(move |ui| {
+                    let mut column = ui.available_rect_before_wrap();
+                    column.set_width(COLUMN);
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(column), |ui| {
+                        let mut acts = GroupActions::default();
+                        group_header(ui, &mut mixer, gi, &mut engine, false, &mut acts);
+                        *out.lock().unwrap() = (column, ui.min_rect());
+                    });
+                });
+            // The app's spacing, not egui's: the 200pt slider is the theme's.
+            rustjay_gui::egui_theme::apply_professional_theme(&harness.ctx);
+            harness.run();
+
+            let (column, used) = *seen.lock().unwrap();
+            assert!(
+                used.left() >= column.left() - 0.5 && used.right() <= column.right() + 0.5,
+                "the group row spans {used:?}, outside its column {column:?}"
             );
         }
     }

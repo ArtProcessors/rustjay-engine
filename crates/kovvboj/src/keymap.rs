@@ -22,7 +22,9 @@ pub struct Keymap {
 impl Keymap {
     /// Returns the default keybindings.
     /// NOTE: dispatch is not yet wired; bindings are persisted for future use.
-    /// The actual Cmd+S shortcut is handled by a hardcoded egui check in MixerTab.
+    /// The actual shortcuts are hardcoded egui checks — Cmd+S in MixerTab, and
+    /// Cmd+Z / Cmd+T in `KovvbojShell::draw`. These entries record what those
+    /// keys are; they do not yet decide it.
     pub fn default_bindings() -> Self {
         let mut bindings = HashMap::new();
         bindings.insert(
@@ -31,6 +33,14 @@ impl Keymap {
                 key: "S".to_string(),
                 modifiers: vec!["Command".to_string()],
                 action: "workspace.save".to_string(),
+            },
+        );
+        bindings.insert(
+            "take".to_string(),
+            KeyBinding {
+                key: "T".to_string(),
+                modifiers: vec!["Command".to_string()],
+                action: "mixer.take".to_string(),
             },
         );
         Self { bindings }

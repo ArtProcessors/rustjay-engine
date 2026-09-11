@@ -386,8 +386,15 @@ pub struct SavedGroup {
     /// `grp_<uuid>_…` keys by a straight prefix swap rather than guessing where
     /// one ends.
     pub group_uuid: String,
-    /// Member layers, bottom first, exactly as saved.
+    /// Every layer under the group, at any depth, bottom first, exactly as
+    /// saved. Which group each one belongs to is recorded by the `members`
+    /// lists below; a layer no nested group claims is a direct member of the
+    /// saved group itself.
     pub layers: Vec<LayerDesc>,
+    /// Groups nested *inside* this one, at any depth. Absent from files written
+    /// before groups could nest, which read back as a flat group.
+    #[serde(default)]
+    pub groups: Vec<GroupDesc>,
     /// The group's own chain.
     #[serde(default)]
     pub fx: Vec<FxDesc>,
@@ -400,16 +407,29 @@ pub struct SavedGroup {
 
 #[cfg(feature = "mixer")]
 impl SavedGroup {
-    /// Capture a group and everything under it.
+    /// Whether this was saved from a deck rather than from a group.
+    ///
+    /// Derived from `group_uuid` rather than stored: a save whose top-level
+    /// group *is* a deck is a deck save, by construction. Nothing to default,
+    /// nothing to migrate, and every file ever written classifies itself —
+    /// including the ones already in a workspace.
+    pub fn is_deck(&self) -> bool {
+        self.group_uuid == crate::DECK_A || self.group_uuid == crate::DECK_B
+    }
+
+    /// Capture a group and everything under it: every layer at any depth, and
+    /// every group nested inside it.
     pub fn capture(
         name: String,
         group: &GroupDesc,
         layers: Vec<LayerDesc>,
+        groups: Vec<GroupDesc>,
         params: &std::collections::HashMap<String, f32>,
     ) -> Self {
         let mut prefixes: Vec<String> =
             layers.iter().map(|l| format!("ch_{}_", l.uuid)).collect();
         prefixes.push(format!("grp_{}_", group.uuid));
+        prefixes.extend(groups.iter().map(|g| format!("grp_{}_", g.uuid)));
         Self {
             version: SAVED_LAYER_VERSION,
             name,
@@ -420,6 +440,7 @@ impl SavedGroup {
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
             layers,
+            groups,
             fx: group.fx.clone(),
             opacity: group.opacity,
             blend_mode: group.blend_mode,
@@ -428,51 +449,103 @@ impl SavedGroup {
 
     /// Fresh identities throughout, with the parameters rekeyed to match.
     ///
-    /// Every layer, every layer's effects, the group and the group's effects
-    /// are renamed, so recalling the same group twice gives two independent
-    /// copies rather than two things fighting over one parameter prefix.
-    #[allow(clippy::type_complexity)]
-    pub fn instantiate(
-        &self,
-    ) -> (
-        Vec<LayerDesc>,
-        String,
-        Vec<FxDesc>,
-        std::collections::HashMap<String, f32>,
-    ) {
-        let mut renames: Vec<(String, String)> = Vec::new();
+    /// Every layer, every layer's effects, every nested group, the group itself
+    /// and its effects are renamed, so recalling the same group twice gives two
+    /// independent copies rather than two things fighting over one parameter
+    /// prefix.
+    pub fn instantiate(&self) -> RecalledGroup {
+        self.rebuild(new_uuid())
+    }
+
+    /// Recall into an existing group — a deck — which keeps its own uuid.
+    ///
+    /// Everything underneath still gets fresh identities, but the top of the
+    /// tree stays put: a deck is fixed furniture, and `grp_deck_a_opacity` has
+    /// to still be there after a recall or whatever is mapped to it on a
+    /// control surface is mapped to nothing. The saved group's opacity, blend
+    /// and chain are applied *onto* the deck.
+    pub fn instantiate_into(&self, group_uuid: &str) -> RecalledGroup {
+        self.rebuild(group_uuid.to_string())
+    }
+
+    /// The shared body: fresh uuids everywhere below `target`, which is the
+    /// top-level group's new name.
+    fn rebuild(&self, target: String) -> RecalledGroup {
+        use std::collections::HashMap;
+
+        // Substring renames for effect slots: an fx key carries both its
+        // owner's prefix and its own, `ch_<layer>_fx<slot>_name`.
+        let mut fx_renames: Vec<(String, String)> = Vec::new();
+        let mut layer_map: HashMap<String, String> = HashMap::new();
+        let mut group_map: HashMap<String, String> = HashMap::new();
+        group_map.insert(self.group_uuid.clone(), target.clone());
 
         let mut layers = self.layers.clone();
         for layer in &mut layers {
             let fresh = new_uuid();
-            renames.push((format!("ch_{}_", layer.uuid), format!("ch_{fresh}_")));
+            layer_map.insert(layer.uuid.clone(), fresh.clone());
             layer.uuid = fresh;
             for slot in &mut layer.fx {
                 let f = new_uuid();
-                renames.push((format!("fx{}_", slot.uuid), format!("fx{f}_")));
+                fx_renames.push((format!("fx{}_", slot.uuid), format!("fx{f}_")));
                 slot.uuid = f;
             }
         }
 
-        let group_uuid = new_uuid();
+        let mut groups = self.groups.clone();
+        for g in &mut groups {
+            let fresh = new_uuid();
+            group_map.insert(g.uuid.clone(), fresh.clone());
+            g.uuid = fresh;
+            for slot in &mut g.fx {
+                let f = new_uuid();
+                fx_renames.push((format!("fx{}_", slot.uuid), format!("fx{f}_")));
+                slot.uuid = f;
+            }
+        }
+        // Second pass: the pointers, once every new name exists. A parent that
+        // is not in the map (or absent) means the saved group itself — a nested
+        // group cannot belong outside the subtree it was saved with.
+        for g in &mut groups {
+            g.parent = Some(
+                g.parent
+                    .as_ref()
+                    .and_then(|p| group_map.get(p).cloned())
+                    .unwrap_or_else(|| target.clone()),
+            );
+            g.members = g
+                .members
+                .iter()
+                .filter_map(|m| layer_map.get(m).cloned())
+                .collect();
+        }
+
         let mut fx = self.fx.clone();
         for slot in &mut fx {
             let f = new_uuid();
-            renames.push((format!("fx{}_", slot.uuid), format!("fx{f}_")));
+            fx_renames.push((format!("fx{}_", slot.uuid), format!("fx{f}_")));
             slot.uuid = f;
         }
 
-        let old_group = format!("grp_{}_", self.group_uuid);
-        let new_group = format!("grp_{group_uuid}_");
-        let mut params = std::collections::HashMap::new();
+        let mut params = HashMap::new();
         for (key, value) in &self.params {
-            // Swap the owner's prefix, then the slot's — a layer key carries
-            // both, `ch_<layer>_fx<slot>_name`.
-            let mut k = match key.strip_prefix(old_group.as_str()) {
-                Some(rest) => format!("{new_group}{rest}"),
-                None => key.clone(),
-            };
-            for (from, to) in &renames {
+            // The owner's prefix first, then the slot's.
+            let mut k = key.clone();
+            for (old, new) in layer_map
+                .iter()
+                .map(|(o, n)| (format!("ch_{o}_"), format!("ch_{n}_")))
+                .chain(
+                    group_map
+                        .iter()
+                        .map(|(o, n)| (format!("grp_{o}_"), format!("grp_{n}_"))),
+                )
+            {
+                if let Some(rest) = k.strip_prefix(old.as_str()) {
+                    k = format!("{new}{rest}");
+                    break;
+                }
+            }
+            for (from, to) in &fx_renames {
                 if let Some(at) = k.find(from.as_str()) {
                     k = format!("{}{}{}", &k[..at], to, &k[at + from.len()..]);
                 }
@@ -480,7 +553,49 @@ impl SavedGroup {
             params.insert(k, *value);
         }
 
-        (layers, group_uuid, fx, params)
+        RecalledGroup {
+            group_uuid: target,
+            layers,
+            groups,
+            fx,
+            params,
+        }
+    }
+}
+
+/// One recall of a [`SavedGroup`], with every identity it needs already fresh.
+#[cfg(feature = "mixer")]
+pub struct RecalledGroup {
+    /// Every layer under the group, at any depth.
+    pub layers: Vec<LayerDesc>,
+    /// The top-level group: a fresh uuid from
+    /// [`instantiate`](SavedGroup::instantiate), the deck's own from
+    /// [`instantiate_into`](SavedGroup::instantiate_into).
+    pub group_uuid: String,
+    /// Groups nested underneath, `parent` and `members` already pointing at the
+    /// fresh names.
+    pub groups: Vec<GroupDesc>,
+    /// The top-level group's own chain.
+    pub fx: Vec<FxDesc>,
+    /// Saved values under the new keys.
+    pub params: std::collections::HashMap<String, f32>,
+}
+
+#[cfg(feature = "mixer")]
+impl RecalledGroup {
+    /// Layers belonging to the top-level group itself: the ones no nested group
+    /// claims.
+    pub fn direct_members(&self) -> Vec<String> {
+        self.layers
+            .iter()
+            .filter(|l| {
+                !self
+                    .groups
+                    .iter()
+                    .any(|g| g.members.iter().any(|m| m == &l.uuid))
+            })
+            .map(|l| l.uuid.clone())
+            .collect()
     }
 }
 
@@ -839,7 +954,45 @@ mod tests {
             fx: chain(&["Z"]),
         };
         let layers = vec![desc_with_fx("L1", &["A"]), desc_with_fx("L2", &[])];
-        SavedGroup::capture("Backdrop".into(), &group, layers, &params)
+        SavedGroup::capture("Backdrop".into(), &group, layers, Vec::new(), &params)
+    }
+
+    /// A group with a group inside it: `G` holds `L1` directly and `N` holds
+    /// `L2`. This is the shape a deck takes the moment anything is grouped on
+    /// it, and the shape the flat `layers` list could not express.
+    fn nested_saved_group() -> SavedGroup {
+        let mut params = std::collections::HashMap::new();
+        params.insert("ch_L1_opacity".to_string(), 0.3);
+        params.insert("ch_L2_opacity".to_string(), 0.9);
+        params.insert("grp_G_opacity".to_string(), 0.6);
+        params.insert("grp_N_opacity".to_string(), 0.4);
+        params.insert("grp_N_fxY_amount".to_string(), 0.15);
+        let outer = GroupDesc {
+            parent: None,
+            uuid: "G".into(),
+            name: "Backdrop".into(),
+            members: vec!["L1".into()],
+            opacity: 0.6,
+            blend_mode: rustjay_mixer::BlendMode::Add,
+            solo: false,
+            mute: false,
+            collapsed: false,
+            fx: chain(&["Z"]),
+        };
+        let inner = GroupDesc {
+            parent: Some("G".into()),
+            uuid: "N".into(),
+            name: "Inner".into(),
+            members: vec!["L2".into()],
+            opacity: 0.4,
+            blend_mode: rustjay_mixer::BlendMode::Normal,
+            solo: false,
+            mute: false,
+            collapsed: false,
+            fx: chain(&["Y"]),
+        };
+        let layers = vec![desc_with_fx("L1", &[]), desc_with_fx("L2", &[])];
+        SavedGroup::capture("Backdrop".into(), &outer, layers, vec![inner], &params)
     }
 
     #[test]
@@ -857,7 +1010,9 @@ mod tests {
     #[test]
     fn recalling_a_group_rekeys_everything_under_it() {
         let saved = saved_group();
-        let (layers, gid, fx, params) = saved.instantiate();
+        let r = saved.instantiate();
+        let (layers, gid, fx, params) = (&r.layers, &r.group_uuid, &r.fx, &r.params);
+        let gid = gid.as_str();
 
         assert_eq!(layers.len(), 2);
         assert!(layers.iter().all(|l| l.uuid != "L1" && l.uuid != "L2"));
@@ -880,9 +1035,111 @@ mod tests {
         // And nothing kept an old name.
         assert!(params.keys().all(|k| !k.contains("_L1_") && !k.contains("grp_G_")));
 
-        let (again, gid2, _, _) = saved.instantiate();
-        assert_ne!(again[0].uuid, layers[0].uuid, "two recalls do not collide");
-        assert_ne!(gid2, gid);
+        let again = saved.instantiate();
+        assert_ne!(
+            again.layers[0].uuid, layers[0].uuid,
+            "two recalls do not collide"
+        );
+        assert_ne!(again.group_uuid, gid);
+    }
+
+    /// A group inside the saved group survives with its shape: fresh names for
+    /// everything, and `parent` / `members` still pointing at the right ones.
+    #[test]
+    fn recalling_a_nested_group_keeps_the_nesting() {
+        let saved = nested_saved_group();
+        assert_eq!(saved.groups.len(), 1, "the inner group was captured");
+        assert_eq!(saved.layers.len(), 2, "both layers, at both depths");
+        assert_eq!(
+            saved.params.len(),
+            5,
+            "the inner group's params too: {:?}",
+            saved.params
+        );
+
+        let r = saved.instantiate();
+        assert_eq!(r.groups.len(), 1);
+        let inner = &r.groups[0];
+        assert_ne!(inner.uuid, "N");
+        assert_eq!(
+            inner.parent.as_deref(),
+            Some(r.group_uuid.as_str()),
+            "the inner group hangs off the recalled outer one"
+        );
+        // Its member is the recalled L2, and the outer group keeps only L1.
+        let l2 = r.layers[1].uuid.clone();
+        assert_eq!(inner.members, vec![l2.clone()]);
+        assert_eq!(r.direct_members(), vec![r.layers[0].uuid.clone()]);
+
+        // Params followed both groups.
+        assert_eq!(
+            r.params.get(&format!("grp_{}_opacity", r.group_uuid)),
+            Some(&0.6)
+        );
+        assert_eq!(
+            r.params.get(&format!("grp_{}_opacity", inner.uuid)),
+            Some(&0.4)
+        );
+        assert_eq!(
+            r.params
+                .get(&format!("grp_{}_fx{}_amount", inner.uuid, inner.fx[0].uuid)),
+            Some(&0.15)
+        );
+        assert!(r.params.keys().all(|k| !k.contains("grp_N_")));
+    }
+
+    /// A deck is furniture: recalling into one keeps its uuid, so anything
+    /// mapped to `grp_deck_a_opacity` still finds it afterwards. Everything
+    /// underneath is still freshly named.
+    #[test]
+    fn recalling_into_a_deck_keeps_the_decks_own_name() {
+        let saved = nested_saved_group();
+        let r = saved.instantiate_into("deck_a");
+
+        assert_eq!(r.group_uuid, "deck_a");
+        assert_eq!(
+            r.params.get("grp_deck_a_opacity"),
+            Some(&0.6),
+            "the saved group's opacity lands on the deck's own key"
+        );
+        assert_eq!(r.groups[0].parent.as_deref(), Some("deck_a"));
+        assert!(r.layers.iter().all(|l| l.uuid != "L1" && l.uuid != "L2"));
+        assert_ne!(r.groups[0].uuid, "N");
+
+        // Twice into the same deck: the deck's name is stable, everything under
+        // it is not.
+        let again = saved.instantiate_into("deck_a");
+        assert_eq!(again.group_uuid, "deck_a");
+        assert_ne!(again.groups[0].uuid, r.groups[0].uuid);
+        assert_ne!(again.layers[0].uuid, r.layers[0].uuid);
+    }
+
+    /// Files written before groups could nest have no `groups` field.
+    #[test]
+    fn a_group_saved_before_nesting_still_loads() {
+        let json = r#"{"name":"Old","group_uuid":"G","layers":[],
+            "opacity":1.0,"blend_mode":"Normal"}"#;
+        let back: SavedGroup =
+            serde_json::from_str(json).expect("an older saved group must still parse");
+        assert!(back.groups.is_empty());
+        assert_eq!(back.instantiate_into("deck_b").group_uuid, "deck_b");
+    }
+
+    /// Which section of the library a save belongs in, decided by what it is
+    /// rather than by a flag someone has to remember to set — so the saves
+    /// already in a workspace classify themselves.
+    #[test]
+    fn a_save_from_a_deck_knows_it_came_from_a_deck() {
+        assert!(!saved_group().is_deck(), "an ordinary group is not a deck");
+
+        let json = r#"{"name":"Deck B","group_uuid":"deck_b","layers":[],
+            "opacity":1.0,"blend_mode":"Normal"}"#;
+        let back: SavedGroup = serde_json::from_str(json).expect("parse");
+        assert!(
+            back.is_deck(),
+            "a file written before there were sections still reads as a deck save"
+        );
+        assert!(back.instantiate_into(crate::DECK_A).group_uuid == crate::DECK_A);
     }
 
     #[test]

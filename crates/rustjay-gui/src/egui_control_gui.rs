@@ -330,6 +330,9 @@ impl EguiControlGui {
             if self.show_routing_window {
                 self.build_routing_window(ui);
             }
+            // Toasts float over everything too. Skipping them left every
+            // `EngineState::notify` in a shelled app posted and never seen.
+            self.build_toast_overlay(ui);
             return;
         }
 

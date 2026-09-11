@@ -387,19 +387,100 @@ exists.
    was clipped past the visible width at any panel size. The buttons moved
    to the left gutter beside the star (`ce8072f`).
 
-   **Still open:** the flanking previews are placeholders —
-   `deck_preview_texture_ids` is read by the UI but nothing publishes it. Needs
-   a `pub` accessor for a group's `group_out`, kovvboj publishing the two deck
-   textures, and the host creating the destinations and doing the copy on the
-   render thread.
+   ~~**Still open:** the flanking previews are placeholders.~~ **Done.** A deck
+   is a group, so its preview is that group's thumbnail: `Thumbnails` already
+   owned a small render target per layer, blitted into it on the render hook and
+   registered the view with the host, so groups joined that loop and the shell
+   publishes the two ids into `deck_preview_texture_ids`. Not the host-side
+   `create_preview_texture` path: that copy crops rather than scales, so it
+   would mean two full-resolution copies a frame to look right —
+   `register_texture_view` exists for exactly this and says so.
+   `ChannelGroup::output()` is the accessor.
+
+   **The last unexplained report is closed.** "At the crossfader extremes the
+   deck faded to stops rendering new frames in the preview" does not reproduce
+   now that there is something to observe: parked hard at either end, three
+   screenshots a second apart differ in both previews. Both decks render every
+   frame, as designed.
 
    The [`KOVVBOJ_UI.md`] nested-panel bug did **not** bite: the crossfader strip
    is another nested `Panel::bottom` inside the same child `Ui` and it lays out
    correctly. What did bite was a deck drawing its own group header inside its
    own column — unreadable at half width.
-6. **TAKE** — wire `AutoCrossfade` / `BeatSyncCrossfade` / sequencer to the
-   crossfader base value. Already built; this only connects it.
-7. **Savable decks** — `SavedGroup` nesting, `instantiate_into(deck_uuid)`.
+6. ~~**TAKE** — wire `AutoCrossfade` / `BeatSyncCrossfade` / sequencer to the
+   crossfader base value.~~ **Done.** `prepare` decides who owns the fader each
+   frame: idle, the operator does and `mixer.crossfader` is synced *from* the
+   base, so the next TAKE starts where the fader sits; running, it publishes
+   what the tick produced *as* the base, never the modulated value.
+
+   Ownership outlives the transition by one frame — `tick_transitions` clears
+   `auto` on the same call that yields the final value, so "is one running"
+   alone drops the settle frame and the fader springs back.
+
+   TAKE is a button in the strip and ⌘T in the shell; its length is a
+   parameter (`take_seconds`), so it is mappable and rides in the scene's
+   existing `params`. A TAKE stops a running sequence, because the sequencer
+   outranks `auto` in the tick and a button that did nothing would read as
+   broken.
+7. ~~**Savable decks** — `SavedGroup` nesting, `instantiate_into(deck_uuid)`.~~
+   **Done.** `SavedGroup.groups` holds every nested group; `layers` now means
+   every layer at any depth, and membership is what the `members` lists say.
+   `instantiate` returns a `RecalledGroup` and remaps in two passes — fresh
+   names, then the `parent` / `members` pointers once every new name exists.
+   `instantiate_into(deck_uuid)` pins the top of the tree so
+   `grp_deck_a_opacity` survives a recall. Recalling into a deck replaces what
+   is on it (with the modulation sweep a removal does); into the free stack it
+   still adds. 💾 on the deck column heading saves; the library's GROUPS rows
+   grew the same `[A][B]` buttons the source rows have.
+
+## What user testing found
+
+Three, all of them the same shape underneath: a deck is a group, and the code
+that made groups did not know decks existed.
+
+1. **Grouping layers inside a deck made them vanish.** `group_channels` pushed
+   the new group at top level, which took its members *out* of the deck. In deck
+   mode neither column lists a layer that is on no deck, and the transition does
+   not composite one, so they were unreachable and read as deleted. A new group
+   now inherits whatever its members already shared — grouping inside a folder
+   keeps you in the folder — which is a general rule that happens to fix decks.
+   `ungroup` had the same bug in reverse (members and nested groups dropped to
+   `None`, orphaning them and leaving dangling parent pointers), and so did
+   "remove from group".
+
+   **Edge cases:** a pick spanning both decks, or mixing decked and free layers,
+   is **refused** with a notification. Silently moving layers between decks
+   during a gesture that says nothing about decks is worse than saying no. The
+   gather-to-contiguous can reorder members past a layer of the other deck; that
+   is harmless, because deck membership is `Channel::group`, not an index range,
+   and both decks resolve to one image at one anchor.
+
+   **The guard:** `Mixer::channels_off_deck` names the condition, `prepare`
+   warns when it changes, and — since the free tier is a deliberate part of the
+   design, not something to repair away — deck A's column now lists those layers
+   under **NOT ON A DECK — ignores the crossfader**. A layer nothing lists is
+   indistinguishable from a deleted one; that is the whole bug, so the fix is to
+   list it.
+
+2. **Deck saves could not be named** and overwrote each other: a deck's name is
+   always "Deck A", and that is what the filename came from. The heading now
+   carries a name field, Enter or 💾 to save, and an amber "replaces" the moment
+   the typed name matches something already saved — the shape `MixerTab` already
+   uses for the master chain.
+
+3. **Saved decks were filed under GROUPS.** The library lists **DECKS** and
+   **GROUPS** separately, split on `SavedGroup::is_deck()` — *derived* from
+   `group_uuid` rather than stored as a flag and rather than moved to their own
+   directory. One directory stays one namespace, there is nothing to migrate,
+   and every file already in a workspace classifies itself correctly.
+
+**Still open, and pre-existing:** a layer row has a minimum width — the blend
+picker and the mix buttons do not shrink — that a half-window deck column can be
+under. The first row over the width used to widen every row after it, which is
+how deck A's layers came to be painted across deck B; the columns now scroll in
+both axes, so an over-wide row is contained and reachable instead. Making the
+row itself fit a narrow column is a separate piece of work: something has to
+give way, and deciding what is a design question, not a bug fix.
 
 ## Note on provenance
 

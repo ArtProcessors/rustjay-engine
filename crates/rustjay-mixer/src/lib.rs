@@ -429,6 +429,16 @@ impl ChannelGroup {
         }
     }
 
+    /// This frame's finished image — members composited, chain applied — or
+    /// `None` when the group has not rendered one.
+    ///
+    /// `group_out` stays private because the master pass ping-pongs around it;
+    /// what a caller outside can safely do is read the finished picture, which
+    /// is what a deck preview wants.
+    pub fn output(&self) -> Option<&Texture> {
+        self.group_out.as_ref().filter(|_| self.rendered)
+    }
+
     fn ensure_resources(&mut self, device: &wgpu::Device, size: [u32; 2]) {
         if self.size == size && self.composite.is_some() {
             return;
@@ -698,7 +708,7 @@ impl Mixer {
     }
 
     /// The outermost group `uuid` belongs to — itself when it is top level.
-    fn top_level_ancestor(&self, uuid: &str) -> String {
+    pub fn top_level_ancestor(&self, uuid: &str) -> String {
         let mut cur = uuid.to_string();
         for _ in 0..=self.groups.len() {
             let Some(g) = self.groups.iter().find(|g| g.uuid == cur) else {
@@ -755,6 +765,11 @@ impl Mixer {
     pub fn deck_of_channel(&self, index: usize) -> Option<usize> {
         let gid = self.channels.get(index)?.group.as_deref()?;
         self.deck_of(gid)
+    }
+
+    /// One group's finished image, by uuid. See [`ChannelGroup::output`].
+    pub fn group_output(&self, uuid: &str) -> Option<&Texture> {
+        self.groups.iter().find(|g| g.uuid == uuid)?.output()
     }
 
     /// Which deck a group belongs to, if either: 0 for A, 1 for B.
@@ -952,12 +967,30 @@ impl Mixer {
     /// formed. Grouping gathers, as it does in every editor — leaving members
     /// scattered through the stack would put non-members in the middle of a
     /// composite that is supposed to be one image.
+    ///
+    /// The new group is created **inside whatever the members were already
+    /// inside**, when they all shared one parent. Grouping inside a folder
+    /// keeps you in the folder; grouping layers that sit on a deck keeps them
+    /// on that deck. Without this the new group landed at top level and took
+    /// its members out of the deck with it, where — in deck mode — no column
+    /// lists them and nothing renders them: they read as deleted.
     pub fn group_channels(
         &mut self,
         uuid: impl Into<String>,
         name: impl Into<String>,
         members: &[String],
     ) -> Option<String> {
+        // Read before anything moves or is reassigned.
+        let previous: Vec<Option<String>> = members
+            .iter()
+            .filter_map(|u| self.channels.iter().find(|c| &c.uuid == u))
+            .map(|c| c.group.clone())
+            .collect();
+        let inherited: Option<String> = match previous.first() {
+            Some(first) if previous.iter().all(|p| p == first) => first.clone(),
+            _ => None,
+        };
+
         let mut idxs: Vec<usize> = members
             .iter()
             .filter_map(|u| self.channels.iter().position(|c| &c.uuid == u))
@@ -993,6 +1026,9 @@ impl Mixer {
             }
         }
         self.groups.push(ChannelGroup::new(uuid.clone(), name));
+        if let Some(parent) = inherited {
+            self.set_group_parent(&uuid, Some(&parent));
+        }
         self.invalidate_composite_cache();
         Some(uuid)
     }
@@ -1054,15 +1090,53 @@ impl Mixer {
         self.invalidate_composite_cache();
     }
 
-    /// Dissolve a group, leaving its members in the stack.
+    /// Dissolve a group, leaving what was inside it where the group was.
+    ///
+    /// Members and any nested groups are handed to the dissolved group's own
+    /// parent, not to the top level: dissolving a folder inside a deck leaves
+    /// its layers on that deck. Dropping them to `None` took them off the deck,
+    /// out of both columns and out of the transition — invisible, and reported
+    /// as deleted. Child groups pointing at a group that no longer exists were
+    /// the same failure by another route.
     pub fn ungroup(&mut self, uuid: &str) {
+        // A deck is furniture. Dissolving one hands its layers to no deck at
+        // all — out of both columns and out of the transition — and the host
+        // rebuilds it empty. Nothing that says "ungroup" means that.
+        if self.decks.as_ref().is_some_and(|d| d.iter().any(|x| x == uuid)) {
+            return;
+        }
+        let parent = self
+            .groups
+            .iter()
+            .find(|g| g.uuid == uuid)
+            .and_then(|g| g.parent.clone());
         for c in self.channels.iter_mut() {
             if c.group.as_deref() == Some(uuid) {
-                c.group = None;
+                c.group = parent.clone();
+            }
+        }
+        for g in self.groups.iter_mut() {
+            if g.parent.as_deref() == Some(uuid) {
+                g.parent = parent.clone();
             }
         }
         self.groups.retain(|g| g.uuid != uuid);
         self.invalidate_composite_cache();
+    }
+
+    /// Layers that belong to no deck while decks are configured.
+    ///
+    /// Nothing should ever be in here: in deck mode neither column lists such a
+    /// layer, so it renders into the master with no way to reach it. It is the
+    /// shape every "my layers disappeared" report has taken, so it is worth a
+    /// name and a check rather than a comment.
+    pub fn channels_off_deck(&self) -> Vec<usize> {
+        if self.decks.is_none() {
+            return Vec::new();
+        }
+        (0..self.channels.len())
+            .filter(|&i| self.deck_of_channel(i).is_none())
+            .collect()
     }
 
     /// Whether a channel contributes to the mix at all.
@@ -2470,6 +2544,17 @@ mod deck_tests {
             .unwrap();
         m.decks = Some(["deck_a".into(), "deck_b".into()]);
         m
+    }
+
+    /// The layer menu offered "Ungroup" on every deck layer, a deck being a
+    /// group, and taking it moved the whole deck onto no deck at all.
+    #[test]
+    fn a_deck_cannot_be_ungrouped() {
+        let mut m = two_decks();
+        m.ungroup("deck_a");
+        assert!(m.groups.iter().any(|g| g.uuid == "deck_a"));
+        assert_eq!(m.deck_of_channel(0), Some(0));
+        assert_eq!(m.deck_of_channel(1), Some(0));
     }
 
     #[test]
