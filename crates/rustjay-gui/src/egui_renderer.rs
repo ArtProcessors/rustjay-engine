@@ -19,6 +19,9 @@ pub struct EguiRenderer {
     preview_texture_ids: Vec<egui::TextureId>,
     preview_textures: std::collections::HashMap<egui::TextureId, wgpu::Texture>,
     scale_factor: f64,
+    /// The UI sent `ViewportCommand::Close` (e.g. File → Quit); see
+    /// [`Self::take_close_requested`].
+    close_requested: bool,
 }
 
 impl EguiRenderer {
@@ -98,6 +101,7 @@ impl EguiRenderer {
             preview_texture_ids: Vec::new(),
             preview_textures: std::collections::HashMap::new(),
             scale_factor,
+            close_requested: false,
         })
     }
 
@@ -209,6 +213,11 @@ impl EguiRenderer {
         }
     }
 
+    /// Whether the UI asked to close since the last call, clearing it.
+    pub fn take_close_requested(&mut self) -> bool {
+        std::mem::take(&mut self.close_requested)
+    }
+
     /// Render a frame
     pub fn render_frame<F>(&mut self, mut build_ui: F) -> Result<()>
     where
@@ -223,6 +232,13 @@ impl EguiRenderer {
         let mut full_output = self.context.run_ui(raw_input, |ui| {
             build_ui(ui);
         });
+
+        // egui-winit leaves viewport commands to the integration, so a Close
+        // from the UI would otherwise go nowhere.
+        self.close_requested |= full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|v| v.commands.iter().any(|c| matches!(c, egui::ViewportCommand::Close)));
 
         // Handle platform output (cursor, clipboard, etc.)
         self.state
