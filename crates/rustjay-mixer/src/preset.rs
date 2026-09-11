@@ -38,6 +38,12 @@ use rustjay_core::modulation::ModulationEngine;
 /// Hard cap on channels a preset may declare. Mirrors the runtime limit enforced
 /// by [`Mixer::add_channel`](crate::Mixer::add_channel).
 pub const MAX_CHANNELS: usize = 16;
+/// Hard cap on bus groups.
+///
+/// Group count, not layer count, is the memory constraint: each group holds
+/// four full-resolution textures (~133 MB at 4K), so the cap is what keeps a
+/// deeply nested stack from quietly costing a gigabyte of VRAM.
+pub const MAX_GROUPS: usize = 8;
 /// Hard cap on modulation sources a preset may declare (SEC-1).
 pub const MAX_MOD_SOURCES: usize = 64;
 /// Hard cap on total modulation assignment entries a preset may declare (SEC-1).

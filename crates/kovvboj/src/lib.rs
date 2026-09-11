@@ -11,6 +11,92 @@ pub fn shaders_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders")
 }
 
+/// The two decks are permanent furniture: created on first run, never deleted,
+/// never nested. Their uuids are fixed so `grp_deck_a_opacity` — and any MIDI
+/// bound to it — survives every scene load and every deck recall.
+#[cfg(feature = "mixer")]
+pub const DECK_A: &str = "deck_a";
+/// See [`DECK_A`].
+#[cfg(feature = "mixer")]
+pub const DECK_B: &str = "deck_b";
+
+/// The transition loaded when a scene names none. A plain dissolve is what a
+/// crossfader does when nobody has picked anything else.
+#[cfg(feature = "mixer")]
+pub const DEFAULT_TRANSITION: &str = "transition_dissolve.fs";
+
+/// Every transition shader the app ships, sorted, dissolve first.
+///
+/// Named by convention (`transition_*.fs`) rather than by a manifest: the
+/// folder is the list, so dropping one in is all it takes.
+#[cfg(feature = "mixer")]
+pub fn transition_shaders() -> Vec<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(shaders_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|e| e.to_str()) == Some("fs")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("transition_"))
+        })
+        .collect();
+    found.sort();
+    // The default first, so the list opens on what a crossfader normally does.
+    if let Some(i) = found
+        .iter()
+        .position(|p| p.file_name().and_then(|n| n.to_str()) == Some(DEFAULT_TRANSITION))
+    {
+        found.swap(0, i);
+    }
+    found
+}
+
+/// Load `path` as the mixer's transition effect.
+#[cfg(feature = "mixer")]
+fn set_transition(
+    mixer: &mut Mixer,
+    path: &std::path::Path,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    engine: &EngineState,
+) {
+    match rustjay_isf::IsfEffect::from_path(path) {
+        Ok(isf) => {
+            let name = isf.shader_name.clone();
+            let node = EffectNode::new(isf, &name, device, queue, engine);
+            let mut slot = rustjay_mixer::EffectSlot::new(Box::new(node));
+            slot.source_path = Some(path.to_path_buf());
+            slot.effect
+                .set_param_prefix(rustjay_mixer::TRANSITION_PREFIX);
+            mixer.transition = Some(slot);
+        }
+        Err(e) => log::warn!("[Decks] transition {} failed to load: {e}", path.display()),
+    }
+}
+
+/// Make sure both decks exist, and that the transition is loaded.
+///
+/// Called after any graph rebuild. Grouping needs two members, so a deck with
+/// fewer layers than that simply is not formed yet — it becomes a deck as soon
+/// as it has something to hold.
+#[cfg(feature = "mixer")]
+fn ensure_decks(mixer: &mut Mixer) {
+    // A deck exists as soon as a layer claims it — `group_channels` wants two
+    // members, but a deck is furniture, not a grouping gesture.
+    // Both decks, always — not only when a layer claims one. A deck that
+    // vanished because it was emptied took the crossfader with it.
+    for (uuid, name) in [(DECK_A, "Deck A"), (DECK_B, "Deck B")] {
+        if !mixer.groups.iter().any(|g| g.uuid == uuid) {
+            mixer.groups.push(rustjay_mixer::ChannelGroup::new(uuid, name));
+            mixer.invalidate_composite_cache();
+        }
+    }
+    mixer.decks = Some([DECK_A.to_string(), DECK_B.to_string()]);
+}
+
 /// The images-and-videos folder the registry scans alongside [`shaders_dir`].
 pub fn assets_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets")
@@ -203,6 +289,11 @@ pub struct KovvbojAppState {
     #[serde(skip)]
     #[cfg(feature = "mixer")]
     pub pending_source_swaps: Vec<PendingSourceSwap>,
+    /// A transition shader picked in the UI, loaded in `prepare()` where the
+    /// device is available.
+    #[serde(skip)]
+    #[cfg(feature = "mixer")]
+    pub pending_transition: Option<std::path::PathBuf>,
     /// Text-layer edits waiting for `prepare`, where the mixer is reachable.
     #[serde(skip)]
     pub pending_text: Vec<(String, TextEdit)>,
@@ -315,6 +406,8 @@ pub struct PendingLayer {
     /// A saved layer to rebuild instead of a bare source: its FX chain, mix
     /// settings, and parameter values. `None` for a plain library ➕.
     pub saved: Option<crate::scene::SavedLayer>,
+    /// Which deck to land in. `None` when a set has no decks.
+    pub deck: Option<usize>,
 }
 
 /// An FX slot queued for removal.
@@ -885,6 +978,8 @@ impl Default for KovvbojAppState {
             pending_fx_removals: Vec::new(),
             #[cfg(feature = "mixer")]
             pending_source_swaps: Vec::new(),
+            #[cfg(feature = "mixer")]
+            pending_transition: None,
             pending_text: Vec::new(),
             pending_clip: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_font: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -1576,8 +1671,9 @@ impl KovvbojRootPlugin {
         let shaders_dir = crate::shaders_dir();
         let mut sources = std::collections::HashMap::new();
 
-        // Two layers to open on: a generator underneath, a camera over it.
-        let defaults: [(&str, crate::sources::SourceEntry); 2] = [
+        // Four layers to open on, two per deck, so both decks exist from the
+        // first frame and the crossfader has something to transition.
+        let defaults: [(&str, crate::sources::SourceEntry); 4] = [
             (
                 "ColorCycle",
                 crate::sources::SourceEntry {
@@ -1595,6 +1691,28 @@ impl KovvbojRootPlugin {
                     id: "camera".to_string(),
                     name: "Camera".to_string(),
                     kind: crate::sources::SourceKind::Camera,
+                    path: None,
+                    device_index: 0,
+                    text: None,
+                },
+            ),
+            (
+                "ColorCycleB",
+                crate::sources::SourceEntry {
+                    id: "colorcycle_b".to_string(),
+                    name: "ColorCycle".to_string(),
+                    kind: crate::sources::SourceKind::Isf,
+                    path: Some(shaders_dir.join("ColorCycle.fs")),
+                    device_index: 0,
+                    text: None,
+                },
+            ),
+            (
+                "SolidB",
+                crate::sources::SourceEntry {
+                    id: "solid_b".to_string(),
+                    name: "Solid".to_string(),
+                    kind: crate::sources::SourceKind::SolidColor,
                     path: None,
                     device_index: 0,
                     text: None,
@@ -1618,6 +1736,25 @@ impl KovvbojRootPlugin {
         }
 
         self.layer_sources_init = sources;
+
+        // The decks themselves. Bottom two layers are deck A, top two deck B,
+        // and the fader opens on A.
+        // Claim membership directly: `group_channels` refuses fewer than two
+        // members, and a deck has to exist even when a source failed to build.
+        for (uuid, members) in [
+            (DECK_A, ["ColorCycle", "Camera"]),
+            (DECK_B, ["ColorCycleB", "SolidB"]),
+        ] {
+            for m in members {
+                if let Some(ch) = mixer.channels.iter_mut().find(|c| c.uuid == m) {
+                    ch.group = Some(uuid.to_string());
+                }
+            }
+        }
+        ensure_decks(&mut mixer);
+        mixer.crossfader = 0.0;
+        let transition = shaders_dir.join(DEFAULT_TRANSITION);
+        set_transition(&mut mixer, &transition, device, queue, &dummy_engine);
 
         // Phase 12 demo: pre-populate sequencer with a beat-synced sequence
         mixer.sequencer.steps = vec![
@@ -1800,9 +1937,13 @@ impl KovvbojRootPlugin {
                 .filter(|u| mixer.channels.iter().any(|c| &c.uuid == *u))
                 .cloned()
                 .collect();
-            if present.len() < 2 {
-                // A group whose layers are gone is not a group; dropping it
-                // beats leaving one that renders nothing.
+            // A group whose layers are gone is not a group; dropping it beats
+            // leaving one that renders nothing. A deck is the exception: it is
+            // furniture, and it exists whether or not anything is on it.
+            // Dropping a deck here left `decks` unset and the crossfader inert,
+            // which is what "adding a layer stopped the crossfader" was.
+            let is_deck = desc.uuid == DECK_A || desc.uuid == DECK_B;
+            if present.len() < 2 && !is_deck {
                 log::warn!(
                     "[Topology] group '{}' has {} of {} members left, skipping",
                     desc.name,
@@ -1838,6 +1979,20 @@ impl KovvbojRootPlugin {
             mixer.groups.push(group);
         }
 
+        // Nesting last: a parent may be declared after its child, and
+        // `set_group_parent` refuses a parent that does not exist yet. It also
+        // refuses a cycle, so a corrupt scene costs the nesting, not the layers.
+        for desc in &topo.groups {
+            let parent = desc.parent.as_deref();
+            if parent.is_some() && !mixer.set_group_parent(&desc.uuid, parent) {
+                log::warn!(
+                    "[Topology] group '{}' could not nest inside {:?}; left at top level",
+                    desc.name,
+                    parent
+                );
+            }
+        }
+
         reconcile_chain(
             &mut mixer.master,
             &topo.master_fx,
@@ -1847,6 +2002,32 @@ impl KovvbojRootPlugin {
             queue,
             &dummy_engine,
         );
+
+        // The transition the scene named, or the default dissolve. Reloaded only
+        // when the path actually changed, so a scene load does not rebuild a
+        // shader that is already running.
+        let want = crate::scene::resolve(
+            topo.transition
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(DEFAULT_TRANSITION)),
+            &if topo.transition.is_some() {
+                base.clone()
+            } else {
+                crate::shaders_dir()
+            },
+        );
+        let have = mixer
+            .transition
+            .as_ref()
+            .and_then(|s| s.source_path.clone());
+        if have.as_deref() != Some(want.as_path()) {
+            set_transition(&mut mixer, &want, device, queue, &dummy_engine);
+        }
+
+        // Deck roles follow the groups: if a scene rebuilt both deck groups,
+        // the crossfader transitions them again; if it did not, they are
+        // ordinary groups and nothing is special-cased.
+        ensure_decks(&mut mixer);
 
         // Unconditional: every path into here has moved channels between
         // indices or replaced what sits behind one, and the composite cache is
@@ -2296,6 +2477,51 @@ impl EffectPlugin for KovvbojRootPlugin {
                     && let Ok(mut restore) = engine.param_restore.lock()
                 {
                     restore.extend(scene.params.clone());
+                }
+            }
+
+            // A transition picked in the UI: loaded here, where the device is.
+            if let Some(path) = state.pending_transition.take()
+                && let Ok(mut mixer) = self.mixer.lock()
+            {
+                set_transition(&mut mixer, &path, device, queue, engine);
+                // Its inputs are new parameters under the same stable prefix.
+                self.params_dirty = true;
+            }
+
+            // The crossfader *is* the transition's progress — one control, one
+            // uniform, so a plain dissolve is just the dissolve shader at the
+            // fader's position. `prepare` holds `&EngineState`, so the write
+            // goes through the queue the renderer drains each frame.
+            //
+            // Writing the modulated crossfader into a *different* param's base
+            // does not ratchet the way writing it back into its own would: the
+            // value is recomputed from the fader every frame, never accumulated.
+            {
+                // Every frame, not at each edit site. A deck is furniture, and
+                // there are too many ways to disturb it — ungroup, restack,
+                // regroup, a replay that dropped it — to catch one at a time.
+                // Miss one and `decks` points at a group that no longer exists:
+                // the transition bails, the fader goes dead, and the decks
+                // quietly composite as ordinary groups, which is a failure that
+                // looks like nothing happening. Two `any()` over at most eight
+                // groups is not worth being clever about.
+                let decked = self
+                    .mixer
+                    .lock()
+                    .map(|mut m| {
+                        ensure_decks(&mut m);
+                        m.decks.is_some() && m.transition.is_some()
+                    })
+                    .unwrap_or(false);
+                if decked
+                    && let Some(x) = engine.get_param("crossfader")
+                    && let Ok(mut restore) = engine.param_restore.lock()
+                {
+                    restore.push((
+                        rustjay_mixer::TRANSITION_PROGRESS.to_string(),
+                        x.clamp(0.0, 1.0),
+                    ));
                 }
             }
 
@@ -2749,6 +2975,17 @@ impl EffectPlugin for KovvbojRootPlugin {
                         let Ok(mut mixer) = state.mixer.lock() else {
                             continue;
                         };
+                        // Which deck it joins. An unnamed deck means the caller
+                        // had no opinion — a dropped file, a stream URL — and
+                        // deck A is where a set that has decks starts.
+                        if mixer.decks.is_some() {
+                            let deck = match req.deck {
+                                Some(1) => DECK_B,
+                                _ => DECK_A,
+                            };
+                            channel.group = Some(deck.to_string());
+                        }
+
                         // New layers go on top of the stack, which is where you
                         // expect a thing you just added to appear.
                         if mixer.add_channel(channel).is_err() {
@@ -2760,6 +2997,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                             );
                             continue;
                         }
+                        // A deck that did not exist yet does now: the layer
+                        // that claims it is what brings it into being.
+                        ensure_decks(&mut mixer);
                         drop(mixer);
                         state.layer_sources.insert(uuid, entry.clone());
                         self.params_dirty = true;
@@ -4632,5 +4872,97 @@ mod reconcile_tests {
                 SlotPlan::Keep { uuid: "f1".into() },
             ]
         );
+    }
+}
+
+/// The decks are furniture: they exist whether or not anything is on them.
+///
+/// Both reported failures were this — a deck dropped for having too few layers,
+/// which unset `decks` and left the crossfader inert.
+#[cfg(all(test, feature = "mixer"))]
+mod deck_permanence_tests {
+    use super::*;
+
+    struct Stub;
+    impl rustjay_core::EffectInstance for Stub {
+        fn render_to(
+            &mut self,
+            _ctx: &mut rustjay_core::RenderCtx<'_>,
+            _inputs: &[rustjay_core::EffectInput<'_>],
+            _target: rustjay_core::RenderTarget<'_>,
+            _engine: &EngineState,
+        ) {
+        }
+    }
+
+    fn mixer_with(layers: &[(&str, Option<&str>)]) -> Mixer {
+        let mut m = Mixer::new();
+        m.use_crossfader = false;
+        for (uuid, deck) in layers {
+            let mut ch = Channel::new(*uuid, *uuid, Box::new(Stub));
+            ch.group = deck.map(str::to_string);
+            m.add_channel(ch).unwrap();
+        }
+        m
+    }
+
+    #[test]
+    fn a_deck_holding_one_layer_still_exists() {
+        // `group_channels` refuses fewer than two members, and topology replay
+        // used to drop such a group. For a deck that killed the crossfader.
+        let mut m = mixer_with(&[("a", Some(DECK_A)), ("b", Some(DECK_B))]);
+        ensure_decks(&mut m);
+        assert!(m.groups.iter().any(|g| g.uuid == DECK_A));
+        assert!(m.groups.iter().any(|g| g.uuid == DECK_B));
+        assert_eq!(
+            m.decks,
+            Some([DECK_A.to_string(), DECK_B.to_string()]),
+            "one layer per deck is still two decks"
+        );
+    }
+
+    #[test]
+    fn an_empty_deck_still_exists() {
+        let mut m = mixer_with(&[("a", Some(DECK_A))]);
+        ensure_decks(&mut m);
+        assert!(
+            m.decks.is_some(),
+            "emptying a deck must not take the crossfader with it"
+        );
+        assert!(m.groups.iter().any(|g| g.uuid == DECK_B));
+    }
+
+    #[test]
+    fn adding_a_layer_leaves_the_decks_alone() {
+        let mut m = mixer_with(&[("a", Some(DECK_A)), ("b", Some(DECK_B))]);
+        ensure_decks(&mut m);
+        let before = m.decks.clone();
+
+        let mut fresh = Channel::new("new", "new", Box::new(Stub));
+        fresh.group = Some(DECK_A.to_string());
+        m.add_channel(fresh).unwrap();
+        ensure_decks(&mut m);
+
+        assert_eq!(m.decks, before, "adding a layer must not unset the decks");
+        assert_eq!(
+            m.groups.iter().filter(|g| g.uuid == DECK_A).count(),
+            1,
+            "and must not duplicate one either"
+        );
+    }
+
+    #[test]
+    fn a_layer_deep_inside_a_deck_still_reports_that_deck() {
+        let mut m = mixer_with(&[
+            ("a", Some(DECK_A)),
+            ("x", Some("inner")),
+            ("y", Some("inner")),
+        ]);
+        ensure_decks(&mut m);
+        m.groups
+            .push(rustjay_mixer::ChannelGroup::new("inner", "Inner"));
+        assert!(m.set_group_parent("inner", Some(DECK_A)));
+        assert_eq!(m.deck_of("inner"), Some(0));
+        assert_eq!(m.deck_of_channel(1), Some(0));
     }
 }

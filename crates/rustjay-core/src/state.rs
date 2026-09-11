@@ -995,6 +995,12 @@ pub struct EngineState {
     /// `egui::TextureId::User(id)` — `register_native_texture` always returns the
     /// `User` variant. Not part of any preset/persistence.
     pub stage_preview_texture_id: Option<u64>,
+    /// Raw egui texture ids for the two decks' live output, `[A, B]`.
+    ///
+    /// Published the same way as [`stage_preview_texture_id`]: the host owns the
+    /// destination textures and the copy, so it stays on the render thread, and
+    /// a custom tab rebuilds the id with `egui::TextureId::User`.
+    pub deck_preview_texture_ids: [Option<u64>; 2],
     /// Target render frame rate in frames per second.
     pub target_fps: u32,
     /// Output surface present mode.
@@ -1222,6 +1228,7 @@ impl EngineState {
             show_preview: true,
             show_stage_preview: true,
             stage_preview_texture_id: None,
+            deck_preview_texture_ids: [None; 2],
             target_fps: 60,
             present_mode: PresentMode::default(),
             ui_scale: 1.0,

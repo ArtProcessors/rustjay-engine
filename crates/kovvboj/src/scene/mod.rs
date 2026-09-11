@@ -180,6 +180,10 @@ pub struct GroupDesc {
     pub name: String,
     /// Member layer uuids, bottom of the group first.
     pub members: Vec<String>,
+    /// The group this one nests inside. Absent in scenes saved before groups
+    /// could nest, which then load as a flat set of top-level groups.
+    #[serde(default)]
+    pub parent: Option<String>,
     pub opacity: f32,
     pub blend_mode: rustjay_mixer::BlendMode,
     #[serde(default)]
@@ -207,6 +211,11 @@ pub struct Topology {
     /// Master FX applied after compositing.
     #[serde(default)]
     pub master_fx: Vec<FxDesc>,
+    /// The transition the crossfader drives, stored relative to the crate root
+    /// when possible. Absent in scenes saved before decks existed, and in those
+    /// the default dissolve is loaded.
+    #[serde(default)]
+    pub transition: Option<PathBuf>,
     /// Bus groups over the layers. Absent in scenes saved before groups
     /// existed, which then load as a flat stack.
     #[serde(default)]
@@ -588,12 +597,18 @@ impl Topology {
             version: TOPOLOGY_VERSION,
             layers,
             master_fx: capture_fx(&mixer.master),
+            transition: mixer
+                .transition
+                .as_ref()
+                .and_then(|slot| slot.source_path.as_ref())
+                .map(|path| relativize(path, &base)),
             groups: mixer
                 .groups
                 .iter()
                 .map(|g| GroupDesc {
                     uuid: g.uuid.clone(),
                     name: g.name.clone(),
+                    parent: g.parent.clone(),
                     members: mixer
                         .group_members(&g.uuid)
                         .into_iter()
@@ -764,10 +779,12 @@ mod tests {
     #[test]
     fn a_group_survives_a_topology_round_trip() {
         let topo = Topology {
+            transition: None,
             version: TOPOLOGY_VERSION,
             layers: vec![desc_with_fx("a", &[]), desc_with_fx("b", &[])],
             master_fx: Vec::new(),
             groups: vec![GroupDesc {
+                parent: None,
                 uuid: "g1".into(),
                 name: "Backdrop".into(),
                 members: vec!["a".into(), "b".into()],
@@ -810,6 +827,7 @@ mod tests {
         params.insert("grp_G_fxZ_amount".to_string(), 0.2);
         params.insert("ch_OTHER_opacity".to_string(), 1.0); // not in the group
         let group = GroupDesc {
+            parent: None,
             uuid: "G".into(),
             name: "Backdrop".into(),
             members: vec!["L1".into(), "L2".into()],
@@ -889,5 +907,74 @@ mod tests {
             .remove("audio_routing");
         let back: Scene = serde_json::from_value(value).expect("deserialise");
         assert!(back.audio_routing.matrix.is_empty());
+    }
+
+    /// A scene saved before groups could nest must still load.
+    ///
+    /// `parent` defaults to `None`, so every group in an older file comes back
+    /// as top level — the flat arrangement it was saved in. No version bump and
+    /// no migration: the addition is purely additive and defaults correctly.
+    #[test]
+    fn a_group_saved_before_nesting_loads_at_top_level() {
+        let json = r#"{
+            "uuid": "g1",
+            "name": "Beds",
+            "members": ["a", "b"],
+            "opacity": 0.8,
+            "blend_mode": "Normal",
+            "solo": false,
+            "mute": false,
+            "collapsed": false,
+            "fx": []
+        }"#;
+        let group: GroupDesc = serde_json::from_str(json).expect("older group must still parse");
+        assert_eq!(group.parent, None);
+        assert_eq!(group.members, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn nesting_survives_a_round_trip() {
+        let group = GroupDesc {
+            uuid: "inner".into(),
+            name: "Inner".into(),
+            parent: Some("outer".into()),
+            members: vec!["a".into(), "b".into()],
+            opacity: 1.0,
+            blend_mode: rustjay_mixer::BlendMode::Normal,
+            solo: false,
+            mute: false,
+            collapsed: false,
+            fx: Vec::new(),
+        };
+        let back: GroupDesc =
+            serde_json::from_str(&serde_json::to_string(&group).unwrap()).unwrap();
+        assert_eq!(back.parent.as_deref(), Some("outer"));
+    }
+
+    /// A scene saved before decks existed must still load, and get the default.
+    #[test]
+    fn a_topology_without_a_transition_still_parses() {
+        let topo: Topology = serde_json::from_str(
+            r#"{"version":1,"layers":[],"master_fx":[],"groups":[]}"#,
+        )
+        .expect("older topology must still parse");
+        assert_eq!(topo.transition, None);
+    }
+
+    #[test]
+    fn the_chosen_transition_survives_a_round_trip() {
+        let topo = Topology {
+            version: TOPOLOGY_VERSION,
+            layers: Vec::new(),
+            master_fx: Vec::new(),
+            groups: Vec::new(),
+            transition: Some(PathBuf::from("shaders/transition_iris.fs")),
+        };
+        let back: Topology =
+            serde_json::from_str(&serde_json::to_string(&topo).unwrap()).unwrap();
+        assert_eq!(
+            back.transition,
+            Some(PathBuf::from("shaders/transition_iris.fs"))
+        );
     }
 }

@@ -64,12 +64,28 @@ impl Default for MixerTab {
 pub struct DeckTab {
     /// Async result from the native file picker (effect shaders).
     pending_effect: std::sync::Arc<std::sync::Mutex<Option<crate::PendingEffect>>>,
+    /// Which deck's layers this column shows: `Some(0)` A, `Some(1)` B.
+    ///
+    /// `None` shows the whole stack, which is what happens before the decks
+    /// exist and whenever a set is not using them.
+    pub deck: Option<usize>,
 }
 
 impl Default for DeckTab {
     fn default() -> Self {
         Self {
             pending_effect: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            deck: None,
+        }
+    }
+}
+
+impl DeckTab {
+    /// A column showing one deck.
+    pub fn for_deck(deck: usize) -> Self {
+        Self {
+            deck: Some(deck),
+            ..Self::default()
         }
     }
 }
@@ -282,6 +298,48 @@ impl OutputsTab {
 /// scrollable span: zero outside the edge margins, faster the deeper in.
 /// Axis-agnostic — works for the vertical layer list and the horizontal FX
 /// strips. Pure so it is unit-testable; the caller owns applying the offset.
+/// The uuid of deck `d`.
+#[cfg(all(feature = "mixer", feature = "egui"))]
+fn deck_uuid(d: usize) -> &'static str {
+    if d == 1 { crate::DECK_B } else { crate::DECK_A }
+}
+
+/// The library's add-target buttons: `[A][B]` when a set has decks, a plain
+/// `➕` when it does not.
+///
+/// Returns the deck picked, or `Some(None)` for the deckless case — the outer
+/// `Option` is "was anything clicked at all".
+#[cfg(all(feature = "mixer", feature = "egui"))]
+pub fn deck_add_buttons(ui: &mut egui::Ui, decked: bool, what: &str) -> Option<Option<usize>> {
+    if !decked {
+        return ui
+            .small_button("➕")
+            .on_hover_text(what)
+            .clicked()
+            .then_some(None);
+    }
+    // A before B, in the order they read everywhere else. Tight, because two
+    // buttons sit where one ➕ did.
+    ui.spacing_mut().item_spacing.x = 2.0;
+    ui.spacing_mut().button_padding.x = 3.0;
+    let mut picked = None;
+    if ui
+        .small_button("A")
+        .on_hover_text(format!("{what} on deck A"))
+        .clicked()
+    {
+        picked = Some(Some(0));
+    }
+    if ui
+        .small_button("B")
+        .on_hover_text(format!("{what} on deck B"))
+        .clicked()
+    {
+        picked = Some(Some(1));
+    }
+    picked
+}
+
 #[cfg(all(feature = "mixer", feature = "egui"))]
 pub fn drag_edge_scroll_delta(pos: f32, min: f32, max: f32) -> f32 {
     const EDGE: f32 = 36.0;
@@ -1485,6 +1543,8 @@ mod egui_impl {
             name => name,
         };
         state.pending_layers.push(crate::PendingLayer {
+            // Not chosen here — `prepare` puts an unnamed layer on deck A.
+            deck: None,
             source: crate::sources::SourceEntry {
                 id: name.to_lowercase().replace(' ', "_"),
                 name: name.to_string(),
@@ -2186,11 +2246,19 @@ mod egui_impl {
                 let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
 
                 // Drawn top-first so the list reads the way it composites.
+                // A deck column shows only what composites into that deck, at
+                // any nesting depth; an ungrouped layer belongs to neither and
+                // shows in the full stack only.
                 let order: Vec<String> = mixer
                     .channels
                     .iter()
+                    .enumerate()
                     .rev()
-                    .map(|c| c.uuid.clone())
+                    .filter(|(i, _)| match self.deck {
+                        None => true,
+                        Some(d) => mixer.deck_of_channel(*i) == Some(d),
+                    })
+                    .map(|(_, c)| c.uuid.clone())
                     .collect();
 
                 for uuid in order.iter() {
@@ -2206,7 +2274,17 @@ mod egui_impl {
                         let gid = g.uuid.clone();
                         let members = mixer.group_members(&gid);
                         let gi = mixer.groups.iter().position(|x| x.uuid == gid).unwrap();
-                        if members.last() == Some(&idx) {
+                        // A deck column is already the deck's own header: the
+                        // column heading names it, and the crossfader strip
+                        // carries its controls. Drawing the group row too gave
+                        // two headings, an ✕ on furniture that cannot be
+                        // deleted, and a row that does not fit half a width —
+                        // its name field, opacity slider and S/M overlapped.
+                        // Groups *inside* the deck still announce themselves.
+                        let is_this_deck = self
+                            .deck
+                            .is_some_and(|d| mixer.deck_of(&gid) == Some(d) && gid == deck_uuid(d));
+                        if members.last() == Some(&idx) && !is_this_deck {
                             let sel = matches!(
                                 &selection,
                                 crate::Selection::Group { group } if *group == gid
@@ -2815,6 +2893,14 @@ mod egui_impl {
                         _ => None,
                     };
                     let mut queue_layer: Option<crate::PendingLayer> = None;
+                    // Which deck the ➕/A/B click targeted, carried to the
+                    // file-picker branch where the layer is actually built.
+                    let mut pending_deck: Option<usize> = None;
+                    let decked = state
+                        .mixer
+                        .lock()
+                        .map(|m| m.decks.is_some())
+                        .unwrap_or(false);
                     let mut queue_fx: Option<crate::PendingEffect> = None;
                     // Cloned so the row closure can read them while `state` is
                     // borrowed by the registry iteration; the toggle is applied
@@ -2912,12 +2998,17 @@ mod egui_impl {
                             {
                                 toggle_fav = Some(entry.id.clone());
                             }
-                            // Right-to-left so ➕ claims its space first and a
-                            // long name truncates. Laid out the other way round,
-                            // an NDI source named after a hostname pushed the
-                            // button off the panel entirely.
+                            // Buttons first, in the left gutter beside the
+                            // star, so the name is what truncates — an NDI
+                            // source named after a hostname used to push the
+                            // button off the panel. They were laid out
+                            // right-to-left for that reason, which put them
+                            // against an edge that also carries the scroll bar
+                            // and the resize grip: with two of them the second
+                            // was clipped away entirely and could not be
+                            // clicked. The left gutter has no such neighbours.
                             ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
+                                egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     if is_effect {
                                         let enabled =
@@ -2957,15 +3048,16 @@ mod egui_impl {
                                                 });
                                             }
                                         }
-                                    } else if ui
-                                        .small_button("➕")
-                                        .on_hover_text(if wants_a_file(entry) {
+                                    } else if let Some(deck) = super::deck_add_buttons(
+                                        ui,
+                                        decked,
+                                        if wants_a_file(entry) {
                                             "Pick a clip"
                                         } else {
                                             "New layer"
-                                        })
-                                        .clicked()
-                                    {
+                                        },
+                                    ) {
+                                        pending_deck = deck;
                                         // The "Video…" entry has no file yet:
                                         // ask for one, and the picked-file path
                                         // below builds the layer.
@@ -2994,6 +3086,7 @@ mod egui_impl {
                                             queue_layer = Some(crate::PendingLayer {
                                                 source: entry.clone(),
                                                 saved: None,
+                                                deck,
                                             });
                                         }
                                     }
@@ -3171,14 +3264,15 @@ mod egui_impl {
                                         {
                                             queue_layer_delete = Some(saved.name.clone());
                                         }
-                                        if ui
-                                            .small_button("➕")
-                                            .on_hover_text("New layer from this saved one")
-                                            .clicked()
-                                        {
+                                        if let Some(deck) = super::deck_add_buttons(
+                                            ui,
+                                            decked,
+                                            "New layer from this saved one",
+                                        ) {
                                             queue_saved = Some(crate::PendingLayer {
                                                 source: saved.layer.source.clone(),
                                                 saved: Some((*saved).clone()),
+                                                deck,
                                             });
                                         }
                                         let fx = saved.layer.fx.len();
@@ -3527,6 +3621,7 @@ mod egui_impl {
                 };
                 {
                     state.pending_layers.push(crate::PendingLayer {
+                        deck: None,
                         source: crate::sources::SourceEntry {
                             id: name.to_lowercase().replace(' ', "_"),
                             name,

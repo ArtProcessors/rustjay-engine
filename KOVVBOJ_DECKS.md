@@ -339,12 +339,64 @@ exists.
    declaration order in `rustjay-isf`, GPU pixel test.~~ **Done** `ca7bcb4`.
 2. ~~**Diff-based apply** replacing full topology replay, with unit tests.~~
    **Done** `f6a91ca`.
-3. **Nested groups** — `parent` on `ChannelGroup` / `GroupDesc`, depth-first
-   render, cycle guard, 8-group cap, lazy allocation, per-subtree solo.
-4. **Deck roles** — two permanent top-level groups, transition pass between
-   their `group_out`, `"crossfader"` registered as a param, 0/1 early-out.
-5. **UI** — two stacks, crossfader strip, flanking previews, `[A][B]` library
-   buttons, transition picker.
+3. ~~**Nested groups** — `parent` on `ChannelGroup` / `GroupDesc`, depth-first
+   render, cycle guard, 8-group cap, lazy allocation, per-subtree solo.~~
+   **Done** `60681ef`. Solo scopes to *siblings* at each level, which is
+   stricter than "per deck subtree" and is the correct model. Fixed a second
+   pre-existing bug: the master pass anchored a group at its topmost member
+   outright, but only visits contributing channels — so muting the top layer of
+   a group stopped the whole group being blended.
+4. ~~**Deck roles** — two permanent top-level groups, transition pass between
+   their `group_out`, `"crossfader"` registered as a param, 0/1 early-out.~~
+   **Done** `2cff0d3` (mixer) + `255b74e` (kovvboj).
+
+   Two things the plan got wrong: `"crossfader"` was **already** registered by
+   `Mixer::parameters()`, so that item was zero work. And `prepare` holds
+   `&EngineState`, so the fader reaches `transition_progress` through
+   `EngineState::param_restore` — the queue the renderer drains each frame,
+   which exists for exactly this.
+
+   Not yet exercised in the app — no UI reaches the fader or picks a shader
+   until step 5, so this is compiled and unit-tested but not seen.
+5. **UI** — two stacks, crossfader strip, `[A][B]` library buttons, transition
+   picker: **done** `40d257d` + `86257a6`. Run and confirmed working: an iris
+   wipe rendering deck B over deck A mid-fader, the picker swapping shaders
+   live, the early-out showing deck A alone at rest.
+
+   **The crossfader dying after a deck edit was not a deck bug at all.**
+   `Mixer::decks`, both deck groups, their `rendered` flags and the deck
+   anchor were all intact through every edit — instrumented and read off a
+   live run. What broke was one layer down:
+   `CompositePipeline` caches bind groups on `(slot, dest_is_a)` for a
+   `generation`, on the assumption that a slot's source texture is fixed
+   while that key is. The deck slot is fed deck A's `group_out`, deck B's,
+   or the transition output purely according to the fader, and none of
+   those moves bumps `generation` — so the master kept sampling whichever
+   texture the entry was first built from. Parked at A it froze on deck A's
+   output, which is live, so the picture kept moving and only the fader
+   looked dead; the next unrelated edit invalidated the cache and the
+   picture jumped, which is what made an edit look like the cause. Fixed by
+   storing the source texture's allocation id with the cache entry
+   (`ae651c1`), with a GPU regression test. The same staleness covered a
+   group reallocating `group_out` after a mute, and a source swapped in
+   place.
+
+   **The library `[B]` button was unclickable** because the rows laid out
+   right-to-left against the panel edge that carries the scroll bar and the
+   resize grip — two buttons did not fit where one `➕` had, and the second
+   was clipped past the visible width at any panel size. The buttons moved
+   to the left gutter beside the star (`ce8072f`).
+
+   **Still open:** the flanking previews are placeholders —
+   `deck_preview_texture_ids` is read by the UI but nothing publishes it. Needs
+   a `pub` accessor for a group's `group_out`, kovvboj publishing the two deck
+   textures, and the host creating the destinations and doing the copy on the
+   render thread.
+
+   The [`KOVVBOJ_UI.md`] nested-panel bug did **not** bite: the crossfader strip
+   is another nested `Panel::bottom` inside the same child `Ui` and it lays out
+   correctly. What did bite was a deck drawing its own group header inside its
+   own column — unreadable at half width.
 6. **TAKE** — wire `AutoCrossfade` / `BeatSyncCrossfade` / sequencer to the
    crossfader base value. Already built; this only connects it.
 7. **Savable decks** — `SavedGroup` nesting, `instantiate_into(deck_uuid)`.
