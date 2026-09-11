@@ -1,9 +1,10 @@
 //! Spout source — receives frames from a Spout sender (Windows).
 //!
-//! The Windows counterpart to [`SyphonSource`](super::SyphonSource). Spout input
-//! is a CPU path (`rustjay-io` reads BGRA pixels from the sender's shared D3D11
-//! texture), so unlike Syphon's zero-copy texture blit we upload the bytes to a
-//! `Bgra8Unorm` texture each frame and blit that to the deck target.
+//! The Windows counterpart to [`SyphonSource`](super::SyphonSource). On Vulkan
+//! the sender's texture reaches us without leaving the GPU (`rustjay-io`'s
+//! `receive_gpu`) and is blitted straight to the deck target. Otherwise it is a
+//! CPU path: BGRA pixels read back from the sender's shared D3D11 texture and
+//! uploaded to a `Bgra8Unorm` texture each frame.
 
 use rustjay_core::{EffectInput, EffectInstance, EngineState, RenderCtx, RenderTarget};
 use rustjay_io::SpoutInputReceiver;
@@ -14,6 +15,8 @@ pub struct SpoutSource {
     receiver: SpoutInputReceiver,
     sender_name: String,
     connected: bool,
+    /// Frames come through `receive_gpu`, not the CPU upload below.
+    gpu: bool,
     pipeline: BlitPipeline,
     texture: Option<wgpu::Texture>,
     view: Option<wgpu::TextureView>,
@@ -27,6 +30,7 @@ impl SpoutSource {
             receiver: SpoutInputReceiver::new()?,
             sender_name: sender_name.into(),
             connected: false,
+            gpu: false,
             pipeline: BlitPipeline::new(device, rustjay_core::working_format()),
             texture: None,
             view: None,
@@ -61,7 +65,7 @@ impl SpoutSource {
 }
 
 impl EffectInstance for SpoutSource {
-    fn prepare(&mut self, _engine: &EngineState, _device: &wgpu::Device, _queue: &wgpu::Queue) {
+    fn prepare(&mut self, _engine: &EngineState, device: &wgpu::Device, _queue: &wgpu::Queue) {
         if !self.connected {
             match self.receiver.connect(&self.sender_name) {
                 Ok(()) => {
@@ -72,7 +76,11 @@ impl EffectInstance for SpoutSource {
             }
         }
         if self.connected {
-            self.receiver.try_receive_texture();
+            // The CPU readback and upload only when the GPU path can't run.
+            self.gpu = self.receiver.receive_gpu(device);
+            if !self.gpu {
+                self.receiver.try_receive_texture();
+            }
         }
     }
 
@@ -84,6 +92,14 @@ impl EffectInstance for SpoutSource {
         _engine: &EngineState,
     ) {
         if !self.connected {
+            return;
+        }
+
+        if self.gpu {
+            if let Some((_, view)) = self.receiver.gpu_frame() {
+                self.pipeline
+                    .blit(ctx.device, ctx.encoder, view, target.view, ctx.vertex_buffer);
+            }
             return;
         }
 
