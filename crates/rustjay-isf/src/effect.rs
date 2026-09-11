@@ -1051,7 +1051,10 @@ impl EffectPlugin for IsfEffect {
     // -----------------------------------------------------------------------
 
     fn init(&mut self, device: &wgpu::Device, _queue: &wgpu::Queue) {
-        let transpiled = match compile::generate_wgsl(&self.isf, &self.glsl_src) {
+        // Optimized SPIR-V for Vulkan only; see `compile::glsl_to_wgsl`. Hot
+        // reload comes back through here, so it always matches the device.
+        let optimize = device.adapter_info().backend == wgpu::Backend::Vulkan;
+        let transpiled = match compile::generate_wgsl_optimized(&self.isf, &self.glsl_src, optimize) {
             Ok(t) => t,
             Err(e) => {
                 self.transpile_error = Some(format!("Transpile error: {}", e));
@@ -1078,7 +1081,7 @@ impl EffectPlugin for IsfEffect {
         // shader, since the generated stage is what every other shader uses.
         let companion = std::fs::read_to_string(self.shader_path.with_extension("vs"))
             .ok()
-            .map(|src| compile::compile_vertex(&src, &manifest));
+            .map(|src| compile::compile_vertex(&src, &manifest, optimize));
         let vertex_wgsl = match &companion {
             Some(Ok(wgsl)) => wgsl.clone(),
             other => {
