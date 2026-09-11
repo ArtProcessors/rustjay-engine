@@ -289,7 +289,30 @@ pub fn compile_vertex(vs_src: &str, manifest: &IsfManifest) -> Result<String, St
 }
 
 /// GLSL (already preluded) → SPIR-V → naga → WGSL, proved well-formed for wgpu.
+///
+/// Optimized first: spirv-opt inlines every function. Unoptimized, each GLSL
+/// argument reaches the WGSL as a `ptr<function, _>` parameter, and AMD's
+/// Vulkan driver miscompiles calls that store through one — Film look and
+/// most raymarchers render black, while Metal and DX12 are fine. The naga
+/// SPIR-V is valid (checked with spirv-val and by reading it); glslang itself
+/// never emits that pattern, so the driver never sees it from anything else.
+/// Unoptimized stays as the fallback, and it names the variables in errors.
 fn glsl_to_wgsl(glsl: &str, kind: shaderc::ShaderKind, name: &str) -> Result<String, String> {
+    glsl_to_wgsl_at(glsl, kind, name, shaderc::OptimizationLevel::Performance).or_else(|opt_err| {
+        let wgsl = glsl_to_wgsl_at(glsl, kind, name, shaderc::OptimizationLevel::Zero)?;
+        log::warn!(
+            "ISF: {name} compiled unoptimized ({opt_err}); it may render black on AMD Vulkan"
+        );
+        Ok(wgsl)
+    })
+}
+
+fn glsl_to_wgsl_at(
+    glsl: &str,
+    kind: shaderc::ShaderKind,
+    name: &str,
+    level: shaderc::OptimizationLevel,
+) -> Result<String, String> {
     let compiler =
         shaderc::Compiler::new().map_err(|e| format!("shaderc: failed to create compiler: {e}"))?;
     let mut opts = shaderc::CompileOptions::new()
@@ -299,7 +322,7 @@ fn glsl_to_wgsl(glsl: &str, kind: shaderc::ShaderKind, name: &str) -> Result<Str
         shaderc::TargetEnv::Vulkan,
         shaderc::EnvVersion::Vulkan1_2 as u32,
     );
-    opts.set_optimization_level(shaderc::OptimizationLevel::Zero); // keep names for error msgs
+    opts.set_optimization_level(level);
     opts.set_include_callback(|requested, _ty, requesting, _depth| {
         resolve_include(requested, requesting)
     });

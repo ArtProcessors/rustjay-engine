@@ -54,10 +54,14 @@ struct Gpu {
 
 fn init_gpu() -> Result<Gpu, String> {
     let (device, queue) = pollster::block_on(async {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+        // `with_env`: WGPU_BACKEND=dx12|vulkan|metal to A/B one shader across backends.
+        let instance = wgpu::Instance::new(
+            wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            }
+            .with_env(),
+        );
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,

@@ -1066,6 +1066,11 @@ impl EffectPlugin for IsfEffect {
             self.shader_name,
             transpiled.wgsl
         );
+        // The WGSL is what reaches wgpu, so it is what to diff when one backend
+        // renders a shader differently from another.
+        if std::env::var_os("ISF_DUMP_WGSL").is_some() {
+            eprintln!("{}", transpiled.wgsl);
+        }
 
         // Compile shaders — wgpu panics on WGSL validation errors; catch_unwind prevents crash.
         // A companion `.vs` beside the shader is its own vertex stage; anything
@@ -1106,6 +1111,11 @@ impl EffectPlugin for IsfEffect {
                     .map(|ep| ep.name.clone())
             })
             .unwrap_or_else(|| "vs_main".to_string());
+        // The backend compiler (FXC/DXC, Metal, SPIR-V) can reject a shader
+        // naga accepted. Without a scope that error goes to the device's
+        // uncaptured handler, which panics the app; with it, only this effect
+        // fails to load. Dropping the guard on an early return pops it.
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let frag = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("ISF Fragment Shader"),
@@ -1213,6 +1223,12 @@ impl EffectPlugin for IsfEffect {
             multiview_mask: None,
             cache: None,
         });
+        // wgpu-core reports errors synchronously, so this is ready at once.
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            self.transpile_error = Some(format!("Shader compilation failed: {e}"));
+            log::error!("ISF: {} failed to compile: {e}", self.shader_name);
+            return;
+        }
 
         // Fullscreen quad
         let vertices = Vertex::quad_vertices();
