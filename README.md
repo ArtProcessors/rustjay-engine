@@ -150,10 +150,19 @@ cargo run -p ledmap-studio
 | Platform | Notes |
 |----------|-------|
 | macOS    | Metal GPU. Syphon I/O via [`syphon-core`](https://crates.io/crates/syphon-core) / [`syphon-wgpu`](https://crates.io/crates/syphon-wgpu) 0.2 — framework bundled, no separate install needed. |
-| Windows  | Vulkan or DX12. Spout I/O via DirectX interop. |
+| Windows  | Vulkan, DX12 fallback (force with `WGPU_BACKEND=dx12`). Spout I/O via DirectX interop. |
 | Linux    | Vulkan. V4L2 loopback output. |
 
 NDI requires the [NDI SDK](https://ndi.video/download-ndi-sdk/) installed and the `ndi` feature enabled (default on).
+
+> [!WARNING]
+> **AMD on Windows: turn off Radeon Enhanced Sync.** With it on, the AMD driver
+> crashes the app (`STATUS_HEAP_CORRUPTION`, `0xc0000374`, inside `amdxc64.dll`)
+> as soon as several windows present while an output is fullscreen, e.g. a
+> fullscreen projector plus both KOVVBOJ deck preview windows. The crash is in the
+> driver and happens on both DX12 and Vulkan. Turn it off in AMD Software under
+> **Gaming → Graphics**, or only for the app
+> via **Gaming → Games → ⋮ → Add a Game**.
 
 ## Tempo sync
 

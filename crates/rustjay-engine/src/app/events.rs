@@ -212,11 +212,26 @@ impl<P: EffectPlugin> ApplicationHandler<WindowAction> for App<P> {
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
 
+            // Windows: Vulkan where the driver has it, DX12 otherwise. Not
+            // DX12 only — its default shader compiler, FXC, rejects transpiled
+            // ISF shaders that Vulkan runs ("potentially uninitialized
+            // variable"), and DXC would mean an ATL build dependency or a DLL
+            // to ship.
+            //
+            // The AMD crash with several windows over a fullscreen output is
+            // Radeon Enhanced Sync, on either backend — see the README.
+            //
+            // `with_env` so a release build can still be pointed elsewhere or
+            // told to validate — `WGPU_BACKEND=dx12`, `WGPU_VALIDATION=1` —
+            // without a rebuild.
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            });
+            let instance = wgpu::Instance::new(
+                wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::all(),
+                    ..wgpu::InstanceDescriptor::new_without_display_handle()
+                }
+                .with_env(),
+            );
 
             self.wgpu_instance = Some(instance);
         }
