@@ -25,25 +25,25 @@ pub const DECK_B: &str = "deck_b";
 #[cfg(feature = "mixer")]
 pub const DEFAULT_TRANSITION: &str = "transition_dissolve.fs";
 
-/// Every transition shader the app ships, sorted, dissolve first.
+/// Every transition on offer, sorted by name, dissolve first.
 ///
-/// Named by convention (`transition_*.fs`) rather than by a manifest: the
-/// folder is the list, so dropping one in is all it takes.
+/// The app's own `transition_*.fs` by name, and any other library shader
+/// shaped like an ISF transition — see [`is_transition`] — so stock ISF and
+/// gl-transitions ports work unmodified, from the shader folder or any library
+/// folder. The library is the list: adding a shader to it is all it takes.
 #[cfg(feature = "mixer")]
-pub fn transition_shaders() -> Vec<std::path::PathBuf> {
-    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(shaders_dir())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
+pub fn transition_shaders(library: &[sources::SourceEntry]) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = library
+        .iter()
+        .filter_map(|e| e.path.clone())
         .filter(|p| {
-            p.extension().and_then(|e| e.to_str()) == Some("fs")
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("transition_"))
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("transition_"))
+                || std::fs::read_to_string(p).is_ok_and(|src| is_transition(&src))
         })
         .collect();
-    found.sort();
+    found.sort_by_key(|p| transition_name(p).to_lowercase());
     // The default first, so the list opens on what a crossfader normally does.
     if let Some(i) = found
         .iter()
@@ -52,6 +52,39 @@ pub fn transition_shaders() -> Vec<std::path::PathBuf> {
         found.swap(0, i);
     }
     found
+}
+
+/// Whether a shader is shaped like an ISF transition: exactly two image
+/// inputs — from, then to — and a float named `progress`. That is what the
+/// crossfader can drive: the decks go to the image inputs in order and the
+/// fader writes `progress`. A third image (a luma map, say) is one the
+/// crossfader has nothing to feed, so it does not count.
+#[cfg(feature = "mixer")]
+pub fn is_transition(src: &str) -> bool {
+    let Ok(header) = rustjay_isf::header::parse(src) else {
+        return false;
+    };
+    let images = header
+        .inputs
+        .iter()
+        .filter(|i| matches!(i.ty, isf::InputType::Image))
+        .count();
+    images == 2
+        && header
+            .inputs
+            .iter()
+            .any(|i| i.name == "progress" && matches!(i.ty, isf::InputType::Float(_)))
+}
+
+/// A transition's name as the picker shows it: the file name, less the
+/// bundled shaders' `transition_` prefix.
+#[cfg(feature = "mixer")]
+pub fn transition_name(path: &std::path::Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .trim_start_matches("transition_")
+        .to_string()
 }
 
 /// Load `path` as the mixer's transition effect.
@@ -208,6 +241,9 @@ pub enum Selection {
     GroupFx { group: String, fx: String },
     /// An FX slot in the master chain.
     MasterFx { fx: String },
+    /// The crossfader's transition: its shader's own inputs. `progress` is not
+    /// among them — the fader drives that.
+    Transition,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -242,6 +278,12 @@ pub struct KovvbojAppState {
     /// describes it.
     #[serde(skip)]
     pub library_generation: u64,
+    /// The transition picker's list, and the `library_generation` it was built
+    /// against. Building it reads every library shader's header, so it is
+    /// rebuilt when the library changes, not every frame the picker is open.
+    #[serde(skip)]
+    #[cfg(feature = "mixer")]
+    transitions: Option<(u64, Vec<std::path::PathBuf>)>,
     #[serde(skip)]
     pub pending_library_folder: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     pub ready: bool,
@@ -725,6 +767,18 @@ impl KovvbojAppState {
         job.step(analyzer, &mut self.previs, device, queue, quad);
     }
 
+    /// Every transition on offer; see [`transition_shaders`].
+    #[cfg(feature = "mixer")]
+    pub fn transitions(&mut self) -> &[std::path::PathBuf] {
+        let generation = self.library_generation;
+        if !matches!(&self.transitions, Some((g, _)) if *g == generation) {
+            self.transitions = Some((generation, transition_shaders(&self.registry.shaders)));
+        }
+        self.transitions
+            .as_ref()
+            .map_or(&[][..], |(_, list)| list.as_slice())
+    }
+
     /// Every shader in the library, for a scan to work through.
     pub fn library_shader_paths(&self) -> Vec<std::path::PathBuf> {
         self.registry
@@ -960,6 +1014,8 @@ impl Default for KovvbojAppState {
             scan: None,
             previs_analyzer: None,
             library_generation: 0,
+            #[cfg(feature = "mixer")]
+            transitions: None,
             pending_library_folder: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "laser")]
             laser: crate::ui::LaserTab::new(),
@@ -4601,6 +4657,25 @@ fn source_entry_to_api(e: &crate::sources::SourceEntry) -> KovvbojSourceEntry {
 #[cfg(all(test, feature = "mixer"))]
 mod tests {
     use super::*;
+
+    /// The shape the crossfader can drive: two images, then a float progress.
+    #[test]
+    fn a_transition_is_two_images_and_a_progress() {
+        const START: &str = r#"{"NAME":"startImage","TYPE":"image"}"#;
+        const END: &str = r#"{"NAME":"endImage","TYPE":"image"}"#;
+        const LUMA: &str = r#"{"NAME":"luma","TYPE":"image"}"#;
+        const PROGRESS: &str = r#"{"NAME":"progress","TYPE":"float","DEFAULT":0}"#;
+        let shader = |inputs: &[&str]| {
+            format!("/*{{\"INPUTS\":[{}]}}*/\nvoid main() {{}}\n", inputs.join(","))
+        };
+        assert!(is_transition(&shader(&[START, END, PROGRESS])));
+        // A filter: one image.
+        assert!(!is_transition(&shader(&[START, PROGRESS])));
+        // A luma wipe: a third image the crossfader has nothing to feed.
+        assert!(!is_transition(&shader(&[START, END, PROGRESS, LUMA])));
+        // Two images and no progress to drive.
+        assert!(!is_transition(&shader(&[START, END])));
+    }
 
     /// Minimal `EffectInstance` that records its param prefix.
     struct DummyFx {

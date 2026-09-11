@@ -1789,6 +1789,15 @@ mod egui_impl {
                     heading = format!("{name} · FX");
                     prefix = Some(format!("grp_{group}_fx{fx}_"));
                 }
+                crate::Selection::Transition => {
+                    heading = mixer
+                        .transition
+                        .as_ref()
+                        .and_then(|s| s.source_path.as_deref())
+                        .map(|p| format!("Transition · {}", crate::transition_name(p)))
+                        .unwrap_or_else(|| "Transition".to_string());
+                    prefix = Some(rustjay_mixer::TRANSITION_PREFIX.to_string());
+                }
             }
             let _ = &mut mixer;
         }
@@ -2033,6 +2042,11 @@ mod egui_impl {
             let mut any = pacing_block(ui, engine, &prefix, &heading);
             let descriptors = engine.param_descriptors.clone();
             for desc in descriptors.iter().filter(|d| d.id.starts_with(&prefix)) {
+                // The fader drives the transition's progress; a second control
+                // for it would only fight the first.
+                if desc.id == rustjay_mixer::TRANSITION_PROGRESS {
+                    continue;
+                }
                 if desc
                     .id
                     .strip_prefix(prefix.as_str())

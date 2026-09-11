@@ -1458,12 +1458,13 @@ impl KovvbojShell {
             .ok()
             .and_then(|m| m.transition.as_ref().and_then(|s| s.source_path.clone()));
         let current_name = current
-            .as_ref()
-            .and_then(|p| p.file_stem().and_then(|s| s.to_str()))
-            .map(|s| s.trim_start_matches("transition_").to_string())
+            .as_deref()
+            .map(crate::transition_name)
             .unwrap_or_else(|| "none".to_string());
 
         let mut pick: Option<std::path::PathBuf> = None;
+        let mut edit_transition = false;
+        let mut add_transition = false;
 
         // Deck A's output, the fader, deck B's output: one unit, centred on the
         // seam between the deck columns at any width. The fader stretches with
@@ -1516,24 +1517,49 @@ impl KovvbojShell {
                 });
             });
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("transition")
-                        .size(10.0)
-                        .color(rustjay_gui::egui_theme::colors::ink_4()),
-                );
+                // The label opens the transition's own settings in the
+                // inspector: softness, seed, direction, whatever it declares.
+                // A clickable label rather than a button, whose padding pushed
+                // the picker under the TAKE length at a 1200pt window.
+                let editing = state.selection == crate::Selection::Transition;
+                let ink = if editing {
+                    rustjay_gui::egui_theme::colors::amber()
+                } else {
+                    rustjay_gui::egui_theme::colors::ink_4()
+                };
+                if ui
+                    .add(
+                        egui::Label::new(egui::RichText::new("transition").size(10.0).color(ink))
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Edit the transition's settings")
+                    .clicked()
+                {
+                    edit_transition = true;
+                }
                 egui::ComboBox::from_id_salt("transition_pick")
                     .selected_text(current_name)
                     .width(140.0)
                     .show_ui(ui, |ui| {
-                        for path in crate::transition_shaders() {
-                            let name = path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("?")
-                                .trim_start_matches("transition_")
-                                .to_string();
+                        // First, not last: a library full of transitions puts
+                        // the end of this list a long scroll away.
+                        if ui
+                            .button("Add transition\u{2026}")
+                            .on_hover_text(
+                                "Any ISF transition: two image inputs and a float named progress",
+                            )
+                            .clicked()
+                        {
+                            add_transition = true;
+                        }
+                        ui.separator();
+                        for path in state.transitions() {
                             if ui
-                                .selectable_label(current.as_deref() == Some(&*path), name)
+                                .selectable_label(
+                                    current.as_deref() == Some(path.as_path()),
+                                    crate::transition_name(path),
+                                )
                                 .clicked()
                             {
                                 pick = Some(path.clone());
@@ -1582,6 +1608,12 @@ impl KovvbojShell {
         if let Some(path) = pick {
             state.pending_transition = Some(path);
         }
+        if edit_transition {
+            state.selection = crate::Selection::Transition;
+        }
+        if add_transition {
+            Self::add_transition(state, engine);
+        }
 
         // A click on a deck's preview pops that deck out into its own window.
         #[cfg(feature = "projection")]
@@ -1590,6 +1622,48 @@ impl KovvbojShell {
         }
         #[cfg(not(feature = "projection"))]
         let _ = clicked;
+    }
+
+    /// Pick a shader file and add it to the transitions: checked for the ISF
+    /// transition shape, copied into the shader library — so it is there on
+    /// the next launch — and loaded straight away.
+    #[cfg(feature = "mixer")]
+    fn add_transition(state: &mut crate::KovvbojAppState, engine: &Arc<Mutex<EngineState>>) {
+        let Some(picked) = rfd::FileDialog::new()
+            .set_title("Add a transition")
+            .add_filter("ISF shader", &["fs"])
+            .pick_file()
+        else {
+            return;
+        };
+        let notify = |message: String, level: rustjay_core::NotificationLevel| {
+            engine.lock().unwrap_or_else(|e| e.into_inner()).notify(
+                message,
+                level,
+                std::time::Duration::from_secs(6),
+            );
+        };
+        let name = crate::transition_name(&picked);
+        if !std::fs::read_to_string(&picked).is_ok_and(|src| crate::is_transition(&src)) {
+            notify(
+                format!(
+                    "{name} is not a transition: it needs exactly two image inputs and a float named progress."
+                ),
+                rustjay_core::NotificationLevel::Warning,
+            );
+            return;
+        }
+        match crate::sources::registry::install_shader(&picked, &crate::shaders_dir()) {
+            Ok(installed) => {
+                state.pending_transition = Some(installed);
+                // Into the list now, not whenever the folder watcher next looks.
+                state.rescan_library();
+            }
+            Err(e) => notify(
+                format!("Could not add {name}: {e}"),
+                rustjay_core::NotificationLevel::Error,
+            ),
+        }
     }
 
     /// Open a deck's image in its own small OS window.
