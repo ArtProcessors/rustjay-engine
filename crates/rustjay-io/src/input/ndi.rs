@@ -47,12 +47,26 @@ impl NdiPixelLayout {
     }
 }
 
+/// A frame the receive thread wrote straight into GPU-visible memory.
+///
+/// Rows are `bytes_per_row` apart — wgpu's copy alignment, not the frame's
+/// own row length. The consumer encodes a `copy_buffer_to_texture` and then
+/// hands the buffer back with [`NdiReceiver::remap_staged`].
+pub struct StagedFrame {
+    pub buffer: wgpu::Buffer,
+    pub bytes_per_row: u32,
+}
+
 /// A received NDI video frame
 pub struct NdiFrame {
     pub width: u32,
     pub height: u32,
-    /// Pixel data in `layout`.
+    /// Pixel data in `layout`. Empty when `staged` carries the frame instead.
     pub data: Vec<u8>,
+    /// Set when the consumer offered a buffer via
+    /// [`NdiReceiver::provide_staging`]: the frame is already on the GPU side
+    /// and `data` is empty.
+    pub staged: Option<StagedFrame>,
     pub layout: NdiPixelLayout,
     pub timestamp: Instant,
 }
@@ -72,17 +86,31 @@ pub struct NdiReceiver {
     /// one: the OS zero-fills and page-faults every new page.
     spare_tx: Sender<Vec<u8>>,
     spare_rx: CrossbeamReceiver<Vec<u8>>,
+    /// Mapped buffers the consumer offers, for the receive thread to write
+    /// frames into directly; see [`Self::provide_staging`].
+    staging_tx: Sender<wgpu::Buffer>,
+    staging_rx: CrossbeamReceiver<wgpu::Buffer>,
+    /// What the buffers now in circulation were sized for.
+    staging_key: Option<(u32, u32, NdiPixelLayout)>,
 }
+
+/// Buffers in the staging ring. Two are in flight at most (one being written,
+/// one being copied); the third covers the frame a re-map is still pending on.
+const STAGING_BUFFERS: usize = 3;
 
 impl NdiReceiver {
     /// Create a new NDI receiver (does not start receiving yet)
     pub fn new(source_name: impl Into<String>) -> Self {
         let (frame_tx, frame_rx) = channel::bounded(5);
         let (spare_tx, spare_rx) = channel::bounded(4);
+        let (staging_tx, staging_rx) = channel::bounded(STAGING_BUFFERS);
 
         Self {
             spare_tx,
             spare_rx,
+            staging_tx,
+            staging_rx,
+            staging_key: None,
             source_name: source_name.into(),
             receiver_thread: None,
             frame_tx,
@@ -109,6 +137,7 @@ impl NdiReceiver {
         let source_name = self.source_name.clone();
         let frame_tx = self.frame_tx.clone();
         let spare_rx = self.spare_rx.clone();
+        let staging_rx = self.staging_rx.clone();
         let running = Arc::clone(&self.running);
         let source_lost = Arc::clone(&self.source_lost);
         running.store(true, Ordering::SeqCst);
@@ -220,20 +249,57 @@ impl NdiReceiver {
                             _ => NdiPixelLayout::Bgra,
                         };
 
-                        // Strip NDI row stride/padding so bytes_per_row matches
-                        // what the GPU upload expects, into a recycled buffer
-                        // when the consumer has handed one back.
-                        let mut data = spare_rx.try_recv().unwrap_or_default();
-                        strip_stride(&mut data, frame_data, width, height, layout);
-                        let frame = NdiFrame {
+                        // Straight into GPU-visible memory when the consumer
+                        // has offered a buffer the right size for this frame:
+                        // then nothing ever copies it again on the CPU. A
+                        // buffer left over from another size is dropped.
+                        let bytes_per_row = (layout.row_bytes(width) as u32)
+                            .next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+                        let staged_size = u64::from(bytes_per_row) * u64::from(height);
+                        let staged = staging_rx
+                            .try_recv()
+                            .ok()
+                            .filter(|buffer| buffer.size() == staged_size)
+                            .and_then(|buffer| {
+                                match buffer.get_mapped_range_mut(..) {
+                                    Ok(mut view) => {
+                                        strip_stride_into_mapped(
+                                            &mut view,
+                                            frame_data,
+                                            width,
+                                            height,
+                                            layout,
+                                            bytes_per_row,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        log::warn!("[NDI] staging buffer not mapped: {e}");
+                                        return None;
+                                    }
+                                }
+                                buffer.unmap();
+                                Some(StagedFrame {
+                                    buffer,
+                                    bytes_per_row,
+                                })
+                            });
+
+                        // Otherwise strip NDI's row padding into a recycled
+                        // Vec, for the consumer to upload itself.
+                        let mut data = Vec::new();
+                        if staged.is_none() {
+                            data = spare_rx.try_recv().unwrap_or_default();
+                            strip_stride(&mut data, frame_data, width, height, layout);
+                        }
+
+                        let _ = frame_tx.try_send(NdiFrame {
                             width,
                             height,
                             data,
+                            staged,
                             layout,
                             timestamp: Instant::now(),
-                        };
-
-                        let _ = frame_tx.try_send(frame);
+                        });
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -292,6 +358,54 @@ impl NdiReceiver {
         let _ = self.spare_tx.try_send(data);
     }
 
+    /// Offer the receive thread mapped buffers to write frames into, so the
+    /// pixels never pass through a `Vec` and the render thread only encodes a
+    /// copy instead of paying for one ([`NdiFrame::staged`]).
+    ///
+    /// Call it each frame with the size now arriving: it rebuilds the ring
+    /// when that changes and does nothing when it hasn't. Buffers left from an
+    /// earlier size are dropped by the receive thread, which falls back to the
+    /// `Vec` path until the new ones arrive.
+    pub fn provide_staging(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        layout: NdiPixelLayout,
+    ) {
+        if width == 0 || height == 0 || self.staging_key == Some((width, height, layout)) {
+            return;
+        }
+        self.staging_key = Some((width, height, layout));
+        let bytes_per_row =
+            (layout.row_bytes(width) as u32).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        for _ in 0..STAGING_BUFFERS {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("NDI staging"),
+                size: u64::from(bytes_per_row) * u64::from(height),
+                // MAP_WRITE pairs only with COPY_SRC, which is all we need.
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            });
+            if self.staging_tx.try_send(buffer).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Hand a staged buffer back, once its copy has been *submitted*: it is
+    /// mapped again in the background and rejoins the pool. The callback only
+    /// runs while the device is polled, so poll it each frame.
+    pub fn remap_staged(&self, buffer: wgpu::Buffer) {
+        let tx = self.staging_tx.clone();
+        let returned = buffer.clone();
+        buffer.map_async(wgpu::MapMode::Write, .., move |result| {
+            if result.is_ok() {
+                let _ = tx.try_send(returned);
+            }
+        });
+    }
+
     /// Check if a new frame is available
     pub fn has_frame(&self) -> bool {
         !self.frame_rx.is_empty()
@@ -342,6 +456,32 @@ fn strip_stride(out: &mut Vec<u8>, data: &[u8], width: u32, height: u32, layout:
             // A short frame keeps its size; the missing rows are black.
             None => out.resize(out.len() + row_bytes, 0),
         }
+    }
+}
+
+/// [`strip_stride`], writing into mapped GPU memory instead of a `Vec`.
+///
+/// Rows land `bytes_per_row` apart, the copy alignment wgpu requires, which is
+/// usually wider than the frame's own rows. Writes only, never reads: the
+/// memory is typically write-combined, where reading is glacial.
+fn strip_stride_into_mapped(
+    out: &mut wgpu::BufferViewMut,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    layout: NdiPixelLayout,
+    bytes_per_row: u32,
+) {
+    let row_bytes = layout.row_bytes(width);
+    let rows = height as usize;
+    let stride = if rows > 0 { data.len() / rows } else { row_bytes };
+    for y in 0..rows {
+        let Some(row) = data.get(y * stride..y * stride + row_bytes) else {
+            // A short frame leaves the rest of the buffer as it was.
+            break;
+        };
+        let dst = y * bytes_per_row as usize;
+        out.slice(dst..dst + row_bytes).copy_from_slice(row);
     }
 }
 

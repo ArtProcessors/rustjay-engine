@@ -18,6 +18,9 @@ pub struct NdiSource {
     /// Layout of the frames arriving now. A sender can change it mid-stream
     /// (alpha appearing flips 4:2:2 to BGRA), which resizes the texture.
     layout: rustjay_io::NdiPixelLayout,
+    /// Staging buffers whose copy was encoded last frame, so it has been
+    /// submitted by now and they can be mapped again.
+    pending_remap: Vec<wgpu::Buffer>,
 }
 
 impl NdiSource {
@@ -35,6 +38,7 @@ impl NdiSource {
             width: 1920,
             height: 1080,
             layout: rustjay_io::NdiPixelLayout::Bgra,
+            pending_remap: Vec::new(),
         }
     }
 
@@ -92,7 +96,7 @@ impl NdiSource {
 }
 
 impl EffectInstance for NdiSource {
-    fn prepare(&mut self, _engine: &EngineState, _device: &wgpu::Device, _queue: &wgpu::Queue) {
+    fn prepare(&mut self, _engine: &EngineState, device: &wgpu::Device, _queue: &wgpu::Queue) {
         if !self.started {
             if let Err(e) = self.receiver.start() {
                 log::warn!("[NdiSource] Failed to start receiver: {}", e);
@@ -101,6 +105,20 @@ impl EffectInstance for NdiSource {
                 log::info!("[NdiSource] Started receiver for '{}'", self.source_name);
             }
         }
+
+        // Last frame's copies have been submitted, so those buffers can be
+        // mapped again. Their callbacks — and the re-map itself — only run
+        // while the device is polled, which the engine does not do.
+        for buffer in self.pending_remap.drain(..) {
+            self.receiver.remap_staged(buffer);
+        }
+        device.poll(wgpu::PollType::Poll).ok();
+
+        // Offer buffers for the size now arriving: the receive thread writes
+        // frames straight into them, so nothing copies them on this thread.
+        let (width, height) = self.receiver.resolution();
+        self.receiver
+            .provide_staging(device, width, height, self.layout);
     }
 
     fn render_to(
@@ -117,8 +135,31 @@ impl EffectInstance for NdiSource {
         if let Some(frame) = self.receiver.get_latest_frame() {
             self.ensure_texture(ctx.device, frame.width, frame.height, frame.layout);
             let texel_width = self.texel_width();
-            if let Some(ref texture) = self.texture {
-                ctx.queue.write_texture(
+            let size = wgpu::Extent3d {
+                width: texel_width,
+                height: frame.height,
+                depth_or_array_layers: 1,
+            };
+            match (self.texture.as_ref(), frame.staged.as_ref()) {
+                // Already in GPU-visible memory: the GPU does the rest.
+                (Some(texture), Some(staged)) => ctx.encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &staged.buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(staged.bytes_per_row),
+                            rows_per_image: Some(frame.height),
+                        },
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    size,
+                ),
+                (Some(texture), None) => ctx.queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture,
                         mip_level: 0,
@@ -131,15 +172,16 @@ impl EffectInstance for NdiSource {
                         bytes_per_row: Some(texel_width * 4),
                         rows_per_image: Some(frame.height),
                     },
-                    wgpu::Extent3d {
-                        width: texel_width,
-                        height: frame.height,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                    size,
+                ),
+                (None, _) => {}
             }
-            // write_texture has its own copy now; the buffer goes back for reuse.
-            self.receiver.recycle(frame.data);
+            match frame.staged {
+                // Re-mapped next frame, once this copy has been submitted.
+                Some(staged) => self.pending_remap.push(staged.buffer),
+                // write_texture made its own copy; the Vec goes back for reuse.
+                None => self.receiver.recycle(frame.data),
+            }
         }
 
         if let Some(ref view) = self.view {
