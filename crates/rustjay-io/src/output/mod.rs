@@ -60,7 +60,11 @@ impl ReadbackPool {
     /// Harvest the *previous* slot if its map has completed, returning the
     /// BGRA pixel data.  This never blocks — if the GPU hasn't finished yet
     /// we simply skip this frame's readback.
-    fn harvest_previous(&mut self) -> Option<(Vec<u8>, u32, u32)> {
+    ///
+    /// `spare` is refilled rather than a new buffer allocated: a frame is
+    /// 14.7 MB at 2560×1440, and a fresh one costs the kernel a page fault per
+    /// page. The recorder hands its used buffers back for exactly this.
+    fn harvest_previous(&mut self, spare: Option<Vec<u8>>) -> Option<(Vec<u8>, u32, u32)> {
         let prev = (self.current + READBACK_SLOTS - 1) % READBACK_SLOTS;
         let slot = &mut self.slots[prev];
 
@@ -84,16 +88,18 @@ impl ReadbackPool {
                                 .slice(..)
                                 .get_mapped_range()
                                 .expect("buffer mapped by map_async");
+                            let mut tight = spare.unwrap_or_default();
+                            tight.clear();
+                            tight.reserve(row * h as usize);
                             if stride == row {
-                                view.to_vec()
+                                tight.extend_from_slice(&view);
                             } else {
                                 // Drop the per-row padding wgpu required for the copy.
-                                let mut tight = Vec::with_capacity(row * h as usize);
                                 for y in 0..h as usize {
                                     tight.extend_from_slice(&view[y * stride..y * stride + row]);
                                 }
-                                tight
                             }
+                            tight
                         };
                         buffer.unmap();
                         // Return the unmapped buffer to the slot cache so submit_copy
@@ -551,8 +557,12 @@ impl OutputManager {
             // frame's map_async complete before we try to harvest.
             device.poll(wgpu::PollType::Poll).ok();
 
+            // Refill a buffer the recorder has finished with, rather than
+            // allocating a frame's worth every frame.
+            let spare = self.recorder.as_mut().and_then(|rec| rec.reclaim());
+
             // Harvest the previous frame's data (never blocks).
-            if let Some((_data, _width, _height)) = self.readback_pool.harvest_previous() {
+            if let Some((_data, _width, _height)) = self.readback_pool.harvest_previous(spare) {
                 #[cfg(feature = "ndi")]
                 if let Some(ref mut sender) = self.ndi_output
                     && let Err(e) = sender.submit_frame(&_data, _width, _height) {
@@ -578,8 +588,10 @@ impl OutputManager {
                     led.submit(&_data, _width, _height);
                 }
 
+                // Last, so the others have had their look: the recorder takes
+                // the buffer itself rather than copying it.
                 if let Some(ref mut rec) = self.recorder
-                    && !rec.encode_frame(&_data) {
+                    && !rec.encode_frame(_data) {
                         log::warn!("[OutputManager] recorder encode failed — stopping");
                         self.stop_recording();
                     }

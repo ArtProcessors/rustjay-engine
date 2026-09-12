@@ -247,20 +247,27 @@ impl Recorder {
         })
     }
 
+    /// A buffer the writer has finished with, to refill instead of allocating
+    /// — see [`Self::encode_frame`], which takes the frame by value.
+    pub fn reclaim(&mut self) -> Option<Vec<u8>> {
+        self.stash.take().or_else(|| self.spare.try_recv().ok())
+    }
+
     /// Queue one BGRA frame for the writer thread.
     ///
-    /// `data` must be `width * height * 4` bytes in BGRA order.
+    /// `frame` must be `width * height * 4` bytes in BGRA order, and is taken
+    /// by value: at 2560×1440 a copy here cost 6% of the render thread.
     /// Returns `false` once the ffmpeg pipe has closed.
     ///
     /// Never blocks. When the encoder is behind, the frame is dropped and
     /// counted rather than the render thread waiting on it: the show keeps its
     /// framerate, and ffmpeg pads the gap from the wallclock timestamps.
-    pub fn encode_frame(&mut self, data: &[u8]) -> bool {
-        if data.len() != (self.width * self.height * 4) as usize {
+    pub fn encode_frame(&mut self, frame: Vec<u8>) -> bool {
+        if frame.len() != (self.width * self.height * 4) as usize {
             log::warn!(
                 "[Recorder] frame size mismatch: expected {}, got {}",
                 self.width * self.height * 4,
-                data.len()
+                frame.len()
             );
             return false;
         }
@@ -271,15 +278,7 @@ impl Recorder {
             return false;
         };
 
-        let mut buffer = self
-            .stash
-            .take()
-            .or_else(|| self.spare.try_recv().ok())
-            .unwrap_or_default();
-        buffer.clear();
-        buffer.extend_from_slice(data);
-
-        match frames.try_send(buffer) {
+        match frames.try_send(frame) {
             Ok(()) => {
                 self.frame_count += 1;
                 true
