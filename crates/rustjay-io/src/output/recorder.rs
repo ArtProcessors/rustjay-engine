@@ -6,11 +6,18 @@
 //!
 //! HAP Q encode is handled separately via the local `hap-rs` workspace.
 
+use crossbeam::channel::{Receiver, Sender, TrySendError};
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+
+/// Frames the writer thread may be behind before the render thread starts
+/// dropping them. A little slack absorbs an encoder hiccup; more would only
+/// delay the drop while hoarding frames.
+const QUEUE_FRAMES: usize = 3;
 
 /// Target codec for the recorder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,8 +79,20 @@ impl RecorderCodec {
 pub struct Recorder {
     /// ffmpeg child process.
     child: Option<Child>,
-    /// Pipe into ffmpeg stdin.
-    stdin: Option<ChildStdin>,
+    /// Frames queued for the writer thread. Dropped by [`Recorder::finish`]
+    /// to tell it to drain and close the pipe.
+    frames: Option<Sender<Vec<u8>>>,
+    /// Buffers the writer hands back, so recording doesn't allocate a frame's
+    /// worth of memory every frame.
+    spare: Receiver<Vec<u8>>,
+    /// A buffer kept back when the queue was full, rather than freeing it.
+    stash: Option<Vec<u8>>,
+    /// Owns the pipe into ffmpeg; see [`Recorder::encode_frame`].
+    writer: Option<JoinHandle<()>>,
+    /// Set by the writer once the pipe has closed.
+    failed: Arc<AtomicBool>,
+    /// Frames dropped because the encoder was behind.
+    dropped: Arc<AtomicU64>,
     width: u32,
     height: u32,
     _fps: f32,
@@ -169,12 +188,36 @@ impl Recorder {
             .stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
-        let stdin = child
+        let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to open ffmpeg stdin"))?;
 
         log_stderr(&mut child, "ffmpeg");
+
+        // The pipe write is what used to cost the show its framerate: ~8 MB a
+        // frame at 1080p, blocking the render thread whenever ffmpeg fell
+        // behind. It lives on this thread now; the render thread only hands a
+        // buffer over, and the writer hands it back for reuse.
+        let (frames_tx, frames_rx) = crossbeam::channel::bounded::<Vec<u8>>(QUEUE_FRAMES);
+        let (spare_tx, spare) = crossbeam::channel::bounded::<Vec<u8>>(QUEUE_FRAMES + 1);
+        let failed = Arc::new(AtomicBool::new(false));
+        let writer_failed = Arc::clone(&failed);
+        let writer = std::thread::Builder::new()
+            .name("recorder-writer".into())
+            .spawn(move || {
+                // Ends once the sender drops, having drained what was queued.
+                for frame in frames_rx {
+                    if stdin.write_all(&frame).is_err() {
+                        log::warn!("[Recorder] ffmpeg stdin closed");
+                        writer_failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    let _ = spare_tx.try_send(frame);
+                }
+                // Closing the pipe is what tells ffmpeg to finish the file.
+                drop(stdin);
+            })?;
 
         log::info!(
             "[Recorder] started {} {}x{} @ {:.2} fps{} → {}",
@@ -188,7 +231,12 @@ impl Recorder {
 
         Ok(Self {
             child: Some(child),
-            stdin: Some(stdin),
+            frames: Some(frames_tx),
+            spare,
+            stash: None,
+            writer: Some(writer),
+            failed,
+            dropped: Arc::new(AtomicU64::new(0)),
             width,
             height,
             _fps: fps,
@@ -199,29 +247,57 @@ impl Recorder {
         })
     }
 
-    /// Encode one BGRA frame.
+    /// A buffer the writer has finished with, to refill instead of allocating
+    /// — see [`Self::encode_frame`], which takes the frame by value.
+    pub fn reclaim(&mut self) -> Option<Vec<u8>> {
+        self.stash.take().or_else(|| self.spare.try_recv().ok())
+    }
+
+    /// Queue one BGRA frame for the writer thread.
     ///
-    /// `data` must be `width * height * 4` bytes in BGRA order.
-    /// Returns `false` if the ffmpeg pipe has closed.
-    pub fn encode_frame(&mut self, data: &[u8]) -> bool {
-        if data.len() != (self.width * self.height * 4) as usize {
+    /// `frame` must be `width * height * 4` bytes in BGRA order, and is taken
+    /// by value: at 2560×1440 a copy here cost 6% of the render thread.
+    /// Returns `false` once the ffmpeg pipe has closed.
+    ///
+    /// Never blocks. When the encoder is behind, the frame is dropped and
+    /// counted rather than the render thread waiting on it: the show keeps its
+    /// framerate, and ffmpeg pads the gap from the wallclock timestamps.
+    pub fn encode_frame(&mut self, frame: Vec<u8>) -> bool {
+        if frame.len() != (self.width * self.height * 4) as usize {
             log::warn!(
                 "[Recorder] frame size mismatch: expected {}, got {}",
                 self.width * self.height * 4,
-                data.len()
+                frame.len()
             );
             return false;
         }
-        if let Some(ref mut stdin) = self.stdin {
-            if stdin.write_all(data).is_err() {
-                log::warn!("[Recorder] ffmpeg stdin closed");
-                return false;
-            }
-        } else {
+        if self.failed.load(Ordering::Relaxed) {
             return false;
         }
-        self.frame_count += 1;
-        true
+        let Some(frames) = self.frames.as_ref() else {
+            return false;
+        };
+
+        match frames.try_send(frame) {
+            Ok(()) => {
+                self.frame_count += 1;
+                true
+            }
+            Err(TrySendError::Full(buffer)) => {
+                let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                // Every drop is one log line too many at 60 fps; powers of two
+                // say it is happening and roughly how much.
+                if dropped.is_power_of_two() {
+                    log::warn!("[Recorder] encoder behind — {dropped} frame(s) dropped");
+                }
+                self.stash = Some(buffer);
+                true
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.failed.store(true, Ordering::Relaxed);
+                false
+            }
+        }
     }
 
     /// Finish encoding and wait for ffmpeg to exit.
@@ -236,8 +312,19 @@ impl Recorder {
         if let Some(ref mut a) = audio {
             a.stop();
         }
-        drop(self.stdin.take());
+        // Close the queue, then let the writer drain what is left and close
+        // the pipe — the tail of the take is still in flight.
+        drop(self.frames.take());
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
         let status = self.child.take().unwrap().wait()?;
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        if dropped > 0 {
+            log::warn!(
+                "[Recorder] {dropped} frame(s) dropped while encoding — the file is short by that many"
+            );
+        }
         let audio_path = audio.and_then(AudioCapture::wait);
         if !status.success() {
             return Err(anyhow::anyhow!("ffmpeg exited with status: {}", status));
