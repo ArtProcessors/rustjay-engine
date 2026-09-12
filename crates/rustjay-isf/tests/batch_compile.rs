@@ -69,8 +69,16 @@ fn corpus_compile_rate() {
         eprintln!("ISF_CORPUS_DIR not set; skipping extended corpus test");
         return;
     };
+    // cargo runs the test binary from the package directory, so a relative path —
+    // which is what the docs hand you — resolves against crates/rustjay-isf and panics.
+    let dir = PathBuf::from(&dir);
+    let dir = if dir.is_relative() {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(dir)
+    } else {
+        dir
+    };
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
-        .expect("corpus dir")
+        .unwrap_or_else(|e| panic!("corpus dir {}: {e}", dir.display()))
         .map(|e| e.expect("dir entry").path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("fs"))
         .collect();
@@ -103,7 +111,7 @@ fn corpus_compile_rate() {
         }
     }
     let total = entries.len();
-    eprintln!("\n=== corpus {} ===", dir);
+    eprintln!("\n=== corpus {} ===", dir.display());
     eprintln!("{ok}/{total} OK ({:.1}%)", ok as f64 / total.max(1) as f64 * 100.0);
     for (cat, names) in &categories {
         eprintln!("  [{cat}] ({}): {}", names.len(), names.join(", "));
