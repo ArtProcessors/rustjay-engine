@@ -92,11 +92,19 @@ pub struct NdiReceiver {
     staging_rx: CrossbeamReceiver<wgpu::Buffer>,
     /// What the buffers now in circulation were sized for.
     staging_key: Option<(u32, u32, NdiPixelLayout)>,
+    /// How many buffers have been made for that size. Buffers leave the ring
+    /// for good — dropped for the wrong size, or awaiting a re-map — so the
+    /// count bounds how many replacements get made.
+    staging_made: usize,
 }
 
 /// Buffers in the staging ring. Two are in flight at most (one being written,
 /// one being copied); the third covers the frame a re-map is still pending on.
 const STAGING_BUFFERS: usize = 3;
+
+/// Ceiling on replacements for one frame size, so a path that keeps losing
+/// buffers can't allocate without end.
+const STAGING_MAX: usize = 6;
 
 impl NdiReceiver {
     /// Create a new NDI receiver (does not start receiving yet)
@@ -111,6 +119,7 @@ impl NdiReceiver {
             staging_tx,
             staging_rx,
             staging_key: None,
+            staging_made: 0,
             source_name: source_name.into(),
             receiver_thread: None,
             frame_tx,
@@ -237,6 +246,9 @@ impl NdiReceiver {
 
             // Receive loop
             let mut consecutive_errors = 0u32;
+            // Which path frames are taking, said once each way round.
+            let mut on_gpu_path = false;
+            let mut fallbacks = 0u64;
             while running.load(Ordering::SeqCst) {
                 match receiver.capture_video_ref(Duration::from_millis(100)) {
                     Ok(Some(video_frame)) => {
@@ -259,7 +271,17 @@ impl NdiReceiver {
                         let staged = staging_rx
                             .try_recv()
                             .ok()
-                            .filter(|buffer| buffer.size() == staged_size)
+                            .filter(|buffer| {
+                                let fits = buffer.size() == staged_size;
+                                if !fits {
+                                    log::debug!(
+                                        "[NDI] staging buffer is {} bytes, this frame needs \
+                                         {staged_size} — dropped",
+                                        buffer.size()
+                                    );
+                                }
+                                fits
+                            })
                             .and_then(|buffer| {
                                 match buffer.get_mapped_range_mut(..) {
                                     Ok(mut view) => {
@@ -290,6 +312,18 @@ impl NdiReceiver {
                         if staged.is_none() {
                             data = spare_rx.try_recv().unwrap_or_default();
                             strip_stride(&mut data, frame_data, width, height, layout);
+                            fallbacks += 1;
+                            if on_gpu_path || fallbacks == 120 {
+                                on_gpu_path = false;
+                                log::info!(
+                                    "[NDI] no staging buffer free — frames are going through \
+                                     the CPU upload path"
+                                );
+                            }
+                        } else if !on_gpu_path {
+                            on_gpu_path = true;
+                            fallbacks = 0;
+                            log::info!("[NDI] frames are landing straight in GPU memory");
                         }
 
                         let _ = frame_tx.try_send(NdiFrame {
@@ -373,13 +407,27 @@ impl NdiReceiver {
         height: u32,
         layout: NdiPixelLayout,
     ) {
-        if width == 0 || height == 0 || self.staging_key == Some((width, height, layout)) {
+        if width == 0 || height == 0 {
             return;
         }
-        self.staging_key = Some((width, height, layout));
+        let key = (width, height, layout);
+        let fresh = self.staging_key != Some(key);
+        if fresh {
+            // A new size: buffers for the old one are dropped by the receive
+            // thread as they come round.
+            self.staging_key = Some(key);
+            self.staging_made = 0;
+        } else if !self.staging_rx.is_empty() || self.staging_made >= STAGING_MAX {
+            // Buffers are already waiting, or enough are in circulation.
+            return;
+        }
+        // Refill when the ring runs dry, not only when the size changes: a
+        // buffer is gone for good once the thread drops it for the wrong size,
+        // and a re-map can lag. Without this the ring empties once and every
+        // frame falls back to the Vec path for good.
         let bytes_per_row =
             (layout.row_bytes(width) as u32).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        for _ in 0..STAGING_BUFFERS {
+        for _ in 0..if fresh { STAGING_BUFFERS } else { 1 } {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("NDI staging"),
                 size: u64::from(bytes_per_row) * u64::from(height),
@@ -390,6 +438,7 @@ impl NdiReceiver {
             if self.staging_tx.try_send(buffer).is_err() {
                 break;
             }
+            self.staging_made += 1;
         }
     }
 
