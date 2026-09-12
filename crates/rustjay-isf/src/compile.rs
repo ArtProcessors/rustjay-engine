@@ -132,6 +132,16 @@ fn resolve_include(requested: &str, requesting: &str) -> shaderc::IncludeCallbac
 }
 
 pub fn compile(isf: &Isf, glsl_src: &str) -> Result<CompileOutput, String> {
+    compile_optimized(isf, glsl_src, false)
+}
+
+/// [`compile`], through spirv-opt when `optimize`; see [`glsl_to_wgsl`] for
+/// when that is wanted.
+pub fn compile_optimized(
+    isf: &Isf,
+    glsl_src: &str,
+    optimize: bool,
+) -> Result<CompileOutput, String> {
     let body = strip_header(glsl_src)?;
     let merged = build_glsl(
         isf,
@@ -140,7 +150,7 @@ pub fn compile(isf: &Isf, glsl_src: &str) -> Result<CompileOutput, String> {
         &crate::header::render_settings(glsl_src),
     );
 
-    let wgsl = glsl_to_wgsl(&merged.glsl, shaderc::ShaderKind::Fragment, "isf.fs")?;
+    let wgsl = glsl_to_wgsl(&merged.glsl, shaderc::ShaderKind::Fragment, "isf.fs", optimize)?;
     let frag_entry = naga::front::wgsl::parse_str(&wgsl)
         .ok()
         .and_then(|m| {
@@ -180,7 +190,11 @@ pub fn compile(isf: &Isf, glsl_src: &str) -> Result<CompileOutput, String> {
 ///
 /// Locations come from `manifest`, so the outputs land where the fragment
 /// stage reads them.
-pub fn compile_vertex(vs_src: &str, manifest: &IsfManifest) -> Result<String, String> {
+pub fn compile_vertex(
+    vs_src: &str,
+    manifest: &IsfManifest,
+    optimize: bool,
+) -> Result<String, String> {
     if !vs_src.contains("vertShaderInit") {
         return Err("not an ISF vertex shader (no isf_vertShaderInit)".into());
     }
@@ -284,12 +298,48 @@ pub fn compile_vertex(vs_src: &str, manifest: &IsfManifest) -> Result<String, St
     ));
     p.push_str(&body);
 
-    let wgsl = glsl_to_wgsl(&p, shaderc::ShaderKind::Vertex, "isf.vs")?;
+    let wgsl = glsl_to_wgsl(&p, shaderc::ShaderKind::Vertex, "isf.vs", optimize)?;
     Ok(wgsl)
 }
 
 /// GLSL (already preluded) → SPIR-V → naga → WGSL, proved well-formed for wgpu.
-fn glsl_to_wgsl(glsl: &str, kind: shaderc::ShaderKind, name: &str) -> Result<String, String> {
+///
+/// `optimize` is for AMD's Vulkan driver. Unoptimized, each GLSL argument
+/// reaches the WGSL as a `ptr<function, _>` parameter, and the driver
+/// miscompiles calls that store through one — Film look and most raymarchers
+/// render black. spirv-opt inlines those calls away. The naga SPIR-V is valid
+/// (spirv-val, and read by hand); glslang itself never emits that pattern, so
+/// the driver never sees it from anything else. When naga rejects the
+/// optimized SPIR-V, unoptimized is the fallback, and it names variables in
+/// errors.
+// ponytail: a backend flag in a transpiler, on purpose. Optimizing everywhere
+// would be simpler, but it moves ~4% of renders on Metal and DX12 — shaders
+// balanced on a tan() pole and the like, where FP reassociation picks the
+// pixel — so only the backend that needs it pays.
+fn glsl_to_wgsl(
+    glsl: &str,
+    kind: shaderc::ShaderKind,
+    name: &str,
+    optimize: bool,
+) -> Result<String, String> {
+    if !optimize {
+        return glsl_to_wgsl_at(glsl, kind, name, shaderc::OptimizationLevel::Zero);
+    }
+    glsl_to_wgsl_at(glsl, kind, name, shaderc::OptimizationLevel::Performance).or_else(|opt_err| {
+        let wgsl = glsl_to_wgsl_at(glsl, kind, name, shaderc::OptimizationLevel::Zero)?;
+        log::warn!(
+            "ISF: {name} compiled unoptimized ({opt_err}); it may render black on AMD Vulkan"
+        );
+        Ok(wgsl)
+    })
+}
+
+fn glsl_to_wgsl_at(
+    glsl: &str,
+    kind: shaderc::ShaderKind,
+    name: &str,
+    level: shaderc::OptimizationLevel,
+) -> Result<String, String> {
     let compiler =
         shaderc::Compiler::new().map_err(|e| format!("shaderc: failed to create compiler: {e}"))?;
     let mut opts = shaderc::CompileOptions::new()
@@ -299,7 +349,7 @@ fn glsl_to_wgsl(glsl: &str, kind: shaderc::ShaderKind, name: &str) -> Result<Str
         shaderc::TargetEnv::Vulkan,
         shaderc::EnvVersion::Vulkan1_2 as u32,
     );
-    opts.set_optimization_level(shaderc::OptimizationLevel::Zero); // keep names for error msgs
+    opts.set_optimization_level(level);
     opts.set_include_callback(|requested, _ty, requesting, _depth| {
         resolve_include(requested, requesting)
     });
@@ -1522,7 +1572,16 @@ pub struct Transpiled {
 /// Transpile ISF GLSL source to WGSL via the prelude-GLSL + shaderc + naga pipeline
 /// ([`compile`]). `uniform_index` is vestigial (legacy flat-slot layout).
 pub fn generate_wgsl(isf: &Isf, glsl_src: &str) -> Result<Transpiled, String> {
-    let out = compile(isf, glsl_src)?;
+    generate_wgsl_optimized(isf, glsl_src, false)
+}
+
+/// [`generate_wgsl`], through spirv-opt when `optimize`; see [`compile_optimized`].
+pub fn generate_wgsl_optimized(
+    isf: &Isf,
+    glsl_src: &str,
+    optimize: bool,
+) -> Result<Transpiled, String> {
+    let out = compile_optimized(isf, glsl_src, optimize)?;
 
     // Legacy fields, kept for API compatibility.
     let glsl_body = strip_header(glsl_src).unwrap_or_default();

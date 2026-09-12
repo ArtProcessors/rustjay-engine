@@ -1051,7 +1051,10 @@ impl EffectPlugin for IsfEffect {
     // -----------------------------------------------------------------------
 
     fn init(&mut self, device: &wgpu::Device, _queue: &wgpu::Queue) {
-        let transpiled = match compile::generate_wgsl(&self.isf, &self.glsl_src) {
+        // Optimized SPIR-V for Vulkan only; see `compile::glsl_to_wgsl`. Hot
+        // reload comes back through here, so it always matches the device.
+        let optimize = device.adapter_info().backend == wgpu::Backend::Vulkan;
+        let transpiled = match compile::generate_wgsl_optimized(&self.isf, &self.glsl_src, optimize) {
             Ok(t) => t,
             Err(e) => {
                 self.transpile_error = Some(format!("Transpile error: {}", e));
@@ -1066,6 +1069,11 @@ impl EffectPlugin for IsfEffect {
             self.shader_name,
             transpiled.wgsl
         );
+        // The WGSL is what reaches wgpu, so it is what to diff when one backend
+        // renders a shader differently from another.
+        if std::env::var_os("ISF_DUMP_WGSL").is_some() {
+            eprintln!("{}", transpiled.wgsl);
+        }
 
         // Compile shaders — wgpu panics on WGSL validation errors; catch_unwind prevents crash.
         // A companion `.vs` beside the shader is its own vertex stage; anything
@@ -1073,7 +1081,7 @@ impl EffectPlugin for IsfEffect {
         // shader, since the generated stage is what every other shader uses.
         let companion = std::fs::read_to_string(self.shader_path.with_extension("vs"))
             .ok()
-            .map(|src| compile::compile_vertex(&src, &manifest));
+            .map(|src| compile::compile_vertex(&src, &manifest, optimize));
         let vertex_wgsl = match &companion {
             Some(Ok(wgsl)) => wgsl.clone(),
             other => {
@@ -1106,6 +1114,11 @@ impl EffectPlugin for IsfEffect {
                     .map(|ep| ep.name.clone())
             })
             .unwrap_or_else(|| "vs_main".to_string());
+        // The backend compiler (FXC/DXC, Metal, SPIR-V) can reject a shader
+        // naga accepted. Without a scope that error goes to the device's
+        // uncaptured handler, which panics the app; with it, only this effect
+        // fails to load. Dropping the guard on an early return pops it.
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let frag = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("ISF Fragment Shader"),
@@ -1213,6 +1226,12 @@ impl EffectPlugin for IsfEffect {
             multiview_mask: None,
             cache: None,
         });
+        // wgpu-core reports errors synchronously, so this is ready at once.
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            self.transpile_error = Some(format!("Shader compilation failed: {e}"));
+            log::error!("ISF: {} failed to compile: {e}", self.shader_name);
+            return;
+        }
 
         // Fullscreen quad
         let vertices = Vertex::quad_vertices();

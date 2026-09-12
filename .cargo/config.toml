@@ -11,3 +11,13 @@ linker = "arm-linux-gnueabihf-gcc"
 # but only VS 2019's bundled cmake available).
 [env]
 CMAKE_GENERATOR = "Ninja"
+# ...which costs optimization on MSVC: the cmake crate doesn't see a
+# generator it chose, so it overwrites CMAKE_<LANG>_FLAGS_RELEASE with cc's
+# flags minus every /O*, and shaderc (glslang + spirv-opt) builds at /Od —
+# ~300 ms to transpile one ISF shader instead of ~40. cl.exe prepends $CL to
+# every command line, so this puts /O2 back; an explicit /Od later still wins.
+# Ignored off Windows. Not tracked by cargo: `cargo clean -p shaderc-sys`.
+# Unforced on purpose: a CL already in your environment wins, and then this
+# fix is off. It applies in every profile too, so a debuggable C++ dependency
+# on Windows means building with CL cleared.
+CL = "/O2"

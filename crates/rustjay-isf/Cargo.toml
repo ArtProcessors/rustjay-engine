@@ -13,6 +13,7 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 anyhow     = { workspace = true }
 log        = { workspace = true }
+pollster   = { workspace = true }
 shaderc    = { version = "0.10", features = ["build-from-source"] }
 naga       = { version = "29", features = ["spv-in", "wgsl-out", "wgsl-in"] }
 

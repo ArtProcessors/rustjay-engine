@@ -212,11 +212,26 @@ impl<P: EffectPlugin> ApplicationHandler<WindowAction> for App<P> {
                 ..wgpu::InstanceDescriptor::new_without_display_handle()
             });
 
+            // Windows: Vulkan where the driver has it, DX12 otherwise. Not
+            // DX12 only — its default shader compiler, FXC, rejects transpiled
+            // ISF shaders that Vulkan runs ("potentially uninitialized
+            // variable"), and DXC would mean an ATL build dependency or a DLL
+            // to ship.
+            //
+            // The AMD crash with several windows over a fullscreen output is
+            // Radeon Enhanced Sync, on either backend — see the README.
+            //
+            // `with_env` so a release build can still be pointed elsewhere or
+            // told to validate — `WGPU_BACKEND=dx12`, `WGPU_VALIDATION=1` —
+            // without a rebuild.
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            });
+            let instance = wgpu::Instance::new(
+                wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::all(),
+                    ..wgpu::InstanceDescriptor::new_without_display_handle()
+                }
+                .with_env(),
+            );
 
             self.wgpu_instance = Some(instance);
         }
@@ -716,13 +731,17 @@ impl<P: EffectPlugin> ApplicationHandler<WindowAction> for App<P> {
                 self.ui_needs_redraw = true;
 
                 match event {
-                    WindowEvent::CloseRequested => {
+                    // macOS keeps the app in the Dock, which reopens the
+                    // window (`RecreateWindows`). Nothing else can bring it
+                    // back, so elsewhere closing it quits; `exiting` saves.
+                    WindowEvent::CloseRequested if cfg!(target_os = "macos") => {
                         let window = Arc::clone(control_window);
                         self.save_settings();
                         window.set_visible(false);
                         self.control_visible = false;
                         log::info!("Control window hidden");
                     }
+                    WindowEvent::CloseRequested => event_loop.exit(),
                     WindowEvent::KeyboardInput { ref event, .. } => {
                         if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::Shift) =
                             &event.logical_key
@@ -992,6 +1011,10 @@ impl<P: EffectPlugin> ApplicationHandler<WindowAction> for App<P> {
                     let app_state = &mut self.app_state as &mut dyn std::any::Any;
                     if let Err(err) = renderer.render_frame(|ctx| gui.build_ui(ctx, app_state)) {
                         log::error!("egui render error: {}", err);
+                    }
+                    // File → Quit. `exiting` saves.
+                    if renderer.take_close_requested() {
+                        event_loop.exit();
                     }
 
                     // An app can only ask for a texture id while it is drawing,
