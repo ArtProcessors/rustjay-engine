@@ -633,7 +633,10 @@ impl InputManager {
             && let Some(frame) = ndi.get_latest_frame()
         {
             self.resolution = (frame.width, frame.height);
-            self.current_frame = Some(frame.data);
+            // A frame nobody took before this one arrived goes back for reuse.
+            if let Some(stale) = self.current_frame.replace(frame.data) {
+                ndi.recycle(stale);
+            }
             self.has_new_frame = true;
         }
 

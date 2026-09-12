@@ -67,14 +67,22 @@ pub struct NdiReceiver {
     /// Set when the source disappears (not found, or too many consecutive errors)
     source_lost: Arc<AtomicBool>,
     resolution: (u32, u32),
+    /// Frame buffers handed back via [`Self::recycle`], refilled by the
+    /// receive thread. A fresh multi-MB buffer per frame costs ~4.6× a reused
+    /// one: the OS zero-fills and page-faults every new page.
+    spare_tx: Sender<Vec<u8>>,
+    spare_rx: CrossbeamReceiver<Vec<u8>>,
 }
 
 impl NdiReceiver {
     /// Create a new NDI receiver (does not start receiving yet)
     pub fn new(source_name: impl Into<String>) -> Self {
         let (frame_tx, frame_rx) = channel::bounded(5);
+        let (spare_tx, spare_rx) = channel::bounded(4);
 
         Self {
+            spare_tx,
+            spare_rx,
             source_name: source_name.into(),
             receiver_thread: None,
             frame_tx,
@@ -100,6 +108,7 @@ impl NdiReceiver {
 
         let source_name = self.source_name.clone();
         let frame_tx = self.frame_tx.clone();
+        let spare_rx = self.spare_rx.clone();
         let running = Arc::clone(&self.running);
         let source_lost = Arc::clone(&self.source_lost);
         running.store(true, Ordering::SeqCst);
@@ -212,11 +221,14 @@ impl NdiReceiver {
                         };
 
                         // Strip NDI row stride/padding so bytes_per_row matches
-                        // what the GPU upload expects.
+                        // what the GPU upload expects, into a recycled buffer
+                        // when the consumer has handed one back.
+                        let mut data = spare_rx.try_recv().unwrap_or_default();
+                        strip_stride(&mut data, frame_data, width, height, layout);
                         let frame = NdiFrame {
                             width,
                             height,
-                            data: strip_stride(frame_data, width, height, layout),
+                            data,
                             layout,
                             timestamp: Instant::now(),
                         };
@@ -266,9 +278,18 @@ impl NdiReceiver {
         let mut latest: Option<NdiFrame> = None;
         while let Ok(frame) = self.frame_rx.try_recv() {
             self.resolution = (frame.width, frame.height);
-            latest = Some(frame);
+            if let Some(skipped) = latest.replace(frame) {
+                self.recycle(skipped.data);
+            }
         }
         latest
+    }
+
+    /// Hand a frame's buffer back once it has been uploaded, so the receive
+    /// thread refills it instead of allocating. Dropping it instead is fine,
+    /// just slower.
+    pub fn recycle(&self, data: Vec<u8>) {
+        let _ = self.spare_tx.try_send(data);
     }
 
     /// Check if a new frame is available
@@ -299,25 +320,58 @@ impl Drop for NdiReceiver {
 /// This produces tightly-packed rows ready to upload. BGRA needs no channel
 /// swap — it already matches `Bgra8Unorm` — and UYVY is uploaded as-is for the
 /// shader to unpack.
-fn strip_stride(data: &[u8], width: u32, height: u32, layout: NdiPixelLayout) -> Vec<u8> {
+///
+/// Fills `out` in place, reusing its allocation (see [`NdiReceiver::recycle`]).
+fn strip_stride(out: &mut Vec<u8>, data: &[u8], width: u32, height: u32, layout: NdiPixelLayout) {
     let row_bytes = layout.row_bytes(width);
-    let mut out = vec![0u8; row_bytes * height as usize];
+    let rows = height as usize;
+    let actual_stride = if rows > 0 { data.len() / rows } else { row_bytes };
+    out.clear();
 
-    let actual_stride = if height > 0 {
-        data.len() / height as usize
-    } else {
-        row_bytes
-    };
-
-    for y in 0..height as usize {
-        let src = y * actual_stride;
-        let dst = y * row_bytes;
-        if src + row_bytes <= data.len() {
-            out[dst..dst + row_bytes].copy_from_slice(&data[src..src + row_bytes]);
-        }
+    // Unpadded — most senders: one copy.
+    if actual_stride == row_bytes {
+        out.extend_from_slice(&data[..row_bytes * rows]);
+        return;
     }
 
-    out
+    out.reserve(row_bytes * rows);
+    for y in 0..rows {
+        let src = y * actual_stride;
+        match data.get(src..src + row_bytes) {
+            Some(row) => out.extend_from_slice(row),
+            // A short frame keeps its size; the missing rows are black.
+            None => out.resize(out.len() + row_bytes, 0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod strip_stride_tests {
+    use super::{strip_stride, NdiPixelLayout};
+
+    fn stripped(data: &[u8], w: u32, h: u32, layout: NdiPixelLayout, reuse: &mut Vec<u8>) -> Vec<u8> {
+        strip_stride(reuse, data, w, h, layout);
+        reuse.clone()
+    }
+
+    #[test]
+    fn strips_padding_and_passes_tight_frames_through() {
+        // One buffer across all three, as the receive thread reuses it; a
+        // leftover byte from an earlier, bigger frame must not survive.
+        let mut buf = vec![0xAA; 64];
+
+        // 2×2 BGRA: 8-byte rows padded to 12.
+        let padded: Vec<u8> = (0..24).collect();
+        let expected: Vec<u8> = (0..8).chain(12..20).collect();
+        assert_eq!(stripped(&padded, 2, 2, NdiPixelLayout::Bgra, &mut buf), expected);
+
+        let tight: Vec<u8> = (0..16).collect();
+        assert_eq!(stripped(&tight, 2, 2, NdiPixelLayout::Bgra, &mut buf), tight);
+
+        // UYVY rows are width * 2.
+        let uyvy: Vec<u8> = (0..8).collect();
+        assert_eq!(stripped(&uyvy, 2, 2, NdiPixelLayout::Uyvy, &mut buf), uyvy);
+    }
 }
 
 /// Global NDI availability check

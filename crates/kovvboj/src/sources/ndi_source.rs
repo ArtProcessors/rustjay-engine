@@ -138,6 +138,8 @@ impl EffectInstance for NdiSource {
                     },
                 );
             }
+            // write_texture has its own copy now; the buffer goes back for reuse.
+            self.receiver.recycle(frame.data);
         }
 
         if let Some(ref view) = self.view {
