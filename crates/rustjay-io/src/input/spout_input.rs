@@ -11,11 +11,12 @@
 //!
 //! The per-sender info contains the DXGI `GetSharedHandle` value (stored as
 //! 32-bit via `HandleToLong`). We open the shared D3D11 texture with
-//! `ID3D11Device::OpenSharedResource`, copy to a staging texture each frame,
-//! and map it to read BGRA pixels into the `InputManager` CPU buffer.
+//! `ID3D11Device::OpenSharedResource`, then either:
 //!
-//! This is NOT zero-copy (unlike Syphon on macOS). Zero-copy would require
-//! D3D11↔D3D12 texture interop; that is deferred.
+//! - **GPU path** ([`SpoutInputReceiver::receive_gpu`], Vulkan): copy it on
+//!   the GPU into a texture Vulkan imported, and sample that. No readback.
+//! - **CPU path** ([`SpoutInputReceiver::try_receive_texture`]): copy to a
+//!   staging texture, map it, and read BGRA pixels for the caller to upload.
 
 #![cfg(target_os = "windows")]
 
@@ -23,12 +24,19 @@ use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Query, ID3D11Texture2D,
+    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_QUERY_DESC,
+    D3D11_QUERY_EVENT, D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
-use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+};
+use windows::Win32::Graphics::Dxgi::{
+    IDXGIKeyedMutex, IDXGIResource1, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
+};
 use windows::Win32::System::Memory::{
     MapViewOfFile, OpenFileMappingA, UnmapViewOfFile, VirtualQuery, FILE_MAP_READ,
     MEMORY_BASIC_INFORMATION,
@@ -265,6 +273,210 @@ unsafe fn read_sender_info(name: &str) -> anyhow::Result<(HANDLE, u32, u32)> {
     Ok((handle, width, height))
 }
 
+/// Slots the GPU path cycles through. One copy is in flight at a time and the
+/// renderer samples the newest finished one, so a slot is only rewritten three
+/// copies after it was last shown — past the engine's two frames in flight.
+const BRIDGE_SLOTS: usize = 4;
+
+/// The GPU path: Spout senders share their texture by a legacy (KMT) D3D11
+/// handle, which wgpu-hal can't import. So each frame D3D11 copies it, on the
+/// GPU, into one of our own textures shared by NT handle, each imported into
+/// Vulkan once. That replaces the staging readback, a CPU copy and an upload.
+struct GpuBridge {
+    slots: Vec<BridgeSlot>,
+    /// Width, height and DXGI format the slots were made for.
+    key: (u32, u32, i32),
+    /// Newest slot whose copy has finished: what the renderer samples.
+    ready: Option<usize>,
+    /// Slot with a copy in flight.
+    pending: Option<usize>,
+    next: usize,
+}
+
+struct BridgeSlot {
+    d3d: ID3D11Texture2D,
+    /// Signals when the copy into `d3d` has finished on the GPU.
+    query: ID3D11Query,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// The NT handle the import used; Vulkan doesn't take ownership of it.
+    /// Kept as its value, not a `HANDLE`, which isn't `Send` — sources move
+    /// between threads.
+    handle: usize,
+}
+
+impl Drop for BridgeSlot {
+    fn drop(&mut self) {
+        // SAFETY: our own handle from CreateSharedHandle, closed exactly once.
+        unsafe { CloseHandle(HANDLE(self.handle as *mut _)).ok() };
+    }
+}
+
+/// The wgpu format for a sender's DXGI format; `None` sends it down the CPU path.
+fn bridge_format(format: DXGI_FORMAT) -> Option<wgpu::TextureFormat> {
+    Some(match format {
+        DXGI_FORMAT_B8G8R8A8_UNORM => wgpu::TextureFormat::Bgra8Unorm,
+        DXGI_FORMAT_R8G8B8A8_UNORM => wgpu::TextureFormat::Rgba8Unorm,
+        DXGI_FORMAT_R16G16B16A16_FLOAT => wgpu::TextureFormat::Rgba16Float,
+        DXGI_FORMAT_R10G10B10A2_UNORM => wgpu::TextureFormat::Rgb10a2Unorm,
+        _ => return None,
+    })
+}
+
+impl GpuBridge {
+    /// # Safety
+    /// `d3d` must be on the same GPU as `device`.
+    unsafe fn new(
+        d3d: &ID3D11Device,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) -> anyhow::Result<Self> {
+        let wgpu_format = bridge_format(format)
+            .ok_or_else(|| anyhow::anyhow!("sender format {format:?} has no wgpu equivalent"))?;
+        // SAFETY: the guard is dropped before `device` is.
+        let hal = unsafe { device.as_hal::<wgpu_hal::api::Vulkan>() }
+            .ok_or_else(|| anyhow::anyhow!("not a Vulkan device"))?;
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let mut slots = Vec::with_capacity(BRIDGE_SLOTS);
+        for _ in 0..BRIDGE_SLOTS {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0)
+                    as u32,
+            };
+            let mut d3d_tex = None;
+            unsafe { d3d.CreateTexture2D(&desc, None, Some(&mut d3d_tex)) }?;
+            let d3d_tex =
+                d3d_tex.ok_or_else(|| anyhow::anyhow!("CreateTexture2D (bridge) returned None"))?;
+            let mut query = None;
+            let query_desc = D3D11_QUERY_DESC {
+                Query: D3D11_QUERY_EVENT,
+                MiscFlags: 0,
+            };
+            unsafe { d3d.CreateQuery(&query_desc, Some(&mut query)) }?;
+            let query = query.ok_or_else(|| anyhow::anyhow!("CreateQuery returned None"))?;
+            let handle = unsafe {
+                d3d_tex.cast::<IDXGIResource1>()?.CreateSharedHandle(
+                    None,
+                    DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0,
+                    windows::core::PCWSTR::null(),
+                )
+            }?;
+            let hal_desc = wgpu_hal::TextureDescriptor {
+                label: Some("Spout bridge"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu_format,
+                // COPY_SRC so a frame can be read back (tests, snapshots).
+                usage: wgpu::wgt::TextureUses::RESOURCE | wgpu::wgt::TextureUses::COPY_SRC,
+                memory_flags: wgpu_hal::MemoryFlags::empty(),
+                view_formats: Vec::new(),
+            };
+            // SAFETY: `handle` names a live texture made to match `hal_desc`.
+            let hal_texture = match unsafe { hal.texture_from_d3d11_shared_handle(handle, &hal_desc) } {
+                Ok(t) => t,
+                Err(e) => {
+                    unsafe { CloseHandle(handle).ok() };
+                    anyhow::bail!("Vulkan import failed: {e:?}");
+                }
+            };
+            // SAFETY: made for this device just above. D3D11 writes it and
+            // wgpu only samples it, so it starts (and stays) a resource.
+            let texture = unsafe {
+                device.create_texture_from_hal::<wgpu_hal::api::Vulkan>(
+                    hal_texture,
+                    &wgpu::TextureDescriptor {
+                        label: Some("Spout bridge"),
+                        size,
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu_format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    },
+                    wgpu::wgt::TextureUses::RESOURCE,
+                )
+            };
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            slots.push(BridgeSlot {
+                d3d: d3d_tex,
+                query,
+                texture,
+                view,
+                handle: handle.0 as usize,
+            });
+        }
+        Ok(Self {
+            slots,
+            key: (width, height, format.0),
+            ready: None,
+            pending: None,
+            next: 0,
+        })
+    }
+
+    /// Promote the copy in flight once it has landed, then start the next.
+    unsafe fn step(&mut self, ctx: &ID3D11DeviceContext, shared: &ID3D11Texture2D) {
+        if let Some(pending) = self.pending {
+            let mut done = windows::core::BOOL(0);
+            // S_FALSE (still running) is Ok as well; only `done` tells.
+            let polled = unsafe {
+                ctx.GetData(
+                    &self.slots[pending].query,
+                    Some((&raw mut done).cast()),
+                    std::mem::size_of_val(&done) as u32,
+                    D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+                )
+            };
+            if polled.is_err() || !done.as_bool() {
+                return;
+            }
+            self.ready = Some(pending);
+            self.pending = None;
+        }
+
+        let slot = self.next;
+        // The sender's keyed mutex, when it has one — as on the CPU path.
+        let keyed = shared.cast::<IDXGIKeyedMutex>().ok();
+        if let Some(k) = &keyed
+            && unsafe { k.AcquireSync(0, 1000) }.is_err()
+        {
+            return;
+        }
+        unsafe { ctx.CopyResource(&self.slots[slot].d3d, shared) };
+        if let Some(k) = &keyed {
+            unsafe { k.ReleaseSync(0) }.ok();
+        }
+        unsafe {
+            ctx.End(&self.slots[slot].query);
+            ctx.Flush();
+        }
+        self.pending = Some(slot);
+        self.next = (slot + 1) % self.slots.len();
+    }
+}
+
 /// Receives frames from a Spout sender as CPU pixel bytes → wgpu texture.
 ///
 /// Opens the sender's D3D11 shared texture via its DXGI handle, copies to a
@@ -282,6 +494,10 @@ pub struct SpoutInputReceiver {
     resolution: (u32, u32),
     /// BGRA pixel buffer filled by `try_receive_texture()`
     pixel_buffer: Vec<u8>,
+    /// The GPU path, once [`Self::receive_gpu`] has set it up.
+    gpu: Option<GpuBridge>,
+    /// Set once the GPU path has proved impossible, so it isn't retried.
+    gpu_unavailable: bool,
 }
 
 impl SpoutInputReceiver {
@@ -322,6 +538,8 @@ impl SpoutInputReceiver {
                 staging_texture: None,
                 resolution: (0, 0),
                 pixel_buffer: Vec::new(),
+                gpu: None,
+                gpu_unavailable: false,
             })
         }
     }
@@ -341,6 +559,7 @@ impl SpoutInputReceiver {
         self.staging_texture = None;
         self.resolution = (0, 0);
         self.pixel_buffer.clear();
+        self.gpu = None;
         if let Some(ref name) = self.sender_name {
             log::info!("[Spout] Disconnected from '{}'", name);
         }
@@ -524,6 +743,77 @@ impl SpoutInputReceiver {
         true
     }
 
+    /// Receive onto `device` without leaving the GPU; see [`GpuBridge`].
+    ///
+    /// Returns `false` when the caller should use the CPU path
+    /// ([`Self::try_receive_texture`]) instead: not a Vulkan device, no
+    /// `VULKAN_EXTERNAL_MEMORY_WIN32`, or the import failed (logged once).
+    /// The newest landed frame is [`Self::gpu_frame`]; it trails the sender
+    /// by a frame, the price of never waiting on the copy.
+    pub fn receive_gpu(&mut self, device: &wgpu::Device) -> bool {
+        if self.gpu_unavailable || self.sender_name.is_none() {
+            return false;
+        }
+        if !device
+            .features()
+            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32)
+        {
+            log::info!(
+                "[Spout] Zero-copy input needs Vulkan with external memory; using the CPU path"
+            );
+            self.gpu_unavailable = true;
+            return false;
+        }
+        if self.shared_texture.is_none()
+            && let Err(e) = self.open_shared_texture()
+        {
+            log::error!("[Spout Input] Failed to open texture: {}", e);
+            return true;
+        }
+        let Some(shared) = self.shared_texture.clone() else {
+            return true;
+        };
+
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { shared.GetDesc(&mut desc) };
+        let key = (desc.Width, desc.Height, desc.Format.0);
+        if self.gpu.as_ref().is_none_or(|g| g.key != key) {
+            // The old slots go before the new ones are made.
+            self.gpu = None;
+            // SAFETY: both devices are on the default adapter, as the
+            // sender's texture must be for OpenSharedResource to work.
+            match unsafe {
+                GpuBridge::new(&self.d3d_device, device, desc.Width, desc.Height, desc.Format)
+            } {
+                Ok(bridge) => {
+                    log::info!(
+                        "[Spout] Zero-copy input: {}x{} {:?}",
+                        desc.Width,
+                        desc.Height,
+                        desc.Format
+                    );
+                    self.gpu = Some(bridge);
+                }
+                Err(e) => {
+                    log::warn!("[Spout] Zero-copy input unavailable ({e}); using the CPU path");
+                    self.gpu_unavailable = true;
+                    return false;
+                }
+            }
+        }
+        if let Some(bridge) = self.gpu.as_mut() {
+            unsafe { bridge.step(&self.d3d_context, &shared) };
+        }
+        true
+    }
+
+    /// The newest frame [`Self::receive_gpu`] has landed, if one has yet.
+    pub fn gpu_frame(&self) -> Option<(&wgpu::Texture, &wgpu::TextureView)> {
+        let bridge = self.gpu.as_ref()?;
+        let slot = &bridge.slots[bridge.ready?];
+        Some((&slot.texture, &slot.view))
+    }
+
     /// Move the pixel buffer out of the receiver.
     ///
     /// Returns `Some(Vec<u8>)` (BGRA, row-major) when a frame was received.
@@ -570,5 +860,217 @@ impl Default for SpoutInputReceiver {
 impl Drop for SpoutInputReceiver {
     fn drop(&mut self) {
         self.disconnect();
+    }
+}
+
+#[cfg(test)]
+mod gpu_path_tests {
+    //! The GPU path end to end on this machine's GPU. Gated like the other
+    //! pixel tests: `RUSTJAY_GPU_TESTS=1`.
+    use super::{SpoutDiscovery, SpoutInputReceiver};
+    use crate::output::spout_output::SpoutOutput;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    const TEST_SENDER: &str = "rustjay-gpu-path-test";
+
+    fn vulkan_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        if std::env::var("RUSTJAY_GPU_TESTS").as_deref() != Ok("1") {
+            eprintln!("RUSTJAY_GPU_TESTS != 1 — skipping");
+            return None;
+        }
+        pollster::block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    ..Default::default()
+                })
+                .await
+                .ok()?;
+            let feature = wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
+            if !adapter.features().contains(feature) {
+                eprintln!("{} lacks {feature:?} — skipping", adapter.get_info().name);
+                return None;
+            }
+            adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    required_features: feature,
+                    required_limits: wgpu::Limits::default(),
+                    label: Some("Spout GPU path test"),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    trace: wgpu::Trace::Off,
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                })
+                .await
+                .ok()
+        })
+    }
+
+    /// The texture's pixels, rows tightly packed, 4 bytes each.
+    fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture) -> Vec<u8> {
+        let (w, h) = (tex.width(), tex.height());
+        let row = w * 4;
+        let padded = row.next_multiple_of(256);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(padded * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        enc.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(h),
+                },
+            },
+            tex.size(),
+        );
+        queue.submit([enc.finish()]);
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            r.expect("map_async");
+            flag.store(true, Ordering::SeqCst);
+        });
+        while !done.load(Ordering::SeqCst) {
+            device.poll(wgpu::PollType::Poll).ok();
+            std::thread::yield_now();
+        }
+        let data = buf.slice(..).get_mapped_range().expect("mapped");
+        data.chunks(padded as usize)
+            .flat_map(|r| &r[..row as usize])
+            .copied()
+            .collect()
+    }
+
+    /// Drive `receive_gpu` until a landed frame's first pixel is `want`.
+    fn first_pixel_becomes(
+        rx: &mut SpoutInputReceiver,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        want: [u8; 4],
+    ) -> [u8; 4] {
+        let mut last = [0; 4];
+        for _ in 0..200 {
+            assert!(rx.receive_gpu(device), "GPU path declined to run");
+            if let Some((tex, _)) = rx.gpu_frame() {
+                last.copy_from_slice(&read_back(device, queue, tex)[..4]);
+                if last == want {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        last
+    }
+
+    #[test]
+    fn own_sender_reaches_vulkan_on_the_gpu_path() {
+        let Some((device, queue)) = vulkan_device() else {
+            return;
+        };
+        let mut sender = SpoutOutput::new(TEST_SENDER).expect("sender");
+        let solid = |bgra: [u8; 4]| bgra.repeat(64 * 64);
+        sender
+            .submit_bytes(&solid([0, 0, 255, 255]), 64, 64)
+            .expect("red frame");
+
+        let mut rx = SpoutInputReceiver::new().expect("receiver");
+        rx.connect(TEST_SENDER).expect("connect");
+        let red = [0, 0, 255, 255];
+        assert_eq!(first_pixel_becomes(&mut rx, &device, &queue, red), red, "red, as BGRA");
+
+        // Later frames have to arrive too, not only the first.
+        sender
+            .submit_bytes(&solid([255, 0, 0, 255]), 64, 64)
+            .expect("blue frame");
+        let blue = [255, 0, 0, 255];
+        assert_eq!(first_pixel_becomes(&mut rx, &device, &queue, blue), blue, "blue, as BGRA");
+    }
+
+    /// With a real sender running: saves what each path sees to
+    /// `$SPOUT_SNAPSHOT_DIR` (opaque RGBA PNGs) and times a receive on each.
+    #[test]
+    fn live_sender_snapshots() {
+        let Ok(dir) = std::env::var("SPOUT_SNAPSHOT_DIR") else {
+            eprintln!("SPOUT_SNAPSHOT_DIR unset — skipping");
+            return;
+        };
+        let Some((device, queue)) = vulkan_device() else {
+            return;
+        };
+        let senders = SpoutDiscovery::list_senders();
+        let live = senders
+            .iter()
+            .find(|s| s.name != TEST_SENDER)
+            .expect("no live Spout sender");
+        eprintln!("live sender '{}' {}x{}", live.name, live.width, live.height);
+
+        let mut gpu = SpoutInputReceiver::new().unwrap();
+        gpu.connect(&live.name).unwrap();
+        let mut cpu = SpoutInputReceiver::new().unwrap();
+        cpu.connect(&live.name).unwrap();
+        for _ in 0..10 {
+            gpu.receive_gpu(&device);
+            cpu.try_receive_texture();
+            std::thread::sleep(Duration::from_millis(16));
+        }
+
+        let t = Instant::now();
+        for _ in 0..120 {
+            assert!(gpu.receive_gpu(&device));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let gpu_ms = t.elapsed().as_secs_f64() * 1e3 / 120.0 - 1.0;
+        let t = Instant::now();
+        for _ in 0..120 {
+            cpu.try_receive_texture();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let cpu_ms = t.elapsed().as_secs_f64() * 1e3 / 120.0 - 1.0;
+        eprintln!(
+            "per receive: GPU path ~{gpu_ms:.2} ms, CPU path ~{cpu_ms:.2} ms (before its upload)"
+        );
+
+        let opaque_rgba = |px: &mut [u8], bgra: bool| {
+            for p in px.chunks_mut(4) {
+                if bgra {
+                    p.swap(0, 2);
+                }
+                p[3] = 255;
+            }
+        };
+        let (tex, _) = gpu.gpu_frame().expect("the GPU path landed no frame");
+        let format = tex.format();
+        eprintln!("GPU frame: {}x{} {format:?}", tex.width(), tex.height());
+        if matches!(format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm) {
+            let mut px = read_back(&device, &queue, tex);
+            opaque_rgba(&mut px, format == wgpu::TextureFormat::Bgra8Unorm);
+            image::save_buffer(
+                format!("{dir}/spout_gpu.png"),
+                &px,
+                tex.width(),
+                tex.height(),
+                image::ColorType::Rgba8,
+            )
+            .unwrap();
+        }
+        if let Some(px) = cpu.pixels() {
+            let mut px = px.to_vec();
+            opaque_rgba(&mut px, true);
+            let (w, h) = cpu.resolution();
+            image::save_buffer(format!("{dir}/spout_cpu.png"), &px, w, h, image::ColorType::Rgba8)
+                .unwrap();
+        }
     }
 }

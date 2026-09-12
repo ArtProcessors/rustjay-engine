@@ -129,6 +129,14 @@ impl<P: EffectPlugin> WgpuEngine<P> {
         {
             required_features |= wgpu::Features::TEXTURE_COMPRESSION_BC;
         }
+        // Zero-copy Spout input imports shared D3D11 textures into Vulkan
+        // (rustjay-io's SpoutInputReceiver::receive_gpu).
+        if adapter
+            .features()
+            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32)
+        {
+            required_features |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {

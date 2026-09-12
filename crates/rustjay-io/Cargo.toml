@@ -69,6 +69,13 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_System_LibraryLoader",
 ] }
+# Zero-copy Spout input: imports our bridge textures into Vulkan. Resolves to
+# the workspace's vendored wgpu-hal, the one wgpu itself runs on.
+wgpu-hal = { version = "30.0", features = ["vulkan"] }
+
+[dev-dependencies]
+pollster = { workspace = true }
+image    = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = "0.14"
