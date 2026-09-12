@@ -1393,12 +1393,16 @@ fn inline_img_calls(body: &str) -> String {
                 "texture(sampler2D({}, img_sampler), vec2(({}).x, 1.0 - ({}).y), {})",
                 args[0], args[1], args[1], args[2]
             )),
+            // Pixel coordinates address the sampled image, not the render target, so
+            // they normalise by that image's own size — RENDERSIZE reads out of bounds
+            // whenever an input is smaller than the output.
             ("IMG_PIXEL", 2) => Some(format!(
-                "texelFetch(sampler2D({}, img_sampler), ivec2(int(({}).x), int(RENDERSIZE.y) - 1 - int(({}).y)), 0)",
-                args[0], args[1], args[1]
+                "texture(sampler2D({0}, img_sampler), vec2(({1}).x, float(textureSize(sampler2D({0}, img_sampler), 0).y) - ({1}).y) / vec2(textureSize(sampler2D({0}, img_sampler), 0)))",
+                args[0], args[1]
             )),
             ("IMG_SIZE", 1) => Some(format!("textureSize(sampler2D({}, img_sampler), 0)", args[0])),
-            ("IMG_THIS_NORM_PIXEL", 1) => Some(format!(
+            // ISF defines IMG_THIS_PIXEL as IMG_THIS_NORM_PIXEL for 2D textures.
+            ("IMG_THIS_NORM_PIXEL", 1) | ("IMG_THIS_PIXEL", 1) => Some(format!(
                 "texture(sampler2D({}, img_sampler), vec2((isf_FragNormCoord).x, 1.0 - (isf_FragNormCoord).y))",
                 args[0]
             )),
@@ -1411,10 +1415,6 @@ fn inline_img_calls(body: &str) -> String {
             ("MM_SHADER_NORM_PIXEL", 1) => Some(format!(
                 "texture(sampler2D(inputImage, img_sampler), vec2(({}).x, 1.0 - ({}).y))",
                 args[0], args[0]
-            )),
-            ("IMG_THIS_PIXEL", 1) => Some(format!(
-                "texelFetch(sampler2D({}, img_sampler), ivec2(int((isf_FragNormCoord).x * RENDERSIZE.x), int(RENDERSIZE.y) - 1 - int((isf_FragNormCoord).y * RENDERSIZE.y)), 0)",
-                args[0]
             )),
             _ => None,
         }
