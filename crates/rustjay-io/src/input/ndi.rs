@@ -379,7 +379,13 @@ impl NdiReceiver {
         while let Ok(frame) = self.frame_rx.try_recv() {
             self.resolution = (frame.width, frame.height);
             if let Some(skipped) = latest.replace(frame) {
-                self.recycle(skipped.data);
+                // A frame nobody will see still holds a buffer. Both kinds go
+                // back: dropping a staged one takes it out of the ring for
+                // good, and the ring bleeds dry within a second or two.
+                match skipped.staged {
+                    Some(staged) => self.remap_staged(staged.buffer),
+                    None => self.recycle(skipped.data),
+                }
             }
         }
         latest
