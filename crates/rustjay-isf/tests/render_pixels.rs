@@ -309,10 +309,12 @@ fn input_texture_2x2(gpu: &Gpu) -> (wgpu::Texture, wgpu::TextureView, wgpu::Samp
 // Tests
 // ---------------------------------------------------------------------------
 
-/// (a) Y-flip / geometry: vec4(isf_FragNormCoord, 0, 1). ISF is bottom-left origin,
-/// so readback row 0 (texture top) must have green ≈ 1.0, last row green ≈ 0.0.
+/// (a) Geometry: vec4(isf_FragNormCoord, 0, 1). This shader samples nothing, so it
+/// gets the unflipped coordinate (see `IsfManifest::flip_frag_norm_coord`) — readback
+/// row 0 (texture top) has green ≈ 0.0, last row green ≈ 1.0. The flipped convention
+/// is covered by the IMG_* passthrough tests (d) and (f).
 #[test]
-fn a_normcoords_yflip() {
+fn a_normcoords_unflipped_without_img_macros() {
     let Some(gpu) = init_gpu() else { return };
     let engine = engine_at(64, 64);
     let (_effect, mut state) = load_effect(&gpu, "normcoords.fs");
@@ -324,13 +326,13 @@ fn a_normcoords_yflip() {
     let (r_br, g_br, _, _) = f.rgba(63, 63);
     eprintln!("corners TL=({r_tl},{g_tl}) TR=({r_tr},{g_tr}) BL=({r_bl},{g_bl}) BR=({r_br},{g_br}) a={a_tl}");
     assert_channel(r_tl, 0, "top-left R");
-    assert_channel(g_tl, 255, "top-left G (ISF y=1 at texture top)");
+    assert_channel(g_tl, 0, "top-left G (unflipped: y=0 at texture top)");
     assert_channel(r_tr, 255, "top-right R");
-    assert_channel(g_tr, 255, "top-right G");
+    assert_channel(g_tr, 0, "top-right G");
     assert_channel(r_bl, 0, "bottom-left R");
-    assert_channel(g_bl, 0, "bottom-left G (ISF y=0 at texture bottom)");
+    assert_channel(g_bl, 255, "bottom-left G (unflipped: y=1 at texture bottom)");
     assert_channel(r_br, 255, "bottom-right R");
-    assert_channel(g_br, 0, "bottom-right G");
+    assert_channel(g_br, 255, "bottom-right G");
     assert_channel(a_tl, 255, "alpha");
 }
 
