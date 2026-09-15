@@ -3131,9 +3131,12 @@ impl EffectPlugin for KovvbojRootPlugin {
         // every frame into the engine's opaque `app_state` slot. The generic
         // `/api/app/state` route serves it, and the WS delta stream diffs it —
         // so runtime structure changes (add/remove/reorder/hot-reload) and live
-        // param moves both surface. Only built when the `api` feature is on.
+        // param moves both surface. Only built when the `api` feature is on,
+        // and only while the web server is up: nobody reads it otherwise, and
+        // building it clones every library entry into a JSON tree — a thousand
+        // strings a frame on the render thread for a 360-shader library.
         #[cfg(all(feature = "mixer", feature = "api"))]
-        {
+        if engine.web_enabled {
             if let Ok(mixer) = self.mixer.lock() {
                 let snapshot = build_kovvboj_snapshot(&mixer, &state.registry, engine);
                 if let Ok(mut guard) = engine.app_state.lock() {
