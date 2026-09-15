@@ -462,6 +462,11 @@ pub struct KovvbojAppState {
     #[serde(skip)]
     #[cfg(feature = "mixer")]
     pub layer_sources: std::collections::HashMap<String, crate::sources::SourceEntry>,
+    /// Layers whose source could not be built and stand on a placeholder —
+    /// the row says so, and the source picker repairs them. See `MissingSource`.
+    #[serde(skip)]
+    #[cfg(feature = "mixer")]
+    pub missing_layers: std::collections::HashSet<String>,
     /// Runtime effect addition queue (processed in `prepare()` where GPU resources are available).
     #[serde(skip)]
     #[cfg(feature = "mixer")]
@@ -1173,6 +1178,8 @@ impl Default for KovvbojAppState {
             #[cfg(feature = "mixer")]
             layer_sources: std::collections::HashMap::new(),
             #[cfg(feature = "mixer")]
+            missing_layers: std::collections::HashSet::new(),
+            #[cfg(feature = "mixer")]
             pending_effects: Vec::new(),
             #[cfg(feature = "mixer")]
             params_dirty_request: false,
@@ -1691,24 +1698,120 @@ fn build_fx_slot(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     engine: &EngineState,
-) -> Option<rustjay_mixer::EffectSlot> {
+) -> rustjay_mixer::EffectSlot {
     let path = crate::scene::resolve(&fx.path, base);
-    match rustjay_isf::IsfEffect::from_path(&path) {
+    let effect: Box<dyn EffectInstance> = match rustjay_isf::IsfEffect::from_path(&path) {
         Ok(isf) => {
             let name = isf.shader_name.clone();
-            let node = EffectNode::new(isf, &name, device, queue, engine);
-            Some(rustjay_mixer::EffectSlot {
-                effect: Box::new(node),
-                enabled: fx.enabled,
-                uuid: fx.uuid.clone(),
-                source_path: Some(path),
-            })
+            Box::new(EffectNode::new(isf, &name, device, queue, engine))
         }
         Err(e) => {
             log::warn!("[Topology] failed to load FX {}: {}", path.display(), e);
-            None
+            Box::new(MissingEffect::new(device, &path))
+        }
+    };
+    rustjay_mixer::EffectSlot {
+        effect,
+        enabled: fx.enabled,
+        uuid: fx.uuid.clone(),
+        source_path: Some(path),
+    }
+}
+
+/// Stands in for a layer source that could not be built — a clip on an
+/// unmounted drive, a shader that no longer parses. Renders nothing, so the
+/// layer composites as transparent, and needs no device, so the decision to
+/// keep the layer is testable headless.
+///
+/// The point is what it is *not*: dropped. A layer that fails to build used
+/// to vanish from the mixer, and thirty seconds later the auto-save wrote the
+/// scene without it. Keeping the channel keeps its descriptor, its chain, its
+/// place in the stack and every binding under `ch_<uuid>_`, and the source
+/// picker repairs it in place.
+#[cfg(feature = "mixer")]
+struct MissingSource;
+
+#[cfg(feature = "mixer")]
+impl EffectInstance for MissingSource {
+    fn label(&self) -> &str {
+        "missing"
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn render_to(
+        &mut self,
+        _ctx: &mut RenderCtx<'_>,
+        _inputs: &[EffectInput<'_>],
+        _target: RenderTarget<'_>,
+        _engine: &EngineState,
+    ) {
+    }
+}
+
+/// [`MissingSource`] for an FX slot: passes its input through untouched. A
+/// no-op would leave the chain's ping-pong target unwritten, so this one has
+/// to copy. The slot keeps its uuid, path and flag, and the hot-reload path
+/// swaps the real shader back in the moment the file is there again.
+#[cfg(feature = "mixer")]
+struct MissingEffect {
+    blit: rustjay_mixer::BlitPipeline,
+    label: String,
+}
+
+#[cfg(feature = "mixer")]
+impl MissingEffect {
+    fn new(device: &wgpu::Device, path: &std::path::Path) -> Self {
+        Self {
+            blit: rustjay_mixer::BlitPipeline::new(device, rustjay_core::working_format()),
+            label: format!("⚠ {}", transition_name(path)),
         }
     }
+}
+
+#[cfg(feature = "mixer")]
+impl EffectInstance for MissingEffect {
+    fn label(&self) -> &str {
+        &self.label
+    }
+    fn render_to(
+        &mut self,
+        ctx: &mut RenderCtx<'_>,
+        inputs: &[EffectInput<'_>],
+        target: RenderTarget<'_>,
+        _engine: &EngineState,
+    ) {
+        if let Some(input) = inputs.first() {
+            self.blit
+                .blit(ctx.device, ctx.encoder, input.view, target.view, ctx.vertex_buffer);
+        }
+    }
+}
+
+/// The channel for a layer, from what building its source produced.
+///
+/// A source that failed to build gets a [`MissingSource`] and the layer is
+/// recorded in `missing`, so the UI can say so and the set still saves whole.
+#[cfg(feature = "mixer")]
+fn layer_or_placeholder(
+    desc: &crate::scene::LayerDesc,
+    built: anyhow::Result<Box<dyn EffectInstance>>,
+    missing: &mut std::collections::HashSet<String>,
+) -> Channel {
+    let source = match built {
+        Ok(source) => source,
+        Err(e) => {
+            log::warn!(
+                "[Topology] layer '{}' could not be built, kept as missing: {e}",
+                desc.name
+            );
+            missing.insert(desc.uuid.clone());
+            Box::new(MissingSource)
+        }
+    };
+    let mut ch = Channel::new(desc.uuid.clone(), desc.name.clone(), source);
+    ch.effect.set_param_prefix(&format!("ch_{}_", desc.uuid));
+    ch
 }
 
 // ---------------------------------------------------------------------------
@@ -1722,6 +1825,13 @@ pub struct KovvbojRootPlugin {
     /// the first `prepare()` — `init` runs before any state exists.
     #[cfg(feature = "mixer")]
     layer_sources_init: std::collections::HashMap<String, crate::sources::SourceEntry>,
+    /// Layers the last graph rebuild could not build — see [`MissingSource`].
+    /// `Some` after every rebuild, so an empty set also reaches the state.
+    #[cfg(feature = "mixer")]
+    missing_init: Option<std::collections::HashSet<String>>,
+    /// Toasts raised where there is no `EngineState`: `init` and the graph
+    /// rebuild it shares with `prepare`. Shown on the next `prepare`.
+    notices: Vec<String>,
     params_dirty: bool,
     /// Modulation snapshot loaded from the workspace scene in `init()` (which has
     /// no `&EngineState`), applied into `engine.modulation` on the first `prepare()`.
@@ -1773,6 +1883,9 @@ impl KovvbojRootPlugin {
             #[cfg(feature = "mixer")]
             mixer: Arc::new(Mutex::new(Mixer::new())),
             layer_sources_init: std::collections::HashMap::new(),
+            #[cfg(feature = "mixer")]
+            missing_init: None,
+            notices: Vec::new(),
             params_dirty: false,
             #[cfg(feature = "mixer")]
             pending_modulation: None,
@@ -2057,6 +2170,7 @@ impl KovvbojRootPlugin {
         let mut old: Vec<Channel> = std::mem::take(&mut mixer.channels);
         let mut next: Vec<Channel> = Vec::with_capacity(topo.layers.len());
         let mut sources = std::collections::HashMap::new();
+        let mut missing = std::collections::HashSet::new();
         let mut rebuilt = 0usize;
 
         for (desc, plan) in topo.layers.iter().zip(plans.iter()) {
@@ -2088,24 +2202,20 @@ impl KovvbojRootPlugin {
                             ),
                         }
                     }
+                    // A kept layer still standing on a placeholder — an undo,
+                    // a failed re-point — stays flagged.
+                    if ch.effect.as_any().is_some_and(|a| a.is::<MissingSource>()) {
+                        missing.insert(desc.uuid.clone());
+                    }
                     ch
                 }
                 LayerPlan::Build { .. } => {
-                    let source = match instantiate_source(&entry, device, queue, &dummy_engine) {
-                        Ok(source) => source,
-                        Err(e) => {
-                            log::warn!(
-                                "[Topology] failed to rebuild layer '{}': {}",
-                                desc.name,
-                                e
-                            );
-                            continue;
-                        }
-                    };
                     rebuilt += 1;
-                    let mut ch = Channel::new(desc.uuid.clone(), desc.name.clone(), source);
-                    ch.effect.set_param_prefix(&prefix);
-                    ch
+                    layer_or_placeholder(
+                        desc,
+                        instantiate_source(&entry, device, queue, &dummy_engine),
+                        &mut missing,
+                    )
                 }
             };
 
@@ -2250,14 +2360,32 @@ impl KovvbojRootPlugin {
         mixer.invalidate_composite_cache();
 
         log::info!(
-            "[Topology] {} layers ({rebuilt} rebuilt, {} dropped), {} groups, {} master FX",
+            "[Topology] {} layers ({rebuilt} rebuilt, {} dropped, {} missing), {} groups, {} master FX",
             mixer.channels.len(),
             dropped.len(),
+            missing.len(),
             mixer.groups.len(),
             topo.master_fx.len()
         );
+        if !missing.is_empty() {
+            let names: Vec<String> = topo
+                .layers
+                .iter()
+                .filter(|l| missing.contains(&l.uuid))
+                .map(|l| match &l.source.path {
+                    Some(p) => format!("{} ({})", l.name, p.display()),
+                    None => l.name.clone(),
+                })
+                .collect();
+            self.notices.push(format!(
+                "{} layer(s) could not be loaded and are kept as ⚠ missing: {}",
+                names.len(),
+                names.join(", ")
+            ));
+        }
         drop(mixer);
         self.layer_sources_init = sources;
+        self.missing_init = Some(missing);
         self.params_dirty = true;
     }
 }
@@ -2308,12 +2436,11 @@ fn built_chain(
 ) -> Vec<rustjay_mixer::EffectSlot> {
     let mut chain = Vec::new();
     for slot in fx {
-        if let Some(mut built) = build_fx_slot(slot, base, device, queue, engine) {
-            built
-                .effect
-                .set_param_prefix(&format!("{prefix}fx{}_", built.uuid));
-            chain.push(built);
-        }
+        let mut built = build_fx_slot(slot, base, device, queue, engine);
+        built
+            .effect
+            .set_param_prefix(&format!("{prefix}fx{}_", built.uuid));
+        chain.push(built);
     }
     chain
 }
@@ -2352,11 +2479,10 @@ fn reconcile_chain(
                 chain.push(slot);
             }
             SlotPlan::Build { .. } => {
-                if let Some(mut slot) = build_fx_slot(fx, base, device, queue, engine) {
-                    slot.effect
-                        .set_param_prefix(&format!("{prefix}fx{}_", slot.uuid));
-                    chain.push(slot);
-                }
+                let mut slot = build_fx_slot(fx, base, device, queue, engine);
+                slot.effect
+                    .set_param_prefix(&format!("{prefix}fx{}_", slot.uuid));
+                chain.push(slot);
             }
         }
     }
@@ -2667,7 +2793,11 @@ impl EffectPlugin for KovvbojRootPlugin {
             }
         }
 
-        for (message, level) in state.pending_notices.drain(..) {
+        for (message, level) in state.pending_notices.drain(..).chain(
+            self.notices
+                .drain(..)
+                .map(|m| (m, rustjay_core::NotificationLevel::Warning)),
+        ) {
             engine.notify(message, level, std::time::Duration::from_secs(8));
         }
 
@@ -3089,6 +3219,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                     .layer_sources
                     .extend(std::mem::take(&mut self.layer_sources_init));
             }
+            if let Some(missing) = self.missing_init.take() {
+                state.missing_layers = missing;
+            }
 
             // The dimmer is a normal parameter, so MIDI/OSC/LFO can drive it;
             // the mixer just reads the resolved value each frame.
@@ -3222,6 +3355,8 @@ impl EffectPlugin for KovvbojRootPlugin {
                         state
                             .layer_sources
                             .insert(req.layer_uuid.clone(), req.source.clone());
+                        // Re-pointing is how a missing layer is repaired.
+                        state.missing_layers.remove(&req.layer_uuid);
                         self.params_dirty = true;
                         engine.notify(
                             format!("Connected to '{}'", req.source.name),
@@ -3300,13 +3435,10 @@ impl EffectPlugin for KovvbojRootPlugin {
                             channel.mute = desc.mute;
                             let prefix = format!("ch_{uuid}_");
                             for fx in &desc.fx {
-                                if let Some(mut slot) =
-                                    build_fx_slot(fx, &base, device, queue, engine)
-                                {
-                                    slot.effect
-                                        .set_param_prefix(&format!("{prefix}fx{}_", slot.uuid));
-                                    channel.chain.push(slot);
-                                }
+                                let mut slot = build_fx_slot(fx, &base, device, queue, engine);
+                                slot.effect
+                                    .set_param_prefix(&format!("{prefix}fx{}_", slot.uuid));
+                                channel.chain.push(slot);
                             }
                             // Values are applied by the engine once the rebuilt
                             // chain's parameters have registered — the same
@@ -3508,14 +3640,11 @@ impl EffectPlugin for KovvbojRootPlugin {
                         channel.solo = desc.solo;
                         channel.mute = desc.mute;
                         for slot in &desc.fx {
-                            if let Some(mut built) =
-                                build_fx_slot(slot, &base, device, queue, engine)
-                            {
-                                built
-                                    .effect
-                                    .set_param_prefix(&format!("{prefix}fx{}_", built.uuid));
-                                channel.chain.push(built);
-                            }
+                            let mut built = build_fx_slot(slot, &base, device, queue, engine);
+                            built
+                                .effect
+                                .set_param_prefix(&format!("{prefix}fx{}_", built.uuid));
+                            channel.chain.push(built);
                         }
                         if mixer.add_channel(channel).is_err() {
                             continue;
@@ -3651,11 +3780,10 @@ impl EffectPlugin for KovvbojRootPlugin {
                     // stack two copies of the same idea.
                     mixer.master.clear();
                     for desc in &fx {
-                        if let Some(mut slot) = build_fx_slot(desc, &base, device, queue, engine) {
-                            slot.effect
-                                .set_param_prefix(&format!("master_fx{}_", slot.uuid));
-                            mixer.master.push(slot);
-                        }
+                        let mut slot = build_fx_slot(desc, &base, device, queue, engine);
+                        slot.effect
+                            .set_param_prefix(&format!("master_fx{}_", slot.uuid));
+                        mixer.master.push(slot);
                     }
                 }
                 if let Ok(mut restore) = engine.param_restore.lock() {
@@ -4801,6 +4929,61 @@ mod tests {
         // Nothing packaged: the crate root, as `cargo run` has.
         assert_eq!(resolve_resources(None, None, &dev), dev);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A layer whose file cannot be opened stays in the set: it stands on a
+    /// placeholder, keeps its descriptor, and the next save writes it back out
+    /// exactly as it was — including the path that will work again once the
+    /// drive is mounted. Dropping it and then auto-saving is how a set used to
+    /// lose layers for good.
+    #[test]
+    fn a_missing_layer_survives_load_and_save() {
+        let desc = crate::scene::LayerDesc {
+            uuid: "clip1".into(),
+            name: "Intro clip".into(),
+            source: crate::sources::SourceEntry {
+                id: "intro".into(),
+                name: "Intro clip".into(),
+                kind: crate::sources::SourceKind::Video,
+                path: Some("/Volumes/Gone/intro.mov".into()),
+                device_index: 0,
+                text: None,
+            },
+            opacity: 0.7,
+            blend_mode: rustjay_mixer::BlendMode::Add,
+            solo: false,
+            mute: false,
+            fx: Vec::new(),
+        };
+
+        // What `apply_topology` does when the build fails.
+        let mut missing = std::collections::HashSet::new();
+        let mut mixer = Mixer::new();
+        let ch = layer_or_placeholder(&desc, Err(anyhow::anyhow!("no such file")), &mut missing);
+        assert_eq!(ch.uuid, "clip1");
+        assert!(missing.contains("clip1"), "the layer is flagged, not dropped");
+        mixer.add_channel(ch).unwrap();
+        let mut sources = std::collections::HashMap::new();
+        sources.insert(desc.uuid.clone(), desc.source.clone());
+
+        // The 30-second auto-save.
+        let dir = std::env::temp_dir().join(format!("kv-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = crate::persistence::Workspace::new(&dir);
+        ws.save_scene(&Scene::from_mixer(&mixer, &sources)).unwrap();
+
+        let back = ws.load_scene().unwrap();
+        let layers = back.topology.expect("topology saved").layers;
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].uuid, "clip1");
+        assert_eq!(layers[0].name, "Intro clip");
+        assert_eq!(
+            layers[0].source.path.as_deref(),
+            Some(std::path::Path::new("/Volumes/Gone/intro.mov")),
+            "the original path is what gets saved, not a placeholder"
+        );
+        assert_eq!(layers[0].source.kind, crate::sources::SourceKind::Video);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The shape the crossfader can drive: two images, then a float progress.

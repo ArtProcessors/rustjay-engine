@@ -2626,23 +2626,35 @@ mod egui_impl {
                                     // ── Row 2: the signal strip ──────────────────────
                                     let mut strip = strip_scroll(ui, "strip").show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            let kind = state
-                                                .layer_sources
-                                                .get(uuid)
+                                            let entry = state.layer_sources.get(uuid);
+                                            let kind = entry
                                                 .map(|e| e.kind)
                                                 .unwrap_or(crate::sources::SourceKind::SolidColor);
+                                            // A layer standing on a placeholder says
+                                            // so where its source would be: the file
+                                            // is what is missing, not the layer.
+                                            let missing = state.missing_layers.contains(uuid);
                                             let label = format!(
                                                 "{} {}",
-                                                source_icon(kind),
+                                                if missing { "⚠" } else { source_icon(kind) },
                                                 mixer.channels[idx].name
                                             );
-                                            let (resp, _) = chip(
+                                            let (mut resp, _) = chip(
                                                 ui,
                                                 ui.id().with(("srcchip", uuid)),
                                                 &label,
                                                 source_selected,
                                                 None,
                                             );
+                                            if missing {
+                                                let what = entry
+                                                    .and_then(|e| e.path.as_ref())
+                                                    .map(|p| p.display().to_string())
+                                                    .unwrap_or_else(|| format!("{kind:?}"));
+                                                resp = resp.on_hover_text(format!(
+                                                    "Missing — could not be opened: {what}\nPick another source in the inspector to repair it."
+                                                ));
+                                            }
                                             if resp.clicked() {
                                                 new_selection = Some(crate::Selection::Source {
                                                     layer: uuid.clone(),
