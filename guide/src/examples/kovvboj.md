@@ -88,7 +88,9 @@ and MAP modes; everything else opens as windows from the View menu.
   `persistence/`.
 - **Stage mode** (`--features projection`) — place output surfaces on a canvas,
   with an aspect-correct, zoomable **live preview** of the master output and
-  per-surface pixel sizing. Surfaces feed `rustjay-projection`.
+  per-surface pixel sizing. Surfaces feed `rustjay-projection`; a projector
+  can draw several, each with its own source, crop and warp, ticked in its
+  Outputs row. Edge blend applies to the projector's composited frame.
 - **LED Map mode** — calibrate addressable LED strips and play them back over
   sACN. See [Lighting & LED](../lighting.md).
 - **Outputs** — window output plus lifecycle-managed NDI / Syphon senders

@@ -43,24 +43,20 @@ fn main() -> anyhow::Result<()> {
         // share the same Arcs.
         plugin.ensure_source_syncs(stage.projectors.len());
         plugin.ensure_rotation_syncs(stage.projectors.len());
-        plugin.ensure_warp_syncs(stage.projectors.len());
 
         // Clone syncs for the closure (plugin will be moved into the engine).
         let source_syncs = plugin.source_syncs();
         let rotation_syncs = plugin.rotation_syncs();
-        let warp_syncs = plugin.warp_syncs();
         log::info!(
-            "[Main] captured syncs: source={}, rotation={}, warp={}",
+            "[Main] captured syncs: source={}, rotation={}",
             source_syncs.len(),
-            rotation_syncs.len(),
-            warp_syncs.len()
+            rotation_syncs.len()
         );
 
         rustjay_engine::run_with_projection_egui_shell(
             plugin,
             Box::new(kovvboj::shell::KovvbojShell::new()),
             move |sub| {
-            use kovvboj::stage::{KovvbojDomeStage, KovvbojEdgeBlendStage, KovvbojSourceStage, KovvbojWarpStage};
             use winit::window::WindowAttributes;
             for (i, proj) in stage.projectors.iter().enumerate() {
                 if !proj.enabled {
@@ -76,11 +72,6 @@ fn main() -> anyhow::Result<()> {
                         monitor_idx
                     );
                 }
-                let w = warp_syncs.get(i).cloned().unwrap_or_else(|| {
-                    log::warn!("[Projector {}] warp_syncs missing, using default", i);
-                    std::sync::Arc::new(std::sync::Mutex::new(kovvboj::stage::WarpSync::default()))
-                });
-                log::info!("[Projector {}] warp_sync ptr={:p}", i, std::sync::Arc::as_ptr(&w));
                 let d = dome_sync.clone();
                 let e = edge_blend_sync.clone();
                 let s = source_syncs.get(i).cloned().unwrap_or_else(|| {
@@ -90,13 +81,7 @@ fn main() -> anyhow::Result<()> {
                     std::sync::Arc::new(std::sync::Mutex::new(rustjay_projection::RotationSync::default()))
                 });
                 sub.add_projector(attrs, proj.fullscreen_monitor, move |device, format| {
-                    vec![
-                        Box::new(KovvbojSourceStage::new(device, format, s.clone())),
-                        Box::new(KovvbojDomeStage::new(device, format, d.clone())),
-                        Box::new(KovvbojEdgeBlendStage::new(device, format, e.clone())),
-                        Box::new(KovvbojWarpStage::new(device, format, w.clone())),
-                        Box::new(rustjay_projection::RotationStage::new(device, format, r.clone())),
-                    ]
+                    kovvboj::stage::projector_stages(device, format, &s, &d, &e, &r)
                 });
             }
             log::info!("Queued {} projector window(s)", sub.pending_len());
