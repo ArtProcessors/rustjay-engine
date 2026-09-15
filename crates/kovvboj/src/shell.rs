@@ -769,6 +769,11 @@ impl KovvbojShell {
     ) {
         use rustjay_gui::egui_theme::colors::*;
 
+        let recordings_dir = app_state
+            .downcast_ref::<crate::KovvbojAppState>()
+            .map(|s| s.workspace.recordings_dir())
+            .unwrap_or_else(|| std::path::PathBuf::from("recordings"));
+
         // Which optional built-ins have anything to show, so the View menu does
         // not offer empty panels. Mirrors the built-in host's own filter.
         let (has_color, has_motion, fps, bpm, clock, web, osc, recording) = {
@@ -1164,7 +1169,7 @@ impl KovvbojShell {
                                 rustjay_core::OutputCommand::StopRecording
                             } else {
                                 rustjay_core::OutputCommand::StartRecording {
-                                    path: crate::ui::next_recording_path(),
+                                    path: crate::ui::next_recording_path(&recordings_dir),
                                     codec: rustjay_core::RecorderCodec::H264,
                                     audio_device: None,
                                 }

@@ -9,17 +9,14 @@
 //!
 //! See VARDA_PORT.md §5 and `examples/delta-egui`.
 
-/// A timestamped path under `recordings/` for a one-click recording.
-///
-/// The Outputs window lets you choose a path and codec; the top-bar button is
-/// for starting one without a decision to make.
-pub fn next_recording_path() -> String {
+/// A timestamped path under the workspace's recordings folder for a one-click
+/// recording — the top-bar button starts one without a decision to make.
+pub fn next_recording_path(dir: &std::path::Path) -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let dir = std::path::PathBuf::from("recordings");
-    std::fs::create_dir_all(&dir).ok();
+    std::fs::create_dir_all(dir).ok();
     dir.join(format!("kovvboj_{ts}.mp4"))
         .to_string_lossy()
         .to_string()

@@ -438,6 +438,11 @@ pub struct KovvbojAppState {
     /// Text-layer edits waiting for `prepare`, where the mixer is reachable.
     #[serde(skip)]
     pub pending_text: Vec<(String, TextEdit)>,
+    /// Toasts raised where there is no `EngineState` to raise them on — a
+    /// failed save, a scene that could not be loaded — shown on the next
+    /// `prepare`. A failure the log alone sees is one nobody sees mid-show.
+    #[serde(skip)]
+    pub pending_notices: Vec<(String, rustjay_core::NotificationLevel)>,
     /// A clip picked for a layer, delivered from the file-dialog thread as
     /// `(layer uuid, file)`.
     #[serde(skip)]
@@ -968,7 +973,9 @@ impl KovvbojAppState {
         true
     }
 
-    pub fn save_workspace(&self) {
+    /// Save the set; a failure reaches the user as a toast, not only the log.
+    pub fn save_workspace(&mut self) {
+        let mut failed: Vec<String> = Vec::new();
         if let Ok(mixer) = self.mixer.lock() {
             // Before the first `prepare()` the layer source map is still empty,
             // so every layer would serialise as a placeholder solid colour.
@@ -977,7 +984,10 @@ impl KovvbojAppState {
             if let Some(scene) = self.scene_snapshot_if_ready(&mixer) {
                 match self.workspace.save_scene(&scene) {
                     Ok(_) => log::info!("[Workspace] scene saved"),
-                    Err(e) => log::warn!("[Workspace] scene save failed: {}", e),
+                    Err(e) => {
+                        log::warn!("[Workspace] scene save failed: {}", e);
+                        failed.push(format!("scene: {e}"));
+                    }
                 }
             }
         }
@@ -985,12 +995,28 @@ impl KovvbojAppState {
         {
             match self.workspace.save_stage(&self.stage) {
                 Ok(_) => log::info!("[Workspace] stage saved"),
-                Err(e) => log::warn!("[Workspace] stage save failed: {}", e),
+                Err(e) => {
+                    log::warn!("[Workspace] stage save failed: {}", e);
+                    failed.push(format!("stage: {e}"));
+                }
             }
         }
         match self.workspace.save_keymap(&self.keymap) {
             Ok(_) => log::info!("[Workspace] keymap saved"),
-            Err(e) => log::warn!("[Workspace] keymap save failed: {}", e),
+            Err(e) => {
+                log::warn!("[Workspace] keymap save failed: {}", e);
+                failed.push(format!("keymap: {e}"));
+            }
+        }
+        if !failed.is_empty() {
+            self.pending_notices.push((
+                format!(
+                    "Could not save to {} — {}",
+                    self.workspace.dir.display(),
+                    failed.join("; ")
+                ),
+                rustjay_core::NotificationLevel::Error,
+            ));
         }
     }
 
@@ -1140,6 +1166,7 @@ impl Default for KovvbojAppState {
             #[cfg(feature = "mixer")]
             pending_transition: None,
             pending_text: Vec::new(),
+            pending_notices: Vec::new(),
             pending_clip: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_font: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_convert: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2640,6 +2667,10 @@ impl EffectPlugin for KovvbojRootPlugin {
             }
         }
 
+        for (message, level) in state.pending_notices.drain(..) {
+            engine.notify(message, level, std::time::Duration::from_secs(8));
+        }
+
         #[cfg(feature = "mixer")]
         {
             // Undo / redo land here: replay the recorded graph, then let the
@@ -2935,6 +2966,7 @@ impl EffectPlugin for KovvbojRootPlugin {
             .map_or(f32::MAX, |t| now.duration_since(t).as_secs_f32());
         if auto_save_elapsed >= 30.0 {
             state.auto_save_last = Some(now);
+            let mut failed: Option<anyhow::Error> = None;
             #[cfg(feature = "mixer")]
             {
                 if let Ok(mixer) = state.mixer.lock()
@@ -2942,16 +2974,31 @@ impl EffectPlugin for KovvbojRootPlugin {
                     && let Err(e) = state.workspace.save_scene(&scene)
                 {
                     log::warn!("[AutoSave] scene failed: {}", e);
+                    failed = Some(e);
                 }
             }
             #[cfg(feature = "projection")]
             {
                 if let Err(e) = state.workspace.save_stage(&state.stage) {
                     log::warn!("[AutoSave] stage failed: {}", e);
+                    failed.get_or_insert(e);
                 }
             }
             if let Err(e) = state.workspace.save_keymap(&state.keymap) {
                 log::warn!("[AutoSave] keymap failed: {}", e);
+                failed.get_or_insert(e);
+            }
+            // Once per interval, not once ever: a set that stops saving
+            // mid-show is exactly the thing to keep hearing about.
+            if let Some(e) = failed {
+                engine.notify(
+                    format!(
+                        "Auto-save failed — {} is not writable: {e}",
+                        state.workspace.dir.display()
+                    ),
+                    rustjay_core::NotificationLevel::Error,
+                    std::time::Duration::from_secs(8),
+                );
             }
         }
 
@@ -3846,7 +3893,7 @@ impl EffectPlugin for KovvbojRootPlugin {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            let dir = std::path::PathBuf::from("recordings");
+                            let dir = state.workspace.recordings_dir();
                             std::fs::create_dir_all(&dir).ok();
                             let path =
                                 dir.join(format!("projector_{}_{}_{}.mp4", i, proj.name, ts));
@@ -3983,7 +4030,7 @@ impl EffectPlugin for KovvbojRootPlugin {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            let dir = std::path::PathBuf::from("recordings");
+                            let dir = state.workspace.recordings_dir();
                             std::fs::create_dir_all(&dir).ok();
                             let path = dir.join(format!("headless_{}_{}_{}.mp4", i, hl.name, ts));
                             if let Err(e) = sub.start_headless_recording(idx, &path, fps, codec) {
