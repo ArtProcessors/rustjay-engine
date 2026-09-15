@@ -414,6 +414,14 @@ pub struct KovvbojAppState {
     #[serde(skip)]
     #[cfg(feature = "projection")]
     pub lighting_overlap_warnings: Vec<rustjay_lighting::Overlap>,
+    /// One view per channel a lighting segment samples, keyed by channel uuid
+    /// and tagged with the texture generation it was made from. A pixel
+    /// sampler compares tile sources by `Arc` pointer, so the same view has
+    /// to be handed back frame after frame for its bind group to be kept.
+    #[serde(skip)]
+    #[cfg(feature = "projection")]
+    pub lighting_channel_views:
+        std::collections::HashMap<String, (u64, std::sync::Arc<wgpu::TextureView>)>,
     /// Runtime deck creation queue (processed in `prepare()` where GPU resources are available).
     #[serde(skip)]
     #[cfg(feature = "mixer")]
@@ -1176,6 +1184,8 @@ impl Default for KovvbojAppState {
             lighting_last_frames: std::collections::HashMap::new(),
             #[cfg(feature = "projection")]
             lighting_overlap_warnings: Vec::new(),
+            #[cfg(feature = "projection")]
+            lighting_channel_views: std::collections::HashMap::new(),
             #[cfg(feature = "mixer")]
             pending_layers: Vec::new(),
             #[cfg(feature = "mixer")]
@@ -1256,23 +1266,19 @@ fn segment_region(
     }
 }
 
-/// Resolve a segment's source texture override. When the segment references a
-/// surface whose source is a mixer channel, returns that channel's texture view
-/// (via `resolve_channel`) so the segment samples the channel directly instead
-/// of the master composite. Master/Domemaster/Deck sources return `None`
-/// (sample master).
+/// The mixer channel a segment samples instead of the master composite: the
+/// one its source surface is routed to, when it names a surface and that
+/// surface is on a channel. Master/Domemaster/Deck surfaces sample the master
+/// at the surface's crop (deck routing is not implemented, as for projectors).
 #[cfg(feature = "projection")]
-fn resolve_segment_source(
+fn segment_channel<'a>(
     seg: &crate::stage::LightingSegment,
-    surfaces: &[crate::stage::KovvbojSurface],
-    resolve_channel: impl Fn(&str) -> Option<std::sync::Arc<wgpu::TextureView>>,
-) -> Option<std::sync::Arc<wgpu::TextureView>> {
+    surfaces: &'a [crate::stage::KovvbojSurface],
+) -> Option<&'a str> {
     let uuid = seg.source_surface.as_ref()?;
     let surf = surfaces.iter().find(|s| &s.uuid == uuid)?;
     match &surf.source {
-        crate::stage::SurfaceSource::Channel(ch) => resolve_channel(ch),
-        // Deck routing is not yet implemented (mirrors projector behaviour);
-        // Master/Domemaster sample the master composite at the surface's crop.
+        crate::stage::SurfaceSource::Channel(ch) => Some(ch),
         _ => None,
     }
 }
@@ -4336,6 +4342,37 @@ impl EffectPlugin for KovvbojRootPlugin {
                         let mixer_guard = state.mixer.lock().ok();
 
                         for lo in state.stage.lighting_outputs.iter_mut() {
+                            // Collect patch spans for overlap detection.
+                            for seg in lo.segments.iter().filter(|s| s.enabled) {
+                                let profile = profiles.iter().find(|p| p.id == seg.profile);
+                                let footprint = profile.map(|p| p.channels.len()).unwrap_or(3);
+                                let count = (seg.grid[0] as usize) * (seg.grid[1] as usize);
+                                overlap_spans.extend(rustjay_lighting::segment_spans(
+                                    lo.name.clone(),
+                                    seg.name.clone(),
+                                    seg.start_universe,
+                                    seg.start_channel,
+                                    footprint,
+                                    count,
+                                ));
+                            }
+
+                            let want = lo.enabled
+                                && matches!(lo.output_type, OutputType::Sacn | OutputType::ArtNet);
+                            if !want {
+                                // Off means off: no sampler, so no atlas pass and no
+                                // readback for it each frame. The sender and its
+                                // meter go with it; all three are rebuilt the frame
+                                // it is switched back on.
+                                if let Some(id) = lo.sampler_id.take() {
+                                    sub.remove_pixel_sampler(id);
+                                    if let Some(sender) = state.lighting_senders.remove(&id) {
+                                        sender.shutdown();
+                                    }
+                                    state.lighting_last_frames.remove(&id);
+                                }
+                                continue;
+                            }
                             let layout = output_atlas_layout(lo, &state.stage.surfaces);
                             let sampler_id = match lo.sampler_id {
                                 Some(id) => {
@@ -4354,37 +4391,44 @@ impl EffectPlugin for KovvbojRootPlugin {
 
                             // Per-segment source override: a surface sourced from a
                             // mixer channel makes its segment sample that channel's
-                            // texture instead of the master composite.
+                            // texture instead of the master composite. The view is
+                            // cached per channel and rebuilt only when the channel's
+                            // texture generation moves — its output ping-pongs with
+                            // FX-chain parity, see `sync_surface_source`. A fresh
+                            // `Arc` every frame compared unequal by pointer in
+                            // `set_tile_sources` and rebuilt the bind group each time.
                             let tile_sources: Vec<Option<std::sync::Arc<wgpu::TextureView>>> = lo
                                 .segments
                                 .iter()
                                 .map(|seg| {
-                                    resolve_segment_source(seg, &state.stage.surfaces, |_ch| {
-                                        #[cfg(feature = "mixer")]
-                                        {
-                                            mixer_guard
-                                                .as_ref()
-                                                .and_then(|m| m.channel_texture(_ch))
-                                                .map(|t| {
-                                                    std::sync::Arc::new(t.texture.create_view(
+                                    let ch = segment_channel(seg, &state.stage.surfaces)?;
+                                    #[cfg(feature = "mixer")]
+                                    {
+                                        let tex = mixer_guard.as_ref()?.channel_texture(ch)?;
+                                        let views = &mut state.lighting_channel_views;
+                                        if views.get(ch).is_none_or(|(g, _)| *g != tex.generation) {
+                                            views.insert(
+                                                ch.to_string(),
+                                                (
+                                                    tex.generation,
+                                                    std::sync::Arc::new(tex.texture.create_view(
                                                         &wgpu::TextureViewDescriptor::default(),
-                                                    ))
-                                                })
+                                                    )),
+                                                ),
+                                            );
                                         }
-                                        #[cfg(not(feature = "mixer"))]
-                                        {
-                                            None
-                                        }
-                                    })
+                                        views.get(ch).map(|(_, v)| v.clone())
+                                    }
+                                    #[cfg(not(feature = "mixer"))]
+                                    {
+                                        let _ = ch;
+                                        None
+                                    }
                                 })
                                 .collect();
                             sub.set_sampler_tile_sources(sampler_id, &tile_sources);
 
-                            let want = lo.enabled
-                                && matches!(lo.output_type, OutputType::Sacn | OutputType::ArtNet);
-
-                            let has_sender = state.lighting_senders.contains_key(&sampler_id);
-                            if want && !has_sender {
+                            if !state.lighting_senders.contains_key(&sampler_id) {
                                 match build_dmx_sender(&lo.output_type, &lo.transport) {
                                     Ok(sender) => {
                                         state.lighting_senders.insert(sampler_id, sender);
@@ -4404,38 +4448,16 @@ impl EffectPlugin for KovvbojRootPlugin {
                                         std::time::Duration::from_secs(4),
                                     ),
                                 }
-                            } else if !want && has_sender {
-                                if let Some(sender) = state.lighting_senders.remove(&sampler_id) {
-                                    sender.shutdown();
-                                }
-                                state.lighting_last_frames.remove(&sampler_id);
                             }
 
-                            if want {
-                                if let Some((px, layout)) = sub.pixel_sampler_atlas(sampler_id) {
-                                    let frame = build_dmx_frame(lo, &profiles, px, layout);
-                                    state.lighting_last_frames.insert(sampler_id, frame.clone());
-                                    if let Some(sender) = state.lighting_senders.get(&sampler_id) {
-                                        sender.submit(frame);
-                                    }
+                            if let Some((px, layout)) = sub.pixel_sampler_atlas(sampler_id) {
+                                let frame = build_dmx_frame(lo, &profiles, px, layout);
+                                state.lighting_last_frames.insert(sampler_id, frame.clone());
+                                if let Some(sender) = state.lighting_senders.get(&sampler_id) {
+                                    sender.submit(frame);
                                 }
-                                sink_labels.push(lo.output_type.label().to_string());
                             }
-
-                            // Collect patch spans for overlap detection.
-                            for seg in lo.segments.iter().filter(|s| s.enabled) {
-                                let profile = profiles.iter().find(|p| p.id == seg.profile);
-                                let footprint = profile.map(|p| p.channels.len()).unwrap_or(3);
-                                let count = (seg.grid[0] as usize) * (seg.grid[1] as usize);
-                                overlap_spans.extend(rustjay_lighting::segment_spans(
-                                    lo.name.clone(),
-                                    seg.name.clone(),
-                                    seg.start_universe,
-                                    seg.start_channel,
-                                    footprint,
-                                    count,
-                                ));
-                            }
+                            sink_labels.push(lo.output_type.label().to_string());
                         }
 
                         // Stop senders for outputs that no longer exist.
