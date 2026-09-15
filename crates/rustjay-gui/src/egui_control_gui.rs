@@ -1774,7 +1774,7 @@ pub fn apply_param_map_overlay(
         let mod_eng = engine.modulation.lock().unwrap_or_else(|e| e.into_inner());
         // What is already driving this parameter. Several sources can, and they
         // sum — an LFO and an audio band together is the point, not a mistake.
-        let bound: Vec<(String, &'static str, f32)> = mod_eng
+        let bound: Vec<(String, &'static str, f32, f32)> = mod_eng
             .assignments
             .get(id)
             .map(|mods| {
@@ -1785,15 +1785,19 @@ pub fn apply_param_map_overlay(
                             m.source_id.clone(),
                             mod_source_short(&entry.source),
                             m.amount,
+                            mod_eng.current_value_for(&m.source_id) * m.amount,
                         ))
                     })
                     .collect()
             })
             .unwrap_or_default();
-        let sources: Vec<(String, &'static str)> = mod_eng
+        let sources: Vec<(String, &'static str, f32)> = mod_eng
             .sources
             .iter()
-            .map(|e| (e.uuid.clone(), mod_source_short(&e.source)))
+            .map(|e| {
+                let value = mod_eng.current_value_for(&e.uuid);
+                (e.uuid.clone(), mod_source_short(&e.source), value)
+            })
             .collect();
         (bound, sources)
     };
@@ -1859,10 +1863,12 @@ pub fn apply_param_map_overlay(
                 ui.separator();
                 ui.label(egui::RichText::new("Existing").small().weak());
             }
-            for (uuid, ty) in &sources {
+            for (uuid, ty, value) in &sources {
                 // Short uuids (`lfo_0`) would all truncate to the same prefix.
                 let tag = short_tag(uuid);
-                if ui.button(format!("+ {ty} {tag}")).clicked() {
+                let resp = ui.button(format!("+ {ty} {tag}"));
+                light_chip(ui, resp.rect, *value);
+                if resp.clicked() {
                     let mut mod_eng =
                         engine.modulation.lock().unwrap_or_else(|e| e.into_inner());
                     mod_eng.assign(id, uuid, 0.5, None);
@@ -1875,12 +1881,13 @@ pub fn apply_param_map_overlay(
                 ui.separator();
                 ui.label(egui::RichText::new("Driving this").small().weak());
                 let mut drop: Option<String> = None;
-                for (uuid, ty, amount) in &bound {
+                for (uuid, ty, amount, contribution) in &bound {
                     ui.horizontal(|ui| {
                         let tag = short_tag(uuid);
-                        ui.label(
+                        let resp = ui.label(
                             egui::RichText::new(format!("{ty} {tag}  ×{amount:.2}")).small(),
                         );
+                        light_chip(ui, resp.rect, *contribution);
                         if ui
                             .small_button("✖")
                             .on_hover_text("Stop this one driving the parameter")
@@ -1908,6 +1915,20 @@ pub fn apply_param_map_overlay(
                 });
         },
     );
+}
+
+/// Light a chip with a source's live output: filled from the left by the
+/// magnitude, `signal` above zero and `cool` below. The popup is only drawn
+/// while open, and the value is a lookup the tick already made.
+fn light_chip(ui: &egui::Ui, rect: egui::Rect, value: f32) {
+    use crate::egui_theme::colors::{cool, signal};
+    let w = rect.width() * value.abs().min(1.0);
+    if w < 0.5 {
+        return;
+    }
+    let color = if value > 0.0 { signal() } else { cool() };
+    ui.painter()
+        .rect_filled(rect.with_max_x(rect.min.x + w), 2.0, color.gamma_multiply(0.3));
 }
 
 /// A tag short enough to sit in a button but still telling two sources apart.
