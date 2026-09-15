@@ -357,7 +357,7 @@ fn deck_stream_paints_invalid_url_error() {
 #[cfg(not(feature = "projection"))]
 #[test]
 fn outputs_without_projection_says_so() {
-    let harness = tab_harness(OutputsTab::default(), [700.0, 400.0]);
+    let harness = tab_harness(OutputsTab, [700.0, 400.0]);
     harness.get_by_label("Projection feature not enabled.");
     assert!(harness.query_by_label("Recording").is_none());
 }
@@ -425,7 +425,7 @@ fn outputs_projector_row_fits_a_640pt_window() {
         name: "Stream".into(),
         ..Default::default()
     });
-    let harness = tab_harness_with_app(OutputsTab::default(), [W, 700.0], app);
+    let harness = tab_harness_with_app(OutputsTab, [W, 700.0], app);
 
     harness.get_by_label("Projectors");
     let name = harness.get(By::new().role(Role::TextInput).value("Projector"));
