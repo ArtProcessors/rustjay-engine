@@ -1919,10 +1919,6 @@ pub struct KovvbojRootPlugin {
     /// is worth saying anything about — see the check in `prepare`.
     #[cfg(feature = "mixer")]
     off_deck_seen: usize,
-    /// Per-projector warp state. Each projector gets its own sync so surface-
-    /// specific warp edits don't leak across outputs.
-    #[cfg(feature = "projection")]
-    warp_syncs: std::sync::Mutex<Vec<std::sync::Arc<std::sync::Mutex<stage::WarpSync>>>>,
     /// Canonical live dome state, shared with the app state and projector.
     #[cfg(feature = "projection")]
     dome_sync: std::sync::Arc<std::sync::Mutex<stage::DomeSync>>,
@@ -1958,8 +1954,6 @@ impl KovvbojRootPlugin {
             crossfade_owned: false,
             #[cfg(feature = "mixer")]
             off_deck_seen: 0,
-            #[cfg(feature = "projection")]
-            warp_syncs: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "projection")]
             dome_sync: std::sync::Arc::new(std::sync::Mutex::new(stage::DomeSync::default())),
             #[cfg(feature = "projection")]
@@ -2009,24 +2003,6 @@ impl KovvbojRootPlugin {
         &self,
     ) -> Vec<std::sync::Arc<std::sync::Mutex<rustjay_projection::RotationSync>>> {
         self.rotation_syncs.lock().unwrap().clone()
-    }
-
-    /// Ensure warp_syncs has at least `count` entries.
-    #[cfg(feature = "projection")]
-    pub fn ensure_warp_syncs(&self, count: usize) {
-        let mut syncs = self.warp_syncs.lock().unwrap();
-        while syncs.len() < count {
-            syncs.push(std::sync::Arc::new(std::sync::Mutex::new(
-                stage::WarpSync::default(),
-            )));
-        }
-        syncs.truncate(count);
-    }
-
-    /// Shared per-projector warp syncs.
-    #[cfg(feature = "projection")]
-    pub fn warp_syncs(&self) -> Vec<std::sync::Arc<std::sync::Mutex<stage::WarpSync>>> {
-        self.warp_syncs.lock().unwrap().clone()
     }
 
     /// Shared dome state for the projector stage.
@@ -2611,12 +2587,68 @@ fn reconcile_chain(
     }
 }
 
-/// Point one output's source stage at the surface assigned to it.
+/// Publish the layers a projector's [`stage::KovvbojSurfacesStage`] draws, one
+/// per assigned surface. A layer whose source and generation are unchanged
+/// keeps its texture view, so the stage's bind groups survive; the version is
+/// bumped only when something actually moved.
+#[cfg(all(feature = "projection", feature = "mixer"))]
+fn sync_surface_layers(
+    sync: &std::sync::Arc<std::sync::Mutex<crate::stage::SourceSync>>,
+    surfaces: &[&crate::stage::KovvbojSurface],
+    mixer: &Mixer,
+) {
+    use crate::stage::{SurfaceLayer, SurfaceSource};
+    let Ok(mut g) = sync.lock() else {
+        return;
+    };
+    let layers: Vec<SurfaceLayer> = surfaces
+        .iter()
+        .enumerate()
+        .map(|(i, surf)| {
+            let source_key = Some(surf.source.label());
+            let output_generation = match &surf.source {
+                SurfaceSource::Channel(uuid) => mixer.channel_texture(uuid).map(|t| t.generation),
+                _ => None,
+            };
+            let view = match g.layers.get(i) {
+                Some(prev)
+                    if prev.source_key == source_key
+                        && prev.output_generation == output_generation =>
+                {
+                    prev.view.clone()
+                }
+                // Master, Domemaster and (for now) Deck sample the stage input.
+                _ => match &surf.source {
+                    SurfaceSource::Channel(uuid) => mixer.channel_texture(uuid).map(|tex| {
+                        std::sync::Arc::new(
+                            tex.texture
+                                .create_view(&wgpu::TextureViewDescriptor::default()),
+                        )
+                    }),
+                    _ => None,
+                },
+            };
+            SurfaceLayer {
+                view,
+                source_key,
+                output_generation,
+                uv_crop: surf.uv_crop_rect,
+                warp: surf.warp.clone(),
+            }
+        })
+        .collect();
+    if g.layers != layers {
+        g.layers = layers;
+        g.version = g.version.wrapping_add(1);
+    }
+}
+
+/// Point a headless output's source stage at the surface assigned to it.
 ///
-/// Shared by projector windows and headless outputs: both carry a
-/// `surface_index`, and until this was factored out only projectors consumed
-/// theirs, so a surface assigned to a headless output was stored, saved, and
-/// then ignored while the output emitted the raw master.
+/// Projectors used this too before they could draw several surfaces — see
+/// [`sync_surface_layers`]. Until it was factored out only projectors consumed
+/// their `surface_index`, so a surface assigned to a headless output was
+/// stored, saved, and then ignored while the output emitted the raw master.
 #[cfg(all(feature = "projection", feature = "mixer"))]
 fn sync_surface_source(
     sync: &std::sync::Arc<std::sync::Mutex<crate::stage::SourceSync>>,
@@ -2734,9 +2766,6 @@ impl EffectPlugin for KovvbojRootPlugin {
             // Create local default syncs for the initial app state.
             // Do NOT touch the plugin's internal sync vectors here —
             // main.rs and prepare() own the canonical counts.
-            s.stage.warp_syncs = vec![std::sync::Arc::new(std::sync::Mutex::new(
-                stage::WarpSync::default(),
-            ))];
             s.stage.dome_sync = Some(self.dome_sync.clone());
             s.stage.edge_blend_sync = Some(self.edge_blend_sync.clone());
             s.stage.source_syncs = vec![std::sync::Arc::new(std::sync::Mutex::new(
@@ -2827,12 +2856,10 @@ impl EffectPlugin for KovvbojRootPlugin {
                     match state.workspace.load_stage() {
                         Ok(loaded_stage) => {
                             // Preserve runtime sync handles so projector stages stay connected.
-                            let warp_syncs = std::mem::take(&mut state.stage.warp_syncs);
                             let source_syncs = std::mem::take(&mut state.stage.source_syncs);
                             let rotation_syncs = std::mem::take(&mut state.stage.rotation_syncs);
                             log::info!(
-                                "[Prepare] before load: old warp={}, source={}, rotation={}",
-                                warp_syncs.len(),
+                                "[Prepare] before load: old source={}, rotation={}",
                                 source_syncs.len(),
                                 rotation_syncs.len()
                             );
@@ -2847,29 +2874,18 @@ impl EffectPlugin for KovvbojRootPlugin {
                             );
 
                             // Restore runtime syncs.
-                            state.stage.warp_syncs = warp_syncs;
                             state.stage.source_syncs = source_syncs;
                             state.stage.rotation_syncs = rotation_syncs;
-                            self.ensure_warp_syncs(state.stage.projectors.len());
-                            state.stage.warp_syncs = self.warp_syncs.lock().unwrap().clone();
                             self.ensure_source_syncs(state.stage.projectors.len());
                             state.stage.source_syncs = self.source_syncs.lock().unwrap().clone();
                             self.ensure_rotation_syncs(state.stage.projectors.len());
                             state.stage.rotation_syncs =
                                 self.rotation_syncs.lock().unwrap().clone();
                             log::info!(
-                                "[Prepare] after sync injection: warp={}, source={}, rotation={}",
-                                state.stage.warp_syncs.len(),
+                                "[Prepare] after sync injection: source={}, rotation={}",
                                 state.stage.source_syncs.len(),
                                 state.stage.rotation_syncs.len()
                             );
-                            for (i, sync) in state.stage.warp_syncs.iter().enumerate() {
-                                log::info!(
-                                    "[Prepare] warp_sync[{}] ptr={:p}",
-                                    i,
-                                    std::sync::Arc::as_ptr(sync)
-                                );
-                            }
                             state.stage.dome_sync = Some(self.dome_sync.clone());
                             state.stage.edge_blend_sync = Some(self.edge_blend_sync.clone());
                             state.stage.publish_warp();
@@ -2891,9 +2907,8 @@ impl EffectPlugin for KovvbojRootPlugin {
                         Err(e) => {
                             log::warn!("[Workspace] failed to load stage: {}", e);
                             log::info!(
-                                "[Prepare] fallback stage: {} projectors, {} warp_syncs",
-                                state.stage.projectors.len(),
-                                state.stage.warp_syncs.len()
+                                "[Prepare] fallback stage: {} projectors",
+                                state.stage.projectors.len()
                             );
                         }
                     }
@@ -4825,12 +4840,7 @@ impl EffectPlugin for KovvbojRootPlugin {
                     if !proj.enabled {
                         continue;
                     }
-                    let sync = &stage.source_syncs[i];
-                    let surface = proj
-                        .surface_index
-                        .and_then(|idx| stage.surfaces.get(idx))
-                        .or_else(|| stage.surfaces.first());
-                    sync_surface_source(sync, surface, &mixer);
+                    sync_surface_layers(&stage.source_syncs[i], &stage.surfaces_for(proj), &mixer);
                 }
 
                 // Headless outputs route their assigned surface the same way,

@@ -6783,7 +6783,7 @@ mod egui_impl {
             .stage
             .projectors
             .iter()
-            .filter(|p| p.surface_index == Some(sel))
+            .filter(|p| p.surfaces.contains(&sel))
             .map(|p| (p.name.clone(), p.width, p.height))
             .chain(
                 state
@@ -7412,35 +7412,39 @@ mod egui_impl {
                             // By name, not by index: surfaces are *named*
                             // 1-based but stored 0-based, so a raw index picker
                             // put "Surface 1" at 0 and read as an off-by-one.
-                            ui.label("surface:");
+                            ui.label("surfaces:");
+                            let names: Vec<&str> = proj
+                                .surfaces
+                                .iter()
+                                .filter_map(|&s| state.stage.surfaces.get(s))
+                                .map(|s| s.name.as_str())
+                                .collect();
+                            let summary = match names.as_slice() {
+                                [] => "— first —".to_string(),
+                                [one] => one.to_string(),
+                                many => format!("{} surfaces", many.len()),
+                            };
+                            // A checklist, not a picker: a projector draws every
+                            // ticked surface, in list order, later ones on top.
                             egui::ComboBox::from_id_salt(format!("proj_surf_{}", i))
-                                .selected_text(
-                                    proj.surface_index
-                                        .and_then(|s| state.stage.surfaces.get(s))
-                                        .map(|s| s.name.as_str())
-                                        .unwrap_or("— none —"),
-                                )
+                                .selected_text(summary)
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                                 .show_ui(ui, |ui| {
-                                    if ui
-                                        .selectable_label(proj.surface_index.is_none(), "— none —")
-                                        .clicked()
-                                    {
-                                        proj.surface_index = None;
-                                        proj_dirty = true;
-                                    }
                                     for (si, surf) in state.stage.surfaces.iter().enumerate() {
-                                        if ui
-                                            .selectable_label(
-                                                proj.surface_index == Some(si),
-                                                &surf.name,
-                                            )
-                                            .clicked()
-                                        {
-                                            proj.surface_index = Some(si);
+                                        let mut on = proj.surfaces.contains(&si);
+                                        if ui.checkbox(&mut on, &surf.name).changed() {
+                                            if on {
+                                                proj.surfaces.push(si);
+                                                proj.surfaces.sort_unstable();
+                                            } else {
+                                                proj.surfaces.retain(|&s| s != si);
+                                            }
                                             proj_dirty = true;
                                         }
                                     }
-                                });
+                                })
+                                .response
+                                .on_hover_text(names.join(" + "));
                         });
                         ui.horizontal(|ui| {
                             ui.label("type:");
@@ -7628,21 +7632,13 @@ mod egui_impl {
                         .stage
                         .projectors
                         .push(crate::stage::KovvbojProjector::default());
-                    // Ensure source_syncs, warp_syncs, and rotation_syncs exist for the new projector.
+                    // Ensure source_syncs and rotation_syncs exist for the new projector.
                     while state.stage.source_syncs.len() <= new_idx {
                         state
                             .stage
                             .source_syncs
                             .push(std::sync::Arc::new(std::sync::Mutex::new(
                                 crate::stage::SourceSync::default(),
-                            )));
-                    }
-                    while state.stage.warp_syncs.len() <= new_idx {
-                        state
-                            .stage
-                            .warp_syncs
-                            .push(std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::stage::WarpSync::default(),
                             )));
                     }
                     while state.stage.rotation_syncs.len() <= new_idx {
@@ -7668,17 +7664,6 @@ mod egui_impl {
                                     proj.width,
                                     proj.height,
                                 ));
-                            let w =
-                                state
-                                    .stage
-                                    .warp_syncs
-                                    .get(new_idx)
-                                    .cloned()
-                                    .unwrap_or_else(|| {
-                                        std::sync::Arc::new(std::sync::Mutex::new(
-                                            crate::stage::WarpSync::default(),
-                                        ))
-                                    });
                             let d = state.stage.dome_sync.clone().unwrap();
                             let e = state.stage.edge_blend_sync.clone().unwrap();
                             let s = state
@@ -7705,33 +7690,7 @@ mod egui_impl {
                                 attrs,
                                 proj.fullscreen_monitor,
                                 move |device, format| {
-                                    vec![
-                                        Box::new(crate::stage::KovvbojSourceStage::new(
-                                            device,
-                                            format,
-                                            s.clone(),
-                                        )),
-                                        Box::new(crate::stage::KovvbojDomeStage::new(
-                                            device,
-                                            format,
-                                            d.clone(),
-                                        )),
-                                        Box::new(crate::stage::KovvbojEdgeBlendStage::new(
-                                            device,
-                                            format,
-                                            e.clone(),
-                                        )),
-                                        Box::new(crate::stage::KovvbojWarpStage::new(
-                                            device,
-                                            format,
-                                            w.clone(),
-                                        )),
-                                        Box::new(rustjay_projection::RotationStage::new(
-                                            device,
-                                            format,
-                                            r.clone(),
-                                        )),
-                                    ]
+                                    crate::stage::projector_stages(device, format, &s, &d, &e, &r)
                                 },
                             );
                             log::info!(

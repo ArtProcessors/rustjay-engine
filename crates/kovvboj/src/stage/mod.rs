@@ -428,14 +428,8 @@ pub struct KovvbojStage {
     /// when the mixer is contended during render.
     #[serde(skip)]
     pub cached_source_options: Vec<(String, SurfaceSource)>,
-    /// Per-projector warp state. Each projector's [`KovvbojWarpStage`] reads its
-    /// own slot so surface-specific warp edits reach only the assigned projector.
-    /// Injected by the plugin; grown/shrunk with projectors.
-    #[cfg(feature = "projection")]
-    #[serde(skip)]
-    pub warp_syncs: Vec<std::sync::Arc<std::sync::Mutex<WarpSync>>>,
-    /// Per-headless-output warp and crop state, mirroring `warp_syncs` and
-    /// `source_syncs`. A headless output ran an `IdentityStage` and got no
+    /// Per-headless-output warp and crop state, the single-surface pipeline
+    /// projectors used before [`KovvbojSurfacesStage`]. A headless output ran an `IdentityStage` and got no
     /// geometry published to it, so a surface assigned to one was stored,
     /// saved, and then ignored — the output emitted the raw master.
     #[cfg(feature = "projection")]
@@ -452,9 +446,9 @@ pub struct KovvbojStage {
     #[cfg(feature = "projection")]
     #[serde(skip)]
     pub edge_blend_sync: Option<std::sync::Arc<std::sync::Mutex<EdgeBlendSync>>>,
-    /// Per-projector source texture override. Each projector's [`KovvbojSourceStage`]
-    /// reads its slot to determine which texture to sample (Master = passthrough,
-    /// Channel = override). Injected by the plugin; grown/shrunk with projectors.
+    /// Per-projector surface layers, read by each projector's
+    /// [`KovvbojSurfacesStage`] and rebuilt by `prepare` every frame. Injected by
+    /// the plugin; grown/shrunk with projectors.
     #[cfg(feature = "projection")]
     #[serde(skip)]
     pub source_syncs: Vec<std::sync::Arc<std::sync::Mutex<SourceSync>>>,
@@ -480,7 +474,6 @@ impl KovvbojStage {
             selected_surface_index: 0,
             cached_source_options: Vec::new(),
             #[cfg(feature = "projection")]
-            warp_syncs: Vec::new(),
             #[cfg(feature = "projection")]
             headless_warp_syncs: Vec::new(),
             #[cfg(feature = "projection")]
@@ -514,7 +507,12 @@ impl KovvbojStage {
             _ => {}
         };
         for proj in &mut self.projectors {
-            remap(&mut proj.surface_index);
+            proj.surfaces.retain(|&i| i != idx);
+            for i in &mut proj.surfaces {
+                if *i > idx {
+                    *i -= 1;
+                }
+            }
         }
         for hl in &mut self.headless_outputs {
             remap(&mut hl.surface_index);
@@ -601,44 +599,29 @@ impl KovvbojStage {
         }
     }
 
-    /// Push the warp of the Master-routed surface (or the first surface) into
-    /// the shared [`WarpSync`] so the projector's [`KovvbojWarpStage`] picks it up
-    /// on the next frame. Bumps the version so the projector only re-applies on
-    /// an actual edit. Call after the GUI mutates a surface's warp.
+    /// The surfaces a projector draws, in order. Indices that no longer
+    /// resolve are skipped; a projector left with none draws the first surface,
+    /// and a stage with no surfaces yields none (the projector shows the master).
+    pub fn surfaces_for(&self, proj: &KovvbojProjector) -> Vec<&KovvbojSurface> {
+        let assigned: Vec<_> = proj
+            .surfaces
+            .iter()
+            .filter_map(|&i| self.surfaces.get(i))
+            .collect();
+        if assigned.is_empty() {
+            self.surfaces.first().into_iter().collect()
+        } else {
+            assigned
+        }
+    }
+
+    /// Push each headless output's surface warp into its [`WarpSync`] so its
+    /// [`KovvbojWarpStage`] picks it up on the next frame. Bumps the version so
+    /// the stage only re-applies on an actual edit. Call after the GUI mutates a
+    /// surface's warp. Projectors don't need this: `prepare` rebuilds their
+    /// surface layers every frame.
     #[cfg(feature = "projection")]
     pub fn publish_warp(&self) {
-        log::debug!(
-            "[publish_warp] {} projectors, {} warp_syncs, {} surfaces",
-            self.projectors.len(),
-            self.warp_syncs.len(),
-            self.surfaces.len()
-        );
-        for (i, proj) in self.projectors.iter().enumerate() {
-            let Some(sync) = self.warp_syncs.get(i) else {
-                log::warn!("[publish_warp] proj {} has no warp_sync", i);
-                continue;
-            };
-            let mode = self.warp_for(proj.surface_index);
-            match sync.lock() {
-                Ok(mut g) => {
-                    let old_version = g.version;
-                    g.mode = mode;
-                    g.version = g.version.wrapping_add(1);
-                    log::debug!(
-                        "[publish_warp] proj {} -> surf {:?} ptr={:p} version {} -> {}",
-                        i,
-                        proj.surface_index,
-                        std::sync::Arc::as_ptr(sync),
-                        old_version,
-                        g.version
-                    );
-                }
-                Err(e) => {
-                    log::warn!("[publish_warp] proj {} sync poisoned: {}", i, e);
-                }
-            }
-        }
-
         // Headless outputs carry a `surface_index` too, and until now nothing
         // read it: they rendered the master untouched however the surface was
         // warped.
@@ -671,6 +654,21 @@ impl KovvbojStage {
     }
 }
 
+/// A projector showed one optional surface before it could show several; a
+/// set saved then carries `null` or a single index, which read as a list.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<usize>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(Option<usize>),
+        Many(Vec<usize>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(one) => one.into_iter().collect(),
+        OneOrMany::Many(many) => many,
+    })
+}
+
 /// Configuration for one projector output window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KovvbojProjector {
@@ -680,8 +678,10 @@ pub struct KovvbojProjector {
     pub height: u32,
     /// `None` = windowed; `Some(index)` = fullscreen on monitor N.
     pub fullscreen_monitor: Option<usize>,
-    /// Which surface this projector displays (`None` = master / no override).
-    pub surface_index: Option<usize>,
+    /// Surfaces this projector draws, by index, later ones on top. Empty draws
+    /// the first surface. Reads the single `surface_index` of older sets.
+    #[serde(default, alias = "surface_index", deserialize_with = "one_or_many")]
+    pub surfaces: Vec<usize>,
     /// Runtime window ID for live management (not persisted).
     #[serde(skip)]
     pub window_id: Option<winit::window::WindowId>,
@@ -733,7 +733,7 @@ impl Default for KovvbojProjector {
             width: 1920,
             height: 1080,
             fullscreen_monitor: None,
-            surface_index: Some(0),
+            surfaces: vec![0],
             window_id: None,
             rotation: OutputRotation::default(),
             output_type: OutputType::Display,
@@ -1145,6 +1145,10 @@ pub struct SourceSync {
     /// UV crop rectangle `[min_u, min_v, max_u, max_v]` applied after scale/offset.
     /// Default `[0.0, 0.0, 1.0, 1.0]` = no crop.
     pub uv_crop: [f32; 4],
+    /// Projectors only: every surface the projector draws, in order, read by
+    /// [`KovvbojSurfacesStage`]. Headless outputs use the single-source fields
+    /// above. `version` is bumped when this changes.
+    pub layers: Vec<SurfaceLayer>,
 }
 
 #[cfg(feature = "projection")]
@@ -1158,6 +1162,66 @@ impl Default for SourceSync {
             uv_scale: [1.0, 1.0],
             uv_offset: [0.0, 0.0],
             uv_crop: [0.0, 0.0, 1.0, 1.0],
+            layers: Vec::new(),
+        }
+    }
+}
+
+/// A [`rustjay_projection::WarpStage`] kept in step with a live-edited
+/// [`rustjay_projection::WarpMode`]: a corner-pin drag or a same-size mesh edit
+/// updates buffers in place; a mode switch or a mesh resize rebuilds.
+#[cfg(feature = "projection")]
+pub struct LiveWarp {
+    pub inner: rustjay_projection::WarpStage,
+    format: wgpu::TextureFormat,
+    inner_is_corner_pin: bool,
+    last_mesh_cols: u32,
+    last_mesh_rows: u32,
+}
+
+#[cfg(feature = "projection")]
+impl LiveWarp {
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        mode: &rustjay_projection::WarpMode,
+    ) -> Self {
+        let (last_mesh_cols, last_mesh_rows) = match mode {
+            rustjay_projection::WarpMode::Mesh(mesh) => (mesh.cols, mesh.rows),
+            _ => (0, 0),
+        };
+        Self {
+            inner: rustjay_projection::WarpStage::from_mode(device, format, mode),
+            format,
+            inner_is_corner_pin: matches!(mode, rustjay_projection::WarpMode::CornerPin { .. }),
+            last_mesh_cols,
+            last_mesh_rows,
+        }
+    }
+
+    pub fn apply(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mode: &rustjay_projection::WarpMode,
+    ) {
+        match mode {
+            // Same mode family → cheap homography update (no rebuild on drag).
+            rustjay_projection::WarpMode::CornerPin { corners } if self.inner_is_corner_pin => {
+                let src = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                let h = rustjay_projection::compute_forward_homography(&src, corners);
+                self.inner.set_homography(queue, &h);
+            }
+            // Same mesh dimensions → cheap vertex buffer update (no rebuild on drag).
+            rustjay_projection::WarpMode::Mesh(mesh)
+                if !self.inner_is_corner_pin
+                    && mesh.cols == self.last_mesh_cols
+                    && mesh.rows == self.last_mesh_rows =>
+            {
+                self.inner.set_mesh(queue, mesh);
+            }
+            // Mode switch or mesh dimension change → rebuild the warp stage.
+            _ => *self = Self::new(device, self.format, mode),
         }
     }
 }
@@ -1167,13 +1231,9 @@ impl Default for SourceSync {
 /// a mode switch or mesh edit rebuilds the inner [`rustjay_projection::WarpStage`].
 #[cfg(feature = "projection")]
 pub struct KovvbojWarpStage {
-    inner: rustjay_projection::WarpStage,
-    format: wgpu::TextureFormat,
+    warp: LiveWarp,
     sync: std::sync::Arc<std::sync::Mutex<WarpSync>>,
     last_version: u64,
-    inner_is_corner_pin: bool,
-    last_mesh_cols: u32,
-    last_mesh_rows: u32,
 }
 
 #[cfg(feature = "projection")]
@@ -1187,20 +1247,10 @@ impl KovvbojWarpStage {
             let g = sync.lock().unwrap_or_else(|e| e.into_inner());
             (g.mode.clone(), g.version)
         };
-        let inner_is_corner_pin = matches!(mode, rustjay_projection::WarpMode::CornerPin { .. });
-        let (last_mesh_cols, last_mesh_rows) = match &mode {
-            rustjay_projection::WarpMode::Mesh(mesh) => (mesh.cols, mesh.rows),
-            _ => (0, 0),
-        };
-        let inner = rustjay_projection::WarpStage::from_mode(device, format, &mode);
         Self {
-            inner,
-            format,
+            warp: LiveWarp::new(device, format, &mode),
             sync,
             last_version: version,
-            inner_is_corner_pin,
-            last_mesh_cols,
-            last_mesh_rows,
         }
     }
 }
@@ -1213,8 +1263,8 @@ impl rustjay_projection::ProjectionStage for KovvbojWarpStage {
 
     /// An identity corner-pin or mesh changes nothing, so the pass is skipped
     /// and the engine feeds the previous stage's output straight through —
-    /// a full-resolution draw saved per projector per frame, which is every
-    /// projector that has not been warped. The source stage stays active, so
+    /// a full-resolution draw saved per output per frame, which is every
+    /// output that has not been warped. The source stage stays active, so
     /// something still copies the input to the surface. A version bump while
     /// inactive is picked up by the next `render`, which compares versions.
     fn is_active(&self) -> bool {
@@ -1239,48 +1289,170 @@ impl rustjay_projection::ProjectionStage for KovvbojWarpStage {
             (g.mode.clone(), g.version)
         };
         if version != self.last_version {
-            log::debug!(
-                "[KovvbojWarpStage] ptr={:p} version changed {} -> {}",
-                std::sync::Arc::as_ptr(&self.sync),
-                self.last_version,
-                version
-            );
             self.last_version = version;
-            match &mode {
-                // Same mode family → cheap homography update (no rebuild on drag).
-                rustjay_projection::WarpMode::CornerPin { corners } if self.inner_is_corner_pin => {
-                    let src = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-                    let h = rustjay_projection::compute_forward_homography(&src, corners);
-                    self.inner.set_homography(ctx.queue, &h);
-                }
-                // Same mesh dimensions → cheap vertex buffer update (no rebuild on drag).
-                rustjay_projection::WarpMode::Mesh(mesh)
-                    if !self.inner_is_corner_pin
-                        && mesh.cols == self.last_mesh_cols
-                        && mesh.rows == self.last_mesh_rows =>
-                {
-                    self.inner.set_mesh(ctx.queue, mesh);
-                }
-                // Mode switch or mesh dimension change → rebuild the warp stage.
-                _ => {
-                    self.inner =
-                        rustjay_projection::WarpStage::from_mode(ctx.device, self.format, &mode);
-                    self.inner_is_corner_pin =
-                        matches!(mode, rustjay_projection::WarpMode::CornerPin { .. });
-                    if let rustjay_projection::WarpMode::Mesh(mesh) = &mode {
-                        self.last_mesh_cols = mesh.cols;
-                        self.last_mesh_rows = mesh.rows;
-                    }
-                }
-            }
+            self.warp.apply(ctx.device, ctx.queue, &mode);
         }
-        self.inner
+        self.warp
+            .inner
             .render(ctx, input, input_texture, output, output_size);
     }
 
     fn on_input_changed(&mut self, device: &wgpu::Device, size: [u32; 2]) {
-        self.inner.on_input_changed(device, size);
+        self.warp.inner.on_input_changed(device, size);
     }
+}
+
+/// One surface a projector draws: which texture, which part of it, and where
+/// it lands in the projector's frame.
+#[cfg(feature = "projection")]
+#[derive(Debug, Clone)]
+pub struct SurfaceLayer {
+    /// `None` = the stage's input (master mix).
+    pub view: Option<std::sync::Arc<wgpu::TextureView>>,
+    /// See [`SourceSync::source_key`].
+    pub source_key: Option<String>,
+    /// See [`SourceSync::output_generation`].
+    pub output_generation: Option<u64>,
+    pub uv_crop: [f32; 4],
+    pub warp: rustjay_projection::WarpMode,
+}
+
+#[cfg(feature = "projection")]
+impl Default for SurfaceLayer {
+    fn default() -> Self {
+        Self {
+            view: None,
+            source_key: None,
+            output_generation: None,
+            uv_crop: [0.0, 0.0, 1.0, 1.0],
+            warp: rustjay_projection::WarpMode::identity(),
+        }
+    }
+}
+
+#[cfg(feature = "projection")]
+impl PartialEq for SurfaceLayer {
+    /// Views compare by identity: a rebuilt view is a change even when it
+    /// points at the same texture, because the stage caches bind groups by it.
+    fn eq(&self, other: &Self) -> bool {
+        let same_view = match (&self.view, &other.view) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        same_view
+            && self.source_key == other.source_key
+            && self.output_generation == other.output_generation
+            && self.uv_crop == other.uv_crop
+            && self.warp == other.warp
+    }
+}
+
+/// Draws every surface assigned to a projector into one frame, each with its
+/// own source, crop and warp, in surface order — later surfaces on top.
+///
+/// Replaces the source + warp pair for projectors. Edge blend runs after it, on
+/// the projector's own raster, where the physical overlap is.
+#[cfg(feature = "projection")]
+pub struct KovvbojSurfacesStage {
+    format: wgpu::TextureFormat,
+    sync: std::sync::Arc<std::sync::Mutex<SourceSync>>,
+    last_version: Option<u64>,
+    slots: Vec<(LiveWarp, Option<std::sync::Arc<wgpu::TextureView>>)>,
+}
+
+#[cfg(feature = "projection")]
+impl KovvbojSurfacesStage {
+    pub fn new(
+        format: wgpu::TextureFormat,
+        sync: std::sync::Arc<std::sync::Mutex<SourceSync>>,
+    ) -> Self {
+        Self {
+            format,
+            sync,
+            last_version: None,
+            slots: Vec::new(),
+        }
+    }
+}
+
+#[cfg(feature = "projection")]
+impl rustjay_projection::ProjectionStage for KovvbojSurfacesStage {
+    fn label(&self) -> &str {
+        "kovvboj-surfaces"
+    }
+
+    fn render(
+        &mut self,
+        ctx: &mut rustjay_core::RenderCtx<'_>,
+        input: &wgpu::TextureView,
+        input_texture: Option<&wgpu::Texture>,
+        output: &wgpu::TextureView,
+        output_size: [u32; 2],
+    ) {
+        {
+            let g = self.sync.lock().unwrap_or_else(|e| e.into_inner());
+            if self.last_version != Some(g.version) {
+                self.last_version = Some(g.version);
+                // Nothing published yet (the first frames) draws the master.
+                let fallback = [SurfaceLayer::default()];
+                let layers = if g.layers.is_empty() { &fallback[..] } else { &g.layers[..] };
+                self.slots.truncate(layers.len());
+                for (i, layer) in layers.iter().enumerate() {
+                    match self.slots.get_mut(i) {
+                        Some((warp, view)) => {
+                            warp.apply(ctx.device, ctx.queue, &layer.warp);
+                            *view = layer.view.clone();
+                        }
+                        None => self.slots.push((
+                            LiveWarp::new(ctx.device, self.format, &layer.warp),
+                            layer.view.clone(),
+                        )),
+                    }
+                    self.slots[i].0.inner.set_uv_crop(ctx.queue, &layer.uv_crop);
+                }
+            }
+        }
+
+        for (i, (warp, view)) in self.slots.iter_mut().enumerate() {
+            let source = view.as_deref().unwrap_or(input);
+            if i == 0 {
+                warp.inner
+                    .render(ctx, source, input_texture, output, output_size);
+            } else {
+                warp.inner.render_over(ctx, source, output);
+            }
+        }
+    }
+
+    fn on_input_changed(&mut self, device: &wgpu::Device, size: [u32; 2]) {
+        for (warp, _) in &mut self.slots {
+            warp.inner.on_input_changed(device, size);
+        }
+    }
+}
+
+/// The stage chain every projector window runs.
+#[cfg(feature = "projection")]
+pub fn projector_stages(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    source: &std::sync::Arc<std::sync::Mutex<SourceSync>>,
+    dome: &std::sync::Arc<std::sync::Mutex<DomeSync>>,
+    edge_blend: &std::sync::Arc<std::sync::Mutex<EdgeBlendSync>>,
+    rotation: &std::sync::Arc<std::sync::Mutex<rustjay_projection::RotationSync>>,
+) -> Vec<Box<dyn rustjay_projection::ProjectionStage>> {
+    vec![
+        // Dome reprojects the master; surfaces then sample it like any input.
+        Box::new(KovvbojDomeStage::new(device, format, dome.clone())),
+        Box::new(KovvbojSurfacesStage::new(format, source.clone())),
+        Box::new(KovvbojEdgeBlendStage::new(device, format, edge_blend.clone())),
+        Box::new(rustjay_projection::RotationStage::new(
+            device,
+            format,
+            rotation.clone(),
+        )),
+    ]
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1682,9 +1854,9 @@ mod tests {
     #[test]
     fn remove_surface_repoints_outputs() {
         let mut stage = stage_with(3);
-        for idx in [Some(0), Some(1), Some(2), None] {
+        for surfaces in [vec![0], vec![1], vec![2], vec![], vec![0, 1, 2]] {
             stage.projectors.push(KovvbojProjector {
-                surface_index: idx,
+                surfaces,
                 ..Default::default()
             });
         }
@@ -1695,14 +1867,14 @@ mod tests {
 
         stage.remove_surface(1);
 
-        let got: Vec<_> = stage.projectors.iter().map(|p| p.surface_index).collect();
-        assert_eq!(got, vec![Some(0), None, Some(1), None]);
+        let got: Vec<_> = stage.projectors.iter().map(|p| p.surfaces.clone()).collect();
+        assert_eq!(got, vec![vec![0], vec![], vec![1], vec![], vec![0, 1]]);
         assert_eq!(stage.headless_outputs[0].surface_index, Some(1));
         assert_eq!(stage.surfaces.len(), 2);
     }
 
-    /// Deleting the last surface must hand the projector identity, not leave
-    /// the dead surface's warp live on the output.
+    /// Deleting the last surface must hand the output identity, not leave the
+    /// dead surface's warp live on it.
     #[cfg(feature = "projection")]
     #[test]
     fn publish_warp_falls_back_to_identity() {
@@ -1713,9 +1885,12 @@ mod tests {
             [0.9, 0.9],
             [0.1, 0.8],
         ]);
-        stage.projectors.push(KovvbojProjector::default());
+        stage.headless_outputs.push(KovvbojHeadlessConfig {
+            surface_index: Some(0),
+            ..Default::default()
+        });
         let sync = std::sync::Arc::new(std::sync::Mutex::new(WarpSync::default()));
-        stage.warp_syncs.push(sync.clone());
+        stage.headless_warp_syncs.push(sync.clone());
 
         stage.publish_warp();
         assert!(!sync.lock().unwrap().mode.is_identity());
@@ -1723,6 +1898,40 @@ mod tests {
         stage.remove_surface(0);
         stage.publish_warp();
         assert!(sync.lock().unwrap().mode.is_identity());
+    }
+
+    /// A projector draws what it lists, skips what no longer exists, and falls
+    /// back to the first surface rather than to nothing.
+    #[test]
+    fn projector_surfaces_resolve_in_order() {
+        let stage = stage_with(3);
+        let names = |surfaces: Vec<usize>| -> Vec<String> {
+            let proj = KovvbojProjector {
+                surfaces,
+                ..Default::default()
+            };
+            stage.surfaces_for(&proj).iter().map(|s| s.name.clone()).collect()
+        };
+        assert_eq!(names(vec![2, 0]), ["Surface 3", "Surface 1"]);
+        assert_eq!(names(vec![7, 1]), ["Surface 2"]);
+        assert_eq!(names(vec![]), ["Surface 1"]);
+        assert!(KovvbojStage::new().surfaces_for(&KovvbojProjector::default()).is_empty());
+    }
+
+    /// Sets saved when a projector had one optional surface still load.
+    #[test]
+    fn projector_reads_legacy_surface_index() {
+        let base = serde_json::to_value(KovvbojProjector::default()).unwrap();
+        let with = |key: &str, v: serde_json::Value| -> Vec<usize> {
+            let mut obj = base.clone();
+            let map = obj.as_object_mut().unwrap();
+            map.remove("surfaces");
+            map.insert(key.into(), v);
+            serde_json::from_value::<KovvbojProjector>(obj).unwrap().surfaces
+        };
+        assert_eq!(with("surface_index", serde_json::json!(2)), [2]);
+        assert!(with("surface_index", serde_json::Value::Null).is_empty());
+        assert_eq!(with("surfaces", serde_json::json!([1, 0])), [1, 0]);
     }
 
     /// Numbering off `len()` hands out a name that is already taken.

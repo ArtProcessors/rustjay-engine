@@ -701,7 +701,35 @@ impl ProjectionStage for WarpStage {
                 blit.blit(ctx.encoder, &bg, output, vb);
                 return;
             }
+        self.draw(ctx, input, output, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+    }
 
+    fn on_input_changed(&mut self, _device: &wgpu::Device, _size: [u32; 2]) {
+        self.cached_bind_group = None;
+        self.cached_input_ptr = None;
+    }
+}
+
+impl WarpStage {
+    /// Draw over whatever `output` already holds instead of clearing it, so
+    /// several warps layer into one frame — a projector showing more than one
+    /// surface. Always runs the warp pass: the identity blit clears.
+    pub fn render_over(
+        &mut self,
+        ctx: &mut RenderCtx<'_>,
+        input: &wgpu::TextureView,
+        output: &wgpu::TextureView,
+    ) {
+        self.draw(ctx, input, output, wgpu::LoadOp::Load);
+    }
+
+    fn draw(
+        &mut self,
+        ctx: &mut RenderCtx<'_>,
+        input: &wgpu::TextureView,
+        output: &wgpu::TextureView,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) {
         let input_ptr = input as *const _ as usize;
         let bind_group = if self.cached_input_ptr == Some(input_ptr) {
             self.cached_bind_group.as_ref().unwrap()
@@ -736,7 +764,7 @@ impl ProjectionStage for WarpStage {
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -750,11 +778,6 @@ impl ProjectionStage for WarpStage {
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         pass.set_bind_group(0, bind_group, &[]);
         pass.draw_indexed(0..self.num_indices, 0, 0..1);
-    }
-
-    fn on_input_changed(&mut self, _device: &wgpu::Device, _size: [u32; 2]) {
-        self.cached_bind_group = None;
-        self.cached_input_ptr = None;
     }
 }
 
@@ -861,6 +884,46 @@ mod tests {
         assert_eq!(&pixels[4..8], &[0, 0, 0, 255]);
         assert_eq!(&pixels[8..12], &[0, 0, 0, 255]);
         assert_eq!(&pixels[12..16], &[255, 255, 255, 255]);
+    }
+
+    /// Two surfaces on one projector: the second draw must land beside the
+    /// first, not clear it.
+    #[test]
+    fn render_over_layers_without_clearing() {
+        let (device, queue) = pollster::block_on(crate::test_harness::init_wgpu());
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let (red_tex, red) =
+            crate::test_harness::create_solid_texture(&device, &queue, 4, 4, [255, 0, 0, 255]);
+        let (_green_tex, green) =
+            crate::test_harness::create_solid_texture(&device, &queue, 4, 4, [0, 255, 0, 255]);
+        let (out_tex, out) = crate::test_harness::create_output_texture(&device, 4, 4);
+
+        let left = WarpMode::corner_pin([[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]]);
+        let right = WarpMode::corner_pin([[0.5, 0.0], [1.0, 0.0], [1.0, 1.0], [0.5, 1.0]]);
+        let mut first = WarpStage::from_mode(&device, format, &left);
+        let mut second = WarpStage::from_mode(&device, format, &right);
+
+        crate::test_harness::run_stage(&device, &queue, &mut first, &red, Some(&red_tex), &out, [4, 4]);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let dummy_vb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 64,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+        let mut ctx = RenderCtx {
+            device: &device,
+            queue: &queue,
+            encoder: &mut encoder,
+            vertex_buffer: &dummy_vb,
+        };
+        second.render_over(&mut ctx, &green, &out);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let px = crate::test_harness::readback_rgba8(&device, &queue, &out_tex, 4, 4);
+        let row1 = 4 * 4;
+        assert_eq!(&px[row1..row1 + 4], &[255, 0, 0, 255], "left survives");
+        assert_eq!(&px[row1 + 12..row1 + 16], &[0, 255, 0, 255], "right drawn over");
     }
 
     #[test]
