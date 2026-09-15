@@ -1393,13 +1393,33 @@ impl KovvbojShell {
         app_state: &mut dyn std::any::Any,
         deck: usize,
     ) {
+        #[cfg(feature = "mixer")]
+        let uuid = if deck == 1 { crate::DECK_B } else { crate::DECK_A };
+        #[cfg(feature = "mixer")]
+        let selected = app_state
+            .downcast_ref::<crate::KovvbojAppState>()
+            .is_some_and(|s| {
+                matches!(&s.selection, crate::Selection::Group { group } if group == uuid)
+            });
+        #[cfg(not(feature = "mixer"))]
+        let selected = false;
+        let mut select = false;
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(label)
-                    .strong()
-                    .monospace()
-                    .color(rustjay_gui::egui_theme::colors::ink_4()),
-            );
+            // The heading selects the deck: its level, blend and chain then
+            // go in the inspector, and ➕ in the library adds an effect to it.
+            if ui
+                .selectable_label(
+                    selected,
+                    egui::RichText::new(label)
+                        .strong()
+                        .monospace()
+                        .color(rustjay_gui::egui_theme::colors::ink_4()),
+                )
+                .on_hover_text("Select the deck — edit it in the inspector, add effects from the library")
+                .clicked()
+            {
+                select = true;
+            }
             #[cfg(feature = "mixer")]
             {
                 let typed = &mut self.deck_name[deck.min(1)];
@@ -1420,7 +1440,6 @@ impl KovvbojShell {
                     .clicked();
                 if let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>() {
                     if entered || clicked {
-                        let uuid = if deck == 1 { crate::DECK_B } else { crate::DECK_A };
                         state.pending_group_save = Some((uuid.to_string(), name.clone()));
                         self.deck_name[deck.min(1)].clear();
                     } else if named && state.saved_groups.iter().any(|g| g.name == name) {
@@ -1434,6 +1453,14 @@ impl KovvbojShell {
                 }
             }
         });
+        #[cfg(feature = "mixer")]
+        if select && let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>() {
+            state.selection = crate::Selection::Group {
+                group: uuid.to_string(),
+            };
+        }
+        #[cfg(not(feature = "mixer"))]
+        let _ = select;
         ui.separator();
     }
 

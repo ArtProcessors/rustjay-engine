@@ -1550,14 +1550,18 @@ impl EffectInstance for Mixer {
             g.rendered = false;
 
             let items = self.group_items(&uuid);
-            // A deck renders even with nothing on it: the normal path clears its
-            // accumulator, so an empty deck is a black image the transition can
-            // fade to. Letting it fall through to `release_resources` left the
-            // transition without two inputs, and the crossfader did nothing at
-            // all. It costs an empty deck its four textures, which is the price
-            // of a fader that always works.
+            // A deck renders even with nothing on it, and even muted: the
+            // normal path clears its accumulator, so an empty or muted deck is
+            // a black image the transition can fade to. Letting it fall
+            // through to `release_resources` left the transition without two
+            // inputs, the crossfader did nothing at all, and the decks
+            // composited as ordinary groups — so muting deck A while parked on
+            // it showed deck B at full, fader or no fader. It costs such a
+            // deck its four textures, which is the price of a fader that
+            // always works. Its members' opacities are already zero (see
+            // `raw_opacities`), so the sources do not render either.
             let is_deck = self.deck_of(&uuid).is_some();
-            if !self.group_audible(&uuid) || (items.is_empty() && !is_deck) {
+            if !is_deck && (!self.group_audible(&uuid) || items.is_empty()) {
                 // Nothing to composite, or nothing that would be heard. Hand
                 // back the four full-resolution textures rather than hold them.
                 g.release_resources();

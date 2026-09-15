@@ -2154,46 +2154,7 @@ mod egui_impl {
                 {
                     acts.save = Some(uuid.clone());
                 }
-                // Through the parameter, not the field: the render reads
-                // `grp_<uuid>_opacity` from the engine now that groups declare
-                // their parameters, so writing the field alone moved nothing —
-                // and it is what makes the fader MIDI-mappable and modulatable,
-                // exactly as a layer's is.
-                let key = format!("grp_{uuid}_opacity");
-                let mut op = engine
-                    .get_param_base(&key)
-                    .unwrap_or(mixer.groups[gi].opacity);
-                // `slider_width`, not `add_sized`: a Slider always allocates the
-                // theme's 200pt and ignores the size it is handed. That pushed
-                // this row past a half-width column, egui widens a Ui to fit
-                // whatever overflows it, and every row after grew to match —
-                // which is what painted deck A's layers across deck B. M, S and
-                // a readable name still go to its left, so it only grows into
-                // what is spare after them.
-                ui.spacing_mut().slider_width =
-                    (ui.available_width() - 56.0 - 96.0).clamp(40.0, 80.0);
-                if ui
-                    .add(
-                        egui::Slider::new(&mut op, 0.0..=1.0)
-                            .show_value(false)
-                            .trailing_fill(true),
-                    )
-                    .on_hover_text("Group opacity")
-                    .changed()
-                {
-                    engine.set_param_base(&key, op);
-                    mixer.groups[gi].opacity = op;
-                }
-                let mut mute = mixer.groups[gi].mute;
-                if ui.selectable_label(mute, "M").on_hover_text("Mute the group").clicked() {
-                    mute = !mute;
-                    mixer.groups[gi].mute = mute;
-                }
-                let mut solo = mixer.groups[gi].solo;
-                if ui.selectable_label(solo, "S").on_hover_text("Solo the group").clicked() {
-                    solo = !solo;
-                    mixer.groups[gi].solo = solo;
-                }
+                group_mix_controls(ui, mixer, gi, engine);
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     if ui
                         .add(
@@ -2213,8 +2174,98 @@ mod egui_impl {
                 });
             });
         });
+        group_strip(ui, mixer, gi, acts);
+    }
 
-        // The group's own chain: what every member passes through together.
+    /// A group's opacity, M and S, laid right-to-left; shared by a group's
+    /// header row and a deck's.
+    fn group_mix_controls(
+        ui: &mut egui::Ui,
+        mixer: &mut rustjay_mixer::Mixer,
+        gi: usize,
+        engine: &mut EngineState,
+    ) {
+        let uuid = mixer.groups[gi].uuid.clone();
+        // Through the parameter, not the field: the render reads
+        // `grp_<uuid>_opacity` from the engine now that groups declare
+        // their parameters, so writing the field alone moved nothing —
+        // and it is what makes the fader MIDI-mappable and modulatable,
+        // exactly as a layer's is.
+        let key = format!("grp_{uuid}_opacity");
+        let mut op = engine
+            .get_param_base(&key)
+            .unwrap_or(mixer.groups[gi].opacity);
+        // `slider_width`, not `add_sized`: a Slider always allocates the
+        // theme's 200pt and ignores the size it is handed. That pushed
+        // this row past a half-width column, egui widens a Ui to fit
+        // whatever overflows it, and every row after grew to match —
+        // which is what painted deck A's layers across deck B. M, S and
+        // a readable name still go to its left, so it only grows into
+        // what is spare after them.
+        ui.spacing_mut().slider_width = (ui.available_width() - 56.0 - 96.0).clamp(40.0, 80.0);
+        if ui
+            .add(
+                egui::Slider::new(&mut op, 0.0..=1.0)
+                    .show_value(false)
+                    .trailing_fill(true),
+            )
+            .on_hover_text("Group opacity")
+            .changed()
+        {
+            engine.set_param_base(&key, op);
+            mixer.groups[gi].opacity = op;
+        }
+        let mut mute = mixer.groups[gi].mute;
+        if ui.selectable_label(mute, "M").on_hover_text("Mute the group").clicked() {
+            mute = !mute;
+            mixer.groups[gi].mute = mute;
+        }
+        let mut solo = mixer.groups[gi].solo;
+        if ui.selectable_label(solo, "S").on_hover_text("Solo the group").clicked() {
+            solo = !solo;
+            mixer.groups[gi].solo = solo;
+        }
+    }
+
+    /// A deck's own row, at the top of its column: mute, solo and level, and
+    /// the chain everything on the deck passes through.
+    ///
+    /// The column heading already names the deck and the crossfader strip
+    /// carries its level against the other, so a full group header — with a
+    /// drag grip, a collapse arrow and an ✖ on furniture — is not drawn for
+    /// it. That left its chain with no strip at all: a deck's effects could
+    /// be reached from nowhere. This is only what the heading lacks.
+    fn deck_header(
+        ui: &mut egui::Ui,
+        mixer: &mut rustjay_mixer::Mixer,
+        gi: usize,
+        engine: &mut EngineState,
+        acts: &mut GroupActions,
+    ) {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                group_mix_controls(ui, mixer, gi, engine);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("deck fx")
+                            .size(10.0)
+                            .color(rustjay_gui::egui_theme::colors::ink_3()),
+                    )
+                    .on_hover_text("Effects here run over the whole deck, after its layers are mixed");
+                });
+            });
+        });
+        group_strip(ui, mixer, gi, acts);
+    }
+
+    /// A group's chain strip: what every member passes through together.
+    fn group_strip(
+        ui: &mut egui::Ui,
+        mixer: &mut rustjay_mixer::Mixer,
+        gi: usize,
+        acts: &mut GroupActions,
+    ) {
+        let uuid = mixer.groups[gi].uuid.clone();
         strip_scroll(ui, ("groupstrip", &uuid)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let out = fx_strip(
@@ -2320,6 +2371,15 @@ mod egui_impl {
                 let mut said_off_deck = false;
 
                 for (uuid, is_off_deck) in order.iter() {
+                // The deck's own row first: its level and gates, and its chain.
+                if let Some(d) = self.deck
+                    && mixer.decks.is_some()
+                    && let Some(gi) = mixer.groups.iter().position(|g| g.uuid == deck_uuid(d))
+                {
+                    deck_header(ui, &mut mixer, gi, engine, &mut group_acts);
+                    ui.separator();
+                }
+
                     let Some(idx) = mixer.channels.iter().position(|c| c.uuid == *uuid) else {
                         continue;
                     };
