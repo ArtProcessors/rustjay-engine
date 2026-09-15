@@ -619,10 +619,12 @@ fn default_true() -> bool {
     true
 }
 
-/// Crate root, used to relativize/resolve asset paths for portability.
+/// The resources root, used to relativize/resolve asset paths for portability:
+/// a bundled shader saves as `shaders/foo.fs` and resolves inside whichever
+/// bundle opens the scene. See [`crate::resources_dir`].
 #[cfg(feature = "mixer")]
 pub(crate) fn topology_base() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    crate::resources_dir()
 }
 
 /// Store `path` relative to `base` when it lives under it; otherwise keep it

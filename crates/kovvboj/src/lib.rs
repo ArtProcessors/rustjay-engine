@@ -4,11 +4,52 @@
 //! into a single engine. Two ISF shader channels are composited via the mixer
 //! with crossfader, blend modes, and transitions.
 
+/// Where the bundled `shaders/` and `assets/` live at runtime.
+///
+/// In order: `$KOVVBOJ_RESOURCES`; the packaged app — `Contents/Resources`
+/// inside a `.app`, or the executable's own directory; and last the crate
+/// root, which is what `cargo run` has. The first candidate that actually
+/// holds a `shaders` directory wins, so an env var pointing nowhere does not
+/// empty the library. Saved scenes relativize paths against this, so a set
+/// made from `cargo run` resolves inside the bundle on another machine.
+pub fn resources_dir() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        resolve_resources(
+            std::env::var_os("KOVVBOJ_RESOURCES").map(std::path::PathBuf::from),
+            std::env::current_exe().ok().as_deref(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+    })
+    .clone()
+}
+
+/// [`resources_dir`] with its inputs passed in, so the order is testable.
+fn resolve_resources(
+    env: Option<std::path::PathBuf>,
+    exe: Option<&std::path::Path>,
+    dev: &std::path::Path,
+) -> std::path::PathBuf {
+    let mut candidates: Vec<std::path::PathBuf> = env.into_iter().collect();
+    if let Some(bin) = exe.and_then(std::path::Path::parent) {
+        // `Foo.app/Contents/MacOS/foo` → `Foo.app/Contents/Resources`.
+        candidates.push(bin.join("..").join("Resources"));
+        candidates.push(bin.to_path_buf());
+    }
+    candidates
+        .into_iter()
+        .find(|c| c.join("shaders").is_dir())
+        // Canonical, so a path built from it strips back off it: `..` in the
+        // bundle candidate would otherwise defeat `relativize`.
+        .map(|c| c.canonicalize().unwrap_or(c))
+        .unwrap_or_else(|| dev.to_path_buf())
+}
+
 /// The shader library folder: the one directory the registry scans and the
 /// watcher watches, and where [`install_shader`](sources::registry::install_shader)
 /// puts anything picked from elsewhere.
 pub fn shaders_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders")
+    resources_dir().join("shaders")
 }
 
 /// The two decks are permanent furniture: created on first run, never deleted,
@@ -186,7 +227,7 @@ pub fn take(mixer: &mut Mixer, seconds: f32) {
 
 /// The images-and-videos folder the registry scans alongside [`shaders_dir`].
 pub fn assets_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets")
+    resources_dir().join("assets")
 }
 
 #[cfg(feature = "api")]
@@ -4672,6 +4713,48 @@ fn source_entry_to_api(e: &crate::sources::SourceEntry) -> KovvbojSourceEntry {
 #[cfg(all(test, feature = "mixer"))]
 mod tests {
     use super::*;
+
+    /// The resources root is looked up in a fixed order, and a candidate only
+    /// counts when it actually holds the shaders.
+    #[test]
+    fn resources_resolve_env_then_bundle_then_exe_dir_then_dev() {
+        let root = std::env::temp_dir().join(format!("kv-res-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bundle = root.join("KOVVBOJ.app/Contents");
+        let exe = bundle.join("MacOS/kovvboj");
+        std::fs::create_dir_all(bundle.join("MacOS")).unwrap();
+        std::fs::create_dir_all(bundle.join("Resources/shaders")).unwrap();
+        let env_dir = root.join("env");
+        std::fs::create_dir_all(env_dir.join("shaders")).unwrap();
+        let flat = root.join("flat");
+        std::fs::create_dir_all(flat.join("shaders")).unwrap();
+        let dev = root.join("dev");
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap();
+
+        // The env override wins when it has shaders …
+        assert_eq!(
+            resolve_resources(Some(env_dir.clone()), Some(&exe), &dev),
+            canon(&env_dir)
+        );
+        // … and is ignored when it does not.
+        assert_eq!(
+            resolve_resources(Some(root.join("nowhere")), Some(&exe), &dev),
+            canon(&bundle.join("Resources"))
+        );
+        // A bundle: `Contents/Resources` beside the binary's directory.
+        assert_eq!(
+            resolve_resources(None, Some(&exe), &dev),
+            canon(&bundle.join("Resources"))
+        );
+        // A flat package (Linux tarball, Windows zip): next to the binary.
+        assert_eq!(
+            resolve_resources(None, Some(&flat.join("kovvboj")), &dev),
+            canon(&flat)
+        );
+        // Nothing packaged: the crate root, as `cargo run` has.
+        assert_eq!(resolve_resources(None, None, &dev), dev);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The shape the crossfader can drive: two images, then a float progress.
     #[test]
