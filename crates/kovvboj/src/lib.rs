@@ -2452,6 +2452,67 @@ impl KovvbojRootPlugin {
     }
 }
 
+/// Put a recalled group's layers and groups into the mixer, returning the
+/// uuids of the layers that went in.
+///
+/// `channels` come in the saved order — bottom of the stack first, exactly as
+/// captured — and are appended as they are. Membership is then set straight
+/// from the saved `members` lists. Moving each layer next to its group's
+/// other members instead, as `set_channel_group` does, walked a nested
+/// group's layers past the deck's own and put the deck back in a different
+/// order from the one it was saved in.
+///
+/// Every group exists before any parent pointer is set, because
+/// `set_group_parent` refuses a parent it cannot find.
+#[cfg(feature = "mixer")]
+fn attach_recalled(
+    mixer: &mut Mixer,
+    channels: Vec<Channel>,
+    recalled: &crate::scene::RecalledGroup,
+    name: &str,
+) -> Vec<String> {
+    let gid = &recalled.group_uuid;
+    let mut members = Vec::with_capacity(channels.len());
+    for mut channel in channels {
+        let owner = recalled
+            .groups
+            .iter()
+            .find(|g| g.members.contains(&channel.uuid))
+            .map_or(gid, |g| &g.uuid);
+        channel.group = Some(owner.clone());
+        if mixer.add_channel(channel).is_ok_and(|i| {
+            members.push(mixer.channels[i].uuid.clone());
+            true
+        }) {}
+    }
+    if members.is_empty() {
+        return members;
+    }
+    if !mixer.groups.iter().any(|g| &g.uuid == gid) {
+        mixer
+            .groups
+            .push(rustjay_mixer::ChannelGroup::new(gid, name));
+    }
+    for g in &recalled.groups {
+        if !mixer.groups.iter().any(|x| x.uuid == g.uuid) {
+            mixer
+                .groups
+                .push(rustjay_mixer::ChannelGroup::new(&g.uuid, &g.name));
+        }
+    }
+    for g in &recalled.groups {
+        if !mixer.set_group_parent(&g.uuid, g.parent.as_deref()) {
+            log::warn!(
+                "[Group] '{}' could not nest inside {:?}",
+                g.name,
+                g.parent
+            );
+        }
+    }
+    mixer.invalidate_composite_cache();
+    members
+}
+
 /// Every group nested under `gid`, at any depth, outermost first.
 ///
 /// Bounded by the group count, so a corrupt parent cycle terminates instead of
@@ -3638,9 +3699,8 @@ impl EffectPlugin for KovvbojRootPlugin {
                     None => saved.instantiate(),
                 };
                 let gid = recalled.group_uuid.clone();
-                let direct = recalled.direct_members();
                 let base = crate::scene::topology_base();
-                let mut members = Vec::new();
+                let members: Vec<String>;
 
                 // Clear the deck first, with the same sweep a layer removal
                 // does, or the old layers' modulation outlives them. Only when
@@ -3683,23 +3743,18 @@ impl EffectPlugin for KovvbojRootPlugin {
                 }
 
                 {
-                    let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut built: Vec<Channel> = Vec::with_capacity(recalled.layers.len());
                     for desc in &recalled.layers {
                         let mut entry = desc.source.clone();
                         if let Some(path) = entry.path.take() {
                             entry.path = Some(crate::scene::resolve(&path, &base));
                         }
-                        let source = match instantiate_source(&entry, device, queue, engine) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                log::warn!("[Group] '{}' failed to build: {e}", desc.name);
-                                continue;
-                            }
-                        };
                         let prefix = format!("ch_{}_", desc.uuid);
-                        let mut source = source;
-                        source.set_param_prefix(&prefix);
-                        let mut channel = Channel::new(desc.uuid.clone(), &desc.name, source);
+                        let mut channel = layer_or_placeholder(
+                            desc,
+                            instantiate_source(&entry, device, queue, engine),
+                            &mut state.missing_layers,
+                        );
                         channel.opacity = desc.opacity;
                         channel.blend_mode = desc.blend_mode;
                         channel.solo = desc.solo;
@@ -3711,54 +3766,18 @@ impl EffectPlugin for KovvbojRootPlugin {
                                 .set_param_prefix(&format!("{prefix}fx{}_", built.uuid));
                             channel.chain.push(built);
                         }
-                        if mixer.add_channel(channel).is_err() {
-                            continue;
-                        }
+                        built.push(channel);
+                    }
+
+                    let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
+                    members = attach_recalled(&mut mixer, built, &recalled, &saved.name);
+                    for desc in recalled.layers.iter().filter(|l| members.contains(&l.uuid)) {
                         state
                             .layer_sources
                             .insert(desc.uuid.clone(), desc.source.clone());
-                        members.push(desc.uuid.clone());
                     }
 
-                    // The groups: the top one, then the nested ones, then who
-                    // belongs to whom. Every group exists before any parent
-                    // pointer is set, because `set_group_parent` refuses a
-                    // parent it cannot find.
                     if !members.is_empty() {
-                        if !mixer.groups.iter().any(|g| g.uuid == gid) {
-                            mixer
-                                .groups
-                                .push(rustjay_mixer::ChannelGroup::new(&gid, &saved.name));
-                        }
-                        for g in &recalled.groups {
-                            if !mixer.groups.iter().any(|x| x.uuid == g.uuid) {
-                                mixer
-                                    .groups
-                                    .push(rustjay_mixer::ChannelGroup::new(&g.uuid, &g.name));
-                            }
-                        }
-                        for uuid in &direct {
-                            if members.iter().any(|m| m == uuid) {
-                                mixer.set_channel_group(uuid, Some(gid.clone()));
-                            }
-                        }
-                        for g in &recalled.groups {
-                            for uuid in &g.members {
-                                if members.iter().any(|m| m == uuid) {
-                                    mixer.set_channel_group(uuid, Some(g.uuid.clone()));
-                                }
-                            }
-                        }
-                        for g in &recalled.groups {
-                            if !mixer.set_group_parent(&g.uuid, g.parent.as_deref()) {
-                                log::warn!(
-                                    "[Group] '{}' could not nest inside {:?}",
-                                    g.name,
-                                    g.parent
-                                );
-                            }
-                        }
-
                         // A group added to a deck lives inside it. A deck
                         // recall *is* the deck and has no parent to set.
                         if let Some(uuid) = deck_uuid.filter(|_| !replace)
@@ -6047,6 +6066,96 @@ mod recall_tests {
         // No deck named, nothing to replace — both kinds simply add.
         assert!(!recall_replaces(true, None));
         assert!(!recall_replaces(false, None));
+    }
+
+    /// A deck holding a group comes back in the order it was saved.
+    ///
+    /// Save: the layers are captured bottom-first, and a plain file round trip
+    /// keeps them so. Recall: the layers are appended in that order and
+    /// membership is assigned in place. Putting each one next to its group's
+    /// other members instead moved the deck's top layer above the nested
+    /// group's — `[L1, N{L2, L3}, L4]` came back as `[L1, L4, L2, L3]`.
+    #[test]
+    fn a_recalled_deck_keeps_its_saved_order() {
+        use crate::sources::testing::StubSource;
+
+        let mut m = Mixer::new();
+        m.use_crossfader = false;
+        for (uuid, group) in [("L1", DECK_A), ("L2", "N"), ("L3", "N"), ("L4", DECK_A)] {
+            let mut ch = Channel::new(uuid, uuid, Box::new(StubSource));
+            ch.group = Some(group.to_string());
+            m.add_channel(ch).unwrap();
+        }
+        ensure_decks(&mut m);
+        m.groups
+            .push(rustjay_mixer::ChannelGroup::new("N", "Inner"));
+        assert!(m.set_group_parent("N", Some(DECK_A)));
+        let names = |layers: &[crate::scene::LayerDesc]| -> Vec<String> {
+            layers.iter().map(|l| l.name.clone()).collect()
+        };
+
+        // The scene file: what the auto-save writes and the next launch reads.
+        let topo = crate::scene::Topology::from_mixer(&m, &Default::default());
+        let json = serde_json::to_string(&topo).unwrap();
+        let back: crate::scene::Topology = serde_json::from_str(&json).unwrap();
+        assert_eq!(names(&back.layers), ["L1", "L2", "L3", "L4"]);
+        assert_eq!(
+            back.groups.iter().find(|g| g.uuid == "N").unwrap().members,
+            ["L2", "L3"]
+        );
+
+        // The saved deck: what 💾 on the deck heading writes.
+        let g = topo.groups.iter().find(|g| g.uuid == DECK_A).unwrap();
+        let nested = descendant_groups(&topo, DECK_A);
+        let members: Vec<&String> = g
+            .members
+            .iter()
+            .chain(nested.iter().flat_map(|n| n.members.iter()))
+            .collect();
+        let layers: Vec<crate::scene::LayerDesc> = topo
+            .layers
+            .iter()
+            .filter(|l| members.contains(&&l.uuid))
+            .cloned()
+            .collect();
+        assert_eq!(names(&layers), ["L1", "L2", "L3", "L4"], "captured bottom-first");
+        let saved = crate::scene::SavedGroup::capture(
+            "Deck".into(),
+            g,
+            layers,
+            nested,
+            &Default::default(),
+        );
+
+        // Recall onto an empty deck A.
+        let recalled = saved.instantiate_into(DECK_A);
+        let mut m2 = Mixer::new();
+        m2.use_crossfader = false;
+        ensure_decks(&mut m2);
+        let built: Vec<Channel> = recalled
+            .layers
+            .iter()
+            .map(|d| Channel::new(d.uuid.clone(), d.name.clone(), Box::new(StubSource)))
+            .collect();
+        let added = attach_recalled(&mut m2, built, &recalled, "Deck");
+        assert_eq!(added.len(), 4);
+        let on_deck_a: Vec<String> = (0..m2.channels.len())
+            .filter(|&i| m2.deck_of_channel(i) == Some(0))
+            .map(|i| m2.channels[i].name.clone())
+            .collect();
+        assert_eq!(
+            on_deck_a,
+            ["L1", "L2", "L3", "L4"],
+            "the stack order survives the recall"
+        );
+        let inner = m2.groups.iter().find(|g| g.name == "Inner").unwrap();
+        let inner_members: Vec<String> = m2
+            .group_members(&inner.uuid)
+            .into_iter()
+            .map(|i| m2.channels[i].name.clone())
+            .collect();
+        assert_eq!(inner_members, ["L2", "L3"]);
+        assert_eq!(inner.parent.as_deref(), Some(DECK_A));
     }
 
     #[test]

@@ -581,24 +581,6 @@ pub struct RecalledGroup {
     pub params: std::collections::HashMap<String, f32>,
 }
 
-#[cfg(feature = "mixer")]
-impl RecalledGroup {
-    /// Layers belonging to the top-level group itself: the ones no nested group
-    /// claims.
-    pub fn direct_members(&self) -> Vec<String> {
-        self.layers
-            .iter()
-            .filter(|l| {
-                !self
-                    .groups
-                    .iter()
-                    .any(|g| g.members.iter().any(|m| m == &l.uuid))
-            })
-            .map(|l| l.uuid.clone())
-            .collect()
-    }
-}
-
 /// Short identity, matching the form used for layers and FX slots elsewhere.
 #[cfg(feature = "mixer")]
 pub fn new_uuid() -> String {
@@ -1071,7 +1053,10 @@ mod tests {
         // Its member is the recalled L2, and the outer group keeps only L1.
         let l2 = r.layers[1].uuid.clone();
         assert_eq!(inner.members, vec![l2.clone()]);
-        assert_eq!(r.direct_members(), vec![r.layers[0].uuid.clone()]);
+        assert!(
+            !inner.members.contains(&r.layers[0].uuid),
+            "the outer group keeps L1 as its own"
+        );
 
         // Params followed both groups.
         assert_eq!(
