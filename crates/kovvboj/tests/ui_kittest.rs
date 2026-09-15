@@ -138,10 +138,19 @@ fn layer_controls_do_not_cover_the_name_on_narrow_panels() {
         );
         let solo = harness.get_by_label("S");
         let mute = harness.get_by_label("M");
+        let key = harness.get_by_label("K");
         assert!(
             solo.rect().min.x >= name.rect().max.x - 1.0,
             "panel {w}: S ({:?}) overlaps the layer name ({:?})",
             solo.rect(),
+            name.rect()
+        );
+        // K is the leftmost control, so it is the one that lands on the name
+        // when the slider does not reserve room for it.
+        assert!(
+            key.rect().min.x >= name.rect().max.x - 1.0,
+            "panel {w}: K ({:?}) overlaps the layer name ({:?})",
+            key.rect(),
             name.rect()
         );
         assert!(

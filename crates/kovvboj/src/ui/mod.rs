@@ -2665,9 +2665,9 @@ mod egui_impl {
                                                 let mut op = engine
                                                     .get_param_base(&opacity_key)
                                                     .unwrap_or(1.0);
-                                                // M and S are placed after the slider (to
-                                                // its left in this right-to-left row), so
-                                                // reserve their width and let the slider
+                                                // M, S and K are placed after the slider
+                                                // (to its left in this right-to-left row),
+                                                // so reserve their width and let the slider
                                                 // take the rest: on a narrow panel the
                                                 // slider squashes before the buttons creep
                                                 // over the layer name. This has to go
@@ -2675,7 +2675,7 @@ mod egui_impl {
                                                 // `Slider` always allocates that width
                                                 // and ignores `add_sized`.
                                                 let slider_w = (ui.available_width()
-                                                    - 2.0 * (20.0 + ui.spacing().item_spacing.x))
+                                                    - 3.0 * (20.0 + ui.spacing().item_spacing.x))
                                                     .clamp(24.0, 96.0);
                                                 ui.spacing_mut().slider_width = slider_w;
                                                 // Filled up to the value: the bare rail
