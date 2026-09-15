@@ -50,6 +50,12 @@ impl Workspace {
         self.dir.join("ui.json")
     }
 
+    /// Where recordings land: inside the set, so they are found again with it
+    /// and never in whatever directory the app happened to be launched from.
+    pub fn recordings_dir(&self) -> PathBuf {
+        self.dir.join("recordings")
+    }
+
     /// Load UI preferences, falling back to defaults when absent or unreadable —
     /// a corrupt prefs file must not stop the app opening.
     pub fn load_ui(&self) -> UiPrefs {
@@ -362,6 +368,21 @@ impl Workspace {
         Ok(scene)
     }
 
+    /// Copy `scene.json` to `scene.json.bak-<unix time>` and return that path.
+    ///
+    /// For a scene this build is about to replace: the auto-save would
+    /// otherwise overwrite the only copy of it thirty seconds after launch.
+    pub fn backup_scene(&self) -> std::io::Result<PathBuf> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let bak = self.dir.join(format!("scene.json.bak-{ts}"));
+        std::fs::copy(self.scene_path(), &bak)?;
+        log::warn!("[Workspace] kept a copy of the scene at {}", bak.display());
+        Ok(bak)
+    }
+
     #[cfg(feature = "projection")]
     pub fn save_stage(&self, stage: &crate::stage::KovvbojStage) -> anyhow::Result<()> {
         self.ensure_dir()?;
@@ -514,13 +535,26 @@ fn migrate_file(from: &Path, to: &Path) {
     }
 }
 
+/// The workspace to open when none was chosen.
+///
+/// A `.kovvboj/` (or pre-rename `.varda/`) in the current directory wins, so a
+/// checkout keeps its set. Otherwise the platform's app-data directory —
+/// `~/Library/Application Support/KOVVBOJ`, `%APPDATA%\KOVVBOJ`,
+/// `~/.local/share/KOVVBOJ`: an app launched from Finder or a shortcut starts
+/// in `/`, where `./.kovvboj` cannot be written and every save failed.
 pub fn default_workspace() -> Workspace {
+    if Path::new(".kovvboj").exists() {
+        return Workspace::new(".kovvboj");
+    }
     // ponytail: read-only compatibility shim. Delete once no `.varda/` remains
     // in the wild; a real migration would have to move presets/ too.
-    if !Path::new(".kovvboj").exists() && Path::new(".varda").exists() {
+    if Path::new(".varda").exists() {
         return Workspace::new(".varda");
     }
-    Workspace::new(".kovvboj")
+    match dirs::data_dir() {
+        Some(data) => Workspace::new(data.join("KOVVBOJ")),
+        None => Workspace::new(".kovvboj"),
+    }
 }
 
 /// Recently opened workspaces, newest first.

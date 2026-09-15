@@ -4,11 +4,52 @@
 //! into a single engine. Two ISF shader channels are composited via the mixer
 //! with crossfader, blend modes, and transitions.
 
+/// Where the bundled `shaders/` and `assets/` live at runtime.
+///
+/// In order: `$KOVVBOJ_RESOURCES`; the packaged app — `Contents/Resources`
+/// inside a `.app`, or the executable's own directory; and last the crate
+/// root, which is what `cargo run` has. The first candidate that actually
+/// holds a `shaders` directory wins, so an env var pointing nowhere does not
+/// empty the library. Saved scenes relativize paths against this, so a set
+/// made from `cargo run` resolves inside the bundle on another machine.
+pub fn resources_dir() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        resolve_resources(
+            std::env::var_os("KOVVBOJ_RESOURCES").map(std::path::PathBuf::from),
+            std::env::current_exe().ok().as_deref(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+    })
+    .clone()
+}
+
+/// [`resources_dir`] with its inputs passed in, so the order is testable.
+fn resolve_resources(
+    env: Option<std::path::PathBuf>,
+    exe: Option<&std::path::Path>,
+    dev: &std::path::Path,
+) -> std::path::PathBuf {
+    let mut candidates: Vec<std::path::PathBuf> = env.into_iter().collect();
+    if let Some(bin) = exe.and_then(std::path::Path::parent) {
+        // `Foo.app/Contents/MacOS/foo` → `Foo.app/Contents/Resources`.
+        candidates.push(bin.join("..").join("Resources"));
+        candidates.push(bin.to_path_buf());
+    }
+    candidates
+        .into_iter()
+        .find(|c| c.join("shaders").is_dir())
+        // Canonical, so a path built from it strips back off it: `..` in the
+        // bundle candidate would otherwise defeat `relativize`.
+        .map(|c| c.canonicalize().unwrap_or(c))
+        .unwrap_or_else(|| dev.to_path_buf())
+}
+
 /// The shader library folder: the one directory the registry scans and the
 /// watcher watches, and where [`install_shader`](sources::registry::install_shader)
 /// puts anything picked from elsewhere.
 pub fn shaders_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders")
+    resources_dir().join("shaders")
 }
 
 /// The two decks are permanent furniture: created on first run, never deleted,
@@ -186,7 +227,7 @@ pub fn take(mixer: &mut Mixer, seconds: f32) {
 
 /// The images-and-videos folder the registry scans alongside [`shaders_dir`].
 pub fn assets_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets")
+    resources_dir().join("assets")
 }
 
 #[cfg(feature = "api")]
@@ -373,6 +414,14 @@ pub struct KovvbojAppState {
     #[serde(skip)]
     #[cfg(feature = "projection")]
     pub lighting_overlap_warnings: Vec<rustjay_lighting::Overlap>,
+    /// One view per channel a lighting segment samples, keyed by channel uuid
+    /// and tagged with the texture generation it was made from. A pixel
+    /// sampler compares tile sources by `Arc` pointer, so the same view has
+    /// to be handed back frame after frame for its bind group to be kept.
+    #[serde(skip)]
+    #[cfg(feature = "projection")]
+    pub lighting_channel_views:
+        std::collections::HashMap<String, (u64, std::sync::Arc<wgpu::TextureView>)>,
     /// Runtime deck creation queue (processed in `prepare()` where GPU resources are available).
     #[serde(skip)]
     #[cfg(feature = "mixer")]
@@ -397,6 +446,11 @@ pub struct KovvbojAppState {
     /// Text-layer edits waiting for `prepare`, where the mixer is reachable.
     #[serde(skip)]
     pub pending_text: Vec<(String, TextEdit)>,
+    /// Toasts raised where there is no `EngineState` to raise them on — a
+    /// failed save, a scene that could not be loaded — shown on the next
+    /// `prepare`. A failure the log alone sees is one nobody sees mid-show.
+    #[serde(skip)]
+    pub pending_notices: Vec<(String, rustjay_core::NotificationLevel)>,
     /// A clip picked for a layer, delivered from the file-dialog thread as
     /// `(layer uuid, file)`.
     #[serde(skip)]
@@ -416,6 +470,11 @@ pub struct KovvbojAppState {
     #[serde(skip)]
     #[cfg(feature = "mixer")]
     pub layer_sources: std::collections::HashMap<String, crate::sources::SourceEntry>,
+    /// Layers whose source could not be built and stand on a placeholder —
+    /// the row says so, and the source picker repairs them. See `MissingSource`.
+    #[serde(skip)]
+    #[cfg(feature = "mixer")]
+    pub missing_layers: std::collections::HashSet<String>,
     /// Runtime effect addition queue (processed in `prepare()` where GPU resources are available).
     #[serde(skip)]
     #[cfg(feature = "mixer")]
@@ -927,7 +986,9 @@ impl KovvbojAppState {
         true
     }
 
-    pub fn save_workspace(&self) {
+    /// Save the set; a failure reaches the user as a toast, not only the log.
+    pub fn save_workspace(&mut self) {
+        let mut failed: Vec<String> = Vec::new();
         if let Ok(mixer) = self.mixer.lock() {
             // Before the first `prepare()` the layer source map is still empty,
             // so every layer would serialise as a placeholder solid colour.
@@ -936,7 +997,10 @@ impl KovvbojAppState {
             if let Some(scene) = self.scene_snapshot_if_ready(&mixer) {
                 match self.workspace.save_scene(&scene) {
                     Ok(_) => log::info!("[Workspace] scene saved"),
-                    Err(e) => log::warn!("[Workspace] scene save failed: {}", e),
+                    Err(e) => {
+                        log::warn!("[Workspace] scene save failed: {}", e);
+                        failed.push(format!("scene: {e}"));
+                    }
                 }
             }
         }
@@ -944,12 +1008,28 @@ impl KovvbojAppState {
         {
             match self.workspace.save_stage(&self.stage) {
                 Ok(_) => log::info!("[Workspace] stage saved"),
-                Err(e) => log::warn!("[Workspace] stage save failed: {}", e),
+                Err(e) => {
+                    log::warn!("[Workspace] stage save failed: {}", e);
+                    failed.push(format!("stage: {e}"));
+                }
             }
         }
         match self.workspace.save_keymap(&self.keymap) {
             Ok(_) => log::info!("[Workspace] keymap saved"),
-            Err(e) => log::warn!("[Workspace] keymap save failed: {}", e),
+            Err(e) => {
+                log::warn!("[Workspace] keymap save failed: {}", e);
+                failed.push(format!("keymap: {e}"));
+            }
+        }
+        if !failed.is_empty() {
+            self.pending_notices.push((
+                format!(
+                    "Could not save to {} — {}",
+                    self.workspace.dir.display(),
+                    failed.join("; ")
+                ),
+                rustjay_core::NotificationLevel::Error,
+            ));
         }
     }
 
@@ -1003,8 +1083,24 @@ impl KovvbojAppState {
         crate::persistence::push_recent(&self.workspace.dir);
         #[cfg(feature = "mixer")]
         {
-            self.pending_scene = self.workspace.load_scene().ok();
-            self.pending_new_graph = self.pending_scene.is_none();
+            let (mut scene, notice) = load_scene_or_backup(&self.workspace);
+            self.pending_notices
+                .extend(notice.map(|n| (n, rustjay_core::NotificationLevel::Warning)));
+            // A graph this build cannot replay is replaced by the default set,
+            // as at startup. Keeping the previous set's live graph would save
+            // *that* into this workspace on the next auto-save. The knobs and
+            // modulation still apply; the topology is dropped so `prepare`
+            // does not warn about it a second time.
+            self.pending_new_graph = !scene
+                .as_ref()
+                .and_then(|s| s.topology.as_ref())
+                .is_some_and(usable_topology);
+            if let Some(s) = scene.as_mut()
+                && self.pending_new_graph
+            {
+                s.topology = None;
+            }
+            self.pending_scene = scene;
             self.layer_sources.clear();
             self.undo_stack.clear();
             self.redo_stack.clear();
@@ -1088,6 +1184,8 @@ impl Default for KovvbojAppState {
             lighting_last_frames: std::collections::HashMap::new(),
             #[cfg(feature = "projection")]
             lighting_overlap_warnings: Vec::new(),
+            #[cfg(feature = "projection")]
+            lighting_channel_views: std::collections::HashMap::new(),
             #[cfg(feature = "mixer")]
             pending_layers: Vec::new(),
             #[cfg(feature = "mixer")]
@@ -1099,11 +1197,14 @@ impl Default for KovvbojAppState {
             #[cfg(feature = "mixer")]
             pending_transition: None,
             pending_text: Vec::new(),
+            pending_notices: Vec::new(),
             pending_clip: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_font: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_convert: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(feature = "mixer")]
             layer_sources: std::collections::HashMap::new(),
+            #[cfg(feature = "mixer")]
+            missing_layers: std::collections::HashSet::new(),
             #[cfg(feature = "mixer")]
             pending_effects: Vec::new(),
             #[cfg(feature = "mixer")]
@@ -1165,23 +1266,19 @@ fn segment_region(
     }
 }
 
-/// Resolve a segment's source texture override. When the segment references a
-/// surface whose source is a mixer channel, returns that channel's texture view
-/// (via `resolve_channel`) so the segment samples the channel directly instead
-/// of the master composite. Master/Domemaster/Deck sources return `None`
-/// (sample master).
+/// The mixer channel a segment samples instead of the master composite: the
+/// one its source surface is routed to, when it names a surface and that
+/// surface is on a channel. Master/Domemaster/Deck surfaces sample the master
+/// at the surface's crop (deck routing is not implemented, as for projectors).
 #[cfg(feature = "projection")]
-fn resolve_segment_source(
+fn segment_channel<'a>(
     seg: &crate::stage::LightingSegment,
-    surfaces: &[crate::stage::KovvbojSurface],
-    resolve_channel: impl Fn(&str) -> Option<std::sync::Arc<wgpu::TextureView>>,
-) -> Option<std::sync::Arc<wgpu::TextureView>> {
+    surfaces: &'a [crate::stage::KovvbojSurface],
+) -> Option<&'a str> {
     let uuid = seg.source_surface.as_ref()?;
     let surf = surfaces.iter().find(|s| &s.uuid == uuid)?;
     match &surf.source {
-        crate::stage::SurfaceSource::Channel(ch) => resolve_channel(ch),
-        // Deck routing is not yet implemented (mirrors projector behaviour);
-        // Master/Domemaster sample the master composite at the surface's crop.
+        crate::stage::SurfaceSource::Channel(ch) => Some(ch),
         _ => None,
     }
 }
@@ -1466,12 +1563,15 @@ fn reload_matching_slots(
 /// honestly: a channel's post-FX ran once over the composite of its decks, and
 /// once those decks are sibling layers there is nowhere for that effect to go
 /// that renders the same picture.
+///
+/// An empty layer list is usable: a set the user cleared to nothing comes back
+/// empty, not as the default set.
 #[cfg(feature = "mixer")]
 fn usable_topology(topo: &crate::scene::Topology) -> bool {
-    topo.version >= crate::scene::TOPOLOGY_VERSION && !topo.layers.is_empty()
+    topo.version >= crate::scene::TOPOLOGY_VERSION
 }
 
-/// Tell the user why their saved graph did not load, and leave the file alone.
+/// Tell the user why their saved graph did not load.
 #[cfg(feature = "mixer")]
 fn warn_stale_topology(topo: &crate::scene::Topology, engine: &EngineState) {
     if topo.version >= crate::scene::TOPOLOGY_VERSION {
@@ -1483,10 +1583,47 @@ fn warn_stale_topology(topo: &crate::scene::Topology, engine: &EngineState) {
         crate::scene::TOPOLOGY_VERSION
     );
     engine.notify(
-        "This scene predates layers and was not loaded. Your file is untouched.".to_string(),
+        "This scene predates layers and cannot be loaded by this build.".to_string(),
         rustjay_core::NotificationLevel::Warning,
         std::time::Duration::from_secs(8),
     );
+}
+
+/// Read the workspace scene, keeping a copy of one this build cannot use.
+///
+/// The scene, if it parsed at all; and a notice when the default set is about
+/// to open in its place — the file did not parse, or its topology is one this
+/// build cannot replay — because the auto-save then overwrites it within
+/// thirty seconds. A timestamped copy is kept beside it first, and the notice
+/// says where. A scene that will be reloaded as is gets neither.
+#[cfg(feature = "mixer")]
+fn load_scene_or_backup(ws: &crate::persistence::Workspace) -> (Option<Scene>, Option<String>) {
+    if !ws.exists() {
+        return (None, None);
+    }
+    let (scene, why) = match ws.load_scene() {
+        Ok(scene) => {
+            if scene.topology.as_ref().is_some_and(usable_topology) {
+                return (Some(scene), None);
+            }
+            (Some(scene), "predates layers and cannot be loaded by this build".to_string())
+        }
+        Err(e) => {
+            log::warn!("[Workspace] failed to load scene: {e}");
+            (None, format!("could not be read: {e}"))
+        }
+    };
+    let kept = match ws.backup_scene() {
+        Ok(bak) => format!("a copy was kept at {}", bak.display()),
+        Err(e) => format!("and could NOT be backed up ({e}) — the auto-save will replace it"),
+    };
+    (
+        scene,
+        Some(format!(
+            "{} {why}. The default set opens instead; {kept}.",
+            ws.scene_path().display()
+        )),
+    )
 }
 
 /// Build an [`EffectSlot`](rustjay_mixer::EffectSlot) from a saved [`FxDesc`],
@@ -1623,24 +1760,120 @@ fn build_fx_slot(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     engine: &EngineState,
-) -> Option<rustjay_mixer::EffectSlot> {
+) -> rustjay_mixer::EffectSlot {
     let path = crate::scene::resolve(&fx.path, base);
-    match rustjay_isf::IsfEffect::from_path(&path) {
+    let effect: Box<dyn EffectInstance> = match rustjay_isf::IsfEffect::from_path(&path) {
         Ok(isf) => {
             let name = isf.shader_name.clone();
-            let node = EffectNode::new(isf, &name, device, queue, engine);
-            Some(rustjay_mixer::EffectSlot {
-                effect: Box::new(node),
-                enabled: fx.enabled,
-                uuid: fx.uuid.clone(),
-                source_path: Some(path),
-            })
+            Box::new(EffectNode::new(isf, &name, device, queue, engine))
         }
         Err(e) => {
             log::warn!("[Topology] failed to load FX {}: {}", path.display(), e);
-            None
+            Box::new(MissingEffect::new(device, &path))
+        }
+    };
+    rustjay_mixer::EffectSlot {
+        effect,
+        enabled: fx.enabled,
+        uuid: fx.uuid.clone(),
+        source_path: Some(path),
+    }
+}
+
+/// Stands in for a layer source that could not be built — a clip on an
+/// unmounted drive, a shader that no longer parses. Renders nothing, so the
+/// layer composites as transparent, and needs no device, so the decision to
+/// keep the layer is testable headless.
+///
+/// The point is what it is *not*: dropped. A layer that fails to build used
+/// to vanish from the mixer, and thirty seconds later the auto-save wrote the
+/// scene without it. Keeping the channel keeps its descriptor, its chain, its
+/// place in the stack and every binding under `ch_<uuid>_`, and the source
+/// picker repairs it in place.
+#[cfg(feature = "mixer")]
+struct MissingSource;
+
+#[cfg(feature = "mixer")]
+impl EffectInstance for MissingSource {
+    fn label(&self) -> &str {
+        "missing"
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn render_to(
+        &mut self,
+        _ctx: &mut RenderCtx<'_>,
+        _inputs: &[EffectInput<'_>],
+        _target: RenderTarget<'_>,
+        _engine: &EngineState,
+    ) {
+    }
+}
+
+/// [`MissingSource`] for an FX slot: passes its input through untouched. A
+/// no-op would leave the chain's ping-pong target unwritten, so this one has
+/// to copy. The slot keeps its uuid, path and flag, and the hot-reload path
+/// swaps the real shader back in the moment the file is there again.
+#[cfg(feature = "mixer")]
+struct MissingEffect {
+    blit: rustjay_mixer::BlitPipeline,
+    label: String,
+}
+
+#[cfg(feature = "mixer")]
+impl MissingEffect {
+    fn new(device: &wgpu::Device, path: &std::path::Path) -> Self {
+        Self {
+            blit: rustjay_mixer::BlitPipeline::new(device, rustjay_core::working_format()),
+            label: format!("⚠ {}", transition_name(path)),
         }
     }
+}
+
+#[cfg(feature = "mixer")]
+impl EffectInstance for MissingEffect {
+    fn label(&self) -> &str {
+        &self.label
+    }
+    fn render_to(
+        &mut self,
+        ctx: &mut RenderCtx<'_>,
+        inputs: &[EffectInput<'_>],
+        target: RenderTarget<'_>,
+        _engine: &EngineState,
+    ) {
+        if let Some(input) = inputs.first() {
+            self.blit
+                .blit(ctx.device, ctx.encoder, input.view, target.view, ctx.vertex_buffer);
+        }
+    }
+}
+
+/// The channel for a layer, from what building its source produced.
+///
+/// A source that failed to build gets a [`MissingSource`] and the layer is
+/// recorded in `missing`, so the UI can say so and the set still saves whole.
+#[cfg(feature = "mixer")]
+fn layer_or_placeholder(
+    desc: &crate::scene::LayerDesc,
+    built: anyhow::Result<Box<dyn EffectInstance>>,
+    missing: &mut std::collections::HashSet<String>,
+) -> Channel {
+    let source = match built {
+        Ok(source) => source,
+        Err(e) => {
+            log::warn!(
+                "[Topology] layer '{}' could not be built, kept as missing: {e}",
+                desc.name
+            );
+            missing.insert(desc.uuid.clone());
+            Box::new(MissingSource)
+        }
+    };
+    let mut ch = Channel::new(desc.uuid.clone(), desc.name.clone(), source);
+    ch.effect.set_param_prefix(&format!("ch_{}_", desc.uuid));
+    ch
 }
 
 // ---------------------------------------------------------------------------
@@ -1654,6 +1887,13 @@ pub struct KovvbojRootPlugin {
     /// the first `prepare()` — `init` runs before any state exists.
     #[cfg(feature = "mixer")]
     layer_sources_init: std::collections::HashMap<String, crate::sources::SourceEntry>,
+    /// Layers the last graph rebuild could not build — see [`MissingSource`].
+    /// `Some` after every rebuild, so an empty set also reaches the state.
+    #[cfg(feature = "mixer")]
+    missing_init: Option<std::collections::HashSet<String>>,
+    /// Toasts raised where there is no `EngineState`: `init` and the graph
+    /// rebuild it shares with `prepare`. Shown on the next `prepare`.
+    notices: Vec<String>,
     params_dirty: bool,
     /// Modulation snapshot loaded from the workspace scene in `init()` (which has
     /// no `&EngineState`), applied into `engine.modulation` on the first `prepare()`.
@@ -1705,6 +1945,9 @@ impl KovvbojRootPlugin {
             #[cfg(feature = "mixer")]
             mixer: Arc::new(Mutex::new(Mixer::new())),
             layer_sources_init: std::collections::HashMap::new(),
+            #[cfg(feature = "mixer")]
+            missing_init: None,
+            notices: Vec::new(),
             params_dirty: false,
             #[cfg(feature = "mixer")]
             pending_modulation: None,
@@ -1989,6 +2232,7 @@ impl KovvbojRootPlugin {
         let mut old: Vec<Channel> = std::mem::take(&mut mixer.channels);
         let mut next: Vec<Channel> = Vec::with_capacity(topo.layers.len());
         let mut sources = std::collections::HashMap::new();
+        let mut missing = std::collections::HashSet::new();
         let mut rebuilt = 0usize;
 
         for (desc, plan) in topo.layers.iter().zip(plans.iter()) {
@@ -2020,24 +2264,20 @@ impl KovvbojRootPlugin {
                             ),
                         }
                     }
+                    // A kept layer still standing on a placeholder — an undo,
+                    // a failed re-point — stays flagged.
+                    if ch.effect.as_any().is_some_and(|a| a.is::<MissingSource>()) {
+                        missing.insert(desc.uuid.clone());
+                    }
                     ch
                 }
                 LayerPlan::Build { .. } => {
-                    let source = match instantiate_source(&entry, device, queue, &dummy_engine) {
-                        Ok(source) => source,
-                        Err(e) => {
-                            log::warn!(
-                                "[Topology] failed to rebuild layer '{}': {}",
-                                desc.name,
-                                e
-                            );
-                            continue;
-                        }
-                    };
                     rebuilt += 1;
-                    let mut ch = Channel::new(desc.uuid.clone(), desc.name.clone(), source);
-                    ch.effect.set_param_prefix(&prefix);
-                    ch
+                    layer_or_placeholder(
+                        desc,
+                        instantiate_source(&entry, device, queue, &dummy_engine),
+                        &mut missing,
+                    )
                 }
             };
 
@@ -2182,16 +2422,95 @@ impl KovvbojRootPlugin {
         mixer.invalidate_composite_cache();
 
         log::info!(
-            "[Topology] {} layers ({rebuilt} rebuilt, {} dropped), {} groups, {} master FX",
+            "[Topology] {} layers ({rebuilt} rebuilt, {} dropped, {} missing), {} groups, {} master FX",
             mixer.channels.len(),
             dropped.len(),
+            missing.len(),
             mixer.groups.len(),
             topo.master_fx.len()
         );
+        if !missing.is_empty() {
+            let names: Vec<String> = topo
+                .layers
+                .iter()
+                .filter(|l| missing.contains(&l.uuid))
+                .map(|l| match &l.source.path {
+                    Some(p) => format!("{} ({})", l.name, p.display()),
+                    None => l.name.clone(),
+                })
+                .collect();
+            self.notices.push(format!(
+                "{} layer(s) could not be loaded and are kept as ⚠ missing: {}",
+                names.len(),
+                names.join(", ")
+            ));
+        }
         drop(mixer);
         self.layer_sources_init = sources;
+        self.missing_init = Some(missing);
         self.params_dirty = true;
     }
+}
+
+/// Put a recalled group's layers and groups into the mixer, returning the
+/// uuids of the layers that went in.
+///
+/// `channels` come in the saved order — bottom of the stack first, exactly as
+/// captured — and are appended as they are. Membership is then set straight
+/// from the saved `members` lists. Moving each layer next to its group's
+/// other members instead, as `set_channel_group` does, walked a nested
+/// group's layers past the deck's own and put the deck back in a different
+/// order from the one it was saved in.
+///
+/// Every group exists before any parent pointer is set, because
+/// `set_group_parent` refuses a parent it cannot find.
+#[cfg(feature = "mixer")]
+fn attach_recalled(
+    mixer: &mut Mixer,
+    channels: Vec<Channel>,
+    recalled: &crate::scene::RecalledGroup,
+    name: &str,
+) -> Vec<String> {
+    let gid = &recalled.group_uuid;
+    let mut members = Vec::with_capacity(channels.len());
+    for mut channel in channels {
+        let owner = recalled
+            .groups
+            .iter()
+            .find(|g| g.members.contains(&channel.uuid))
+            .map_or(gid, |g| &g.uuid);
+        channel.group = Some(owner.clone());
+        if mixer.add_channel(channel).is_ok_and(|i| {
+            members.push(mixer.channels[i].uuid.clone());
+            true
+        }) {}
+    }
+    if members.is_empty() {
+        return members;
+    }
+    if !mixer.groups.iter().any(|g| &g.uuid == gid) {
+        mixer
+            .groups
+            .push(rustjay_mixer::ChannelGroup::new(gid, name));
+    }
+    for g in &recalled.groups {
+        if !mixer.groups.iter().any(|x| x.uuid == g.uuid) {
+            mixer
+                .groups
+                .push(rustjay_mixer::ChannelGroup::new(&g.uuid, &g.name));
+        }
+    }
+    for g in &recalled.groups {
+        if !mixer.set_group_parent(&g.uuid, g.parent.as_deref()) {
+            log::warn!(
+                "[Group] '{}' could not nest inside {:?}",
+                g.name,
+                g.parent
+            );
+        }
+    }
+    mixer.invalidate_composite_cache();
+    members
 }
 
 /// Every group nested under `gid`, at any depth, outermost first.
@@ -2240,12 +2559,11 @@ fn built_chain(
 ) -> Vec<rustjay_mixer::EffectSlot> {
     let mut chain = Vec::new();
     for slot in fx {
-        if let Some(mut built) = build_fx_slot(slot, base, device, queue, engine) {
-            built
-                .effect
-                .set_param_prefix(&format!("{prefix}fx{}_", built.uuid));
-            chain.push(built);
-        }
+        let mut built = build_fx_slot(slot, base, device, queue, engine);
+        built
+            .effect
+            .set_param_prefix(&format!("{prefix}fx{}_", built.uuid));
+        chain.push(built);
     }
     chain
 }
@@ -2284,11 +2602,10 @@ fn reconcile_chain(
                 chain.push(slot);
             }
             SlotPlan::Build { .. } => {
-                if let Some(mut slot) = build_fx_slot(fx, base, device, queue, engine) {
-                    slot.effect
-                        .set_param_prefix(&format!("{prefix}fx{}_", slot.uuid));
-                    chain.push(slot);
-                }
+                let mut slot = build_fx_slot(fx, base, device, queue, engine);
+                slot.effect
+                    .set_param_prefix(&format!("{prefix}fx{}_", slot.uuid));
+                chain.push(slot);
             }
         }
     }
@@ -2599,6 +2916,14 @@ impl EffectPlugin for KovvbojRootPlugin {
             }
         }
 
+        for (message, level) in state.pending_notices.drain(..).chain(
+            self.notices
+                .drain(..)
+                .map(|m| (m, rustjay_core::NotificationLevel::Warning)),
+        ) {
+            engine.notify(message, level, std::time::Duration::from_secs(8));
+        }
+
         #[cfg(feature = "mixer")]
         {
             // Undo / redo land here: replay the recorded graph, then let the
@@ -2873,9 +3198,12 @@ impl EffectPlugin for KovvbojRootPlugin {
         // every frame into the engine's opaque `app_state` slot. The generic
         // `/api/app/state` route serves it, and the WS delta stream diffs it —
         // so runtime structure changes (add/remove/reorder/hot-reload) and live
-        // param moves both surface. Only built when the `api` feature is on.
+        // param moves both surface. Only built when the `api` feature is on,
+        // and only while the web server is up: nobody reads it otherwise, and
+        // building it clones every library entry into a JSON tree — a thousand
+        // strings a frame on the render thread for a 360-shader library.
         #[cfg(all(feature = "mixer", feature = "api"))]
-        {
+        if engine.web_enabled {
             if let Ok(mixer) = self.mixer.lock() {
                 let snapshot = build_kovvboj_snapshot(&mixer, &state.registry, engine);
                 if let Ok(mut guard) = engine.app_state.lock() {
@@ -2894,6 +3222,7 @@ impl EffectPlugin for KovvbojRootPlugin {
             .map_or(f32::MAX, |t| now.duration_since(t).as_secs_f32());
         if auto_save_elapsed >= 30.0 {
             state.auto_save_last = Some(now);
+            let mut failed: Option<anyhow::Error> = None;
             #[cfg(feature = "mixer")]
             {
                 if let Ok(mixer) = state.mixer.lock()
@@ -2901,16 +3230,31 @@ impl EffectPlugin for KovvbojRootPlugin {
                     && let Err(e) = state.workspace.save_scene(&scene)
                 {
                     log::warn!("[AutoSave] scene failed: {}", e);
+                    failed = Some(e);
                 }
             }
             #[cfg(feature = "projection")]
             {
                 if let Err(e) = state.workspace.save_stage(&state.stage) {
                     log::warn!("[AutoSave] stage failed: {}", e);
+                    failed.get_or_insert(e);
                 }
             }
             if let Err(e) = state.workspace.save_keymap(&state.keymap) {
                 log::warn!("[AutoSave] keymap failed: {}", e);
+                failed.get_or_insert(e);
+            }
+            // Once per interval, not once ever: a set that stops saving
+            // mid-show is exactly the thing to keep hearing about.
+            if let Some(e) = failed {
+                engine.notify(
+                    format!(
+                        "Auto-save failed — {} is not writable: {e}",
+                        state.workspace.dir.display()
+                    ),
+                    rustjay_core::NotificationLevel::Error,
+                    std::time::Duration::from_secs(8),
+                );
             }
         }
 
@@ -3000,6 +3344,9 @@ impl EffectPlugin for KovvbojRootPlugin {
                 state
                     .layer_sources
                     .extend(std::mem::take(&mut self.layer_sources_init));
+            }
+            if let Some(missing) = self.missing_init.take() {
+                state.missing_layers = missing;
             }
 
             // The dimmer is a normal parameter, so MIDI/OSC/LFO can drive it;
@@ -3134,6 +3481,8 @@ impl EffectPlugin for KovvbojRootPlugin {
                         state
                             .layer_sources
                             .insert(req.layer_uuid.clone(), req.source.clone());
+                        // Re-pointing is how a missing layer is repaired.
+                        state.missing_layers.remove(&req.layer_uuid);
                         self.params_dirty = true;
                         engine.notify(
                             format!("Connected to '{}'", req.source.name),
@@ -3212,13 +3561,10 @@ impl EffectPlugin for KovvbojRootPlugin {
                             channel.mute = desc.mute;
                             let prefix = format!("ch_{uuid}_");
                             for fx in &desc.fx {
-                                if let Some(mut slot) =
-                                    build_fx_slot(fx, &base, device, queue, engine)
-                                {
-                                    slot.effect
-                                        .set_param_prefix(&format!("{prefix}fx{}_", slot.uuid));
-                                    channel.chain.push(slot);
-                                }
+                                let mut slot = build_fx_slot(fx, &base, device, queue, engine);
+                                slot.effect
+                                    .set_param_prefix(&format!("{prefix}fx{}_", slot.uuid));
+                                channel.chain.push(slot);
                             }
                             // Values are applied by the engine once the rebuilt
                             // chain's parameters have registered — the same
@@ -3353,9 +3699,8 @@ impl EffectPlugin for KovvbojRootPlugin {
                     None => saved.instantiate(),
                 };
                 let gid = recalled.group_uuid.clone();
-                let direct = recalled.direct_members();
                 let base = crate::scene::topology_base();
-                let mut members = Vec::new();
+                let members: Vec<String>;
 
                 // Clear the deck first, with the same sweep a layer removal
                 // does, or the old layers' modulation outlives them. Only when
@@ -3398,85 +3743,41 @@ impl EffectPlugin for KovvbojRootPlugin {
                 }
 
                 {
-                    let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut built: Vec<Channel> = Vec::with_capacity(recalled.layers.len());
                     for desc in &recalled.layers {
                         let mut entry = desc.source.clone();
                         if let Some(path) = entry.path.take() {
                             entry.path = Some(crate::scene::resolve(&path, &base));
                         }
-                        let source = match instantiate_source(&entry, device, queue, engine) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                log::warn!("[Group] '{}' failed to build: {e}", desc.name);
-                                continue;
-                            }
-                        };
                         let prefix = format!("ch_{}_", desc.uuid);
-                        let mut source = source;
-                        source.set_param_prefix(&prefix);
-                        let mut channel = Channel::new(desc.uuid.clone(), &desc.name, source);
+                        let mut channel = layer_or_placeholder(
+                            desc,
+                            instantiate_source(&entry, device, queue, engine),
+                            &mut state.missing_layers,
+                        );
                         channel.opacity = desc.opacity;
                         channel.blend_mode = desc.blend_mode;
                         channel.solo = desc.solo;
                         channel.mute = desc.mute;
                         for slot in &desc.fx {
-                            if let Some(mut built) =
-                                build_fx_slot(slot, &base, device, queue, engine)
-                            {
-                                built
-                                    .effect
-                                    .set_param_prefix(&format!("{prefix}fx{}_", built.uuid));
-                                channel.chain.push(built);
-                            }
+                            let mut built = build_fx_slot(slot, &base, device, queue, engine);
+                            built
+                                .effect
+                                .set_param_prefix(&format!("{prefix}fx{}_", built.uuid));
+                            channel.chain.push(built);
                         }
-                        if mixer.add_channel(channel).is_err() {
-                            continue;
-                        }
+                        built.push(channel);
+                    }
+
+                    let mut mixer = state.mixer.lock().unwrap_or_else(|e| e.into_inner());
+                    members = attach_recalled(&mut mixer, built, &recalled, &saved.name);
+                    for desc in recalled.layers.iter().filter(|l| members.contains(&l.uuid)) {
                         state
                             .layer_sources
                             .insert(desc.uuid.clone(), desc.source.clone());
-                        members.push(desc.uuid.clone());
                     }
 
-                    // The groups: the top one, then the nested ones, then who
-                    // belongs to whom. Every group exists before any parent
-                    // pointer is set, because `set_group_parent` refuses a
-                    // parent it cannot find.
                     if !members.is_empty() {
-                        if !mixer.groups.iter().any(|g| g.uuid == gid) {
-                            mixer
-                                .groups
-                                .push(rustjay_mixer::ChannelGroup::new(&gid, &saved.name));
-                        }
-                        for g in &recalled.groups {
-                            if !mixer.groups.iter().any(|x| x.uuid == g.uuid) {
-                                mixer
-                                    .groups
-                                    .push(rustjay_mixer::ChannelGroup::new(&g.uuid, &g.name));
-                            }
-                        }
-                        for uuid in &direct {
-                            if members.iter().any(|m| m == uuid) {
-                                mixer.set_channel_group(uuid, Some(gid.clone()));
-                            }
-                        }
-                        for g in &recalled.groups {
-                            for uuid in &g.members {
-                                if members.iter().any(|m| m == uuid) {
-                                    mixer.set_channel_group(uuid, Some(g.uuid.clone()));
-                                }
-                            }
-                        }
-                        for g in &recalled.groups {
-                            if !mixer.set_group_parent(&g.uuid, g.parent.as_deref()) {
-                                log::warn!(
-                                    "[Group] '{}' could not nest inside {:?}",
-                                    g.name,
-                                    g.parent
-                                );
-                            }
-                        }
-
                         // A group added to a deck lives inside it. A deck
                         // recall *is* the deck and has no parent to set.
                         if let Some(uuid) = deck_uuid.filter(|_| !replace)
@@ -3563,11 +3864,10 @@ impl EffectPlugin for KovvbojRootPlugin {
                     // stack two copies of the same idea.
                     mixer.master.clear();
                     for desc in &fx {
-                        if let Some(mut slot) = build_fx_slot(desc, &base, device, queue, engine) {
-                            slot.effect
-                                .set_param_prefix(&format!("master_fx{}_", slot.uuid));
-                            mixer.master.push(slot);
-                        }
+                        let mut slot = build_fx_slot(desc, &base, device, queue, engine);
+                        slot.effect
+                            .set_param_prefix(&format!("master_fx{}_", slot.uuid));
+                        mixer.master.push(slot);
                     }
                 }
                 if let Ok(mut restore) = engine.param_restore.lock() {
@@ -3805,7 +4105,7 @@ impl EffectPlugin for KovvbojRootPlugin {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            let dir = std::path::PathBuf::from("recordings");
+                            let dir = state.workspace.recordings_dir();
                             std::fs::create_dir_all(&dir).ok();
                             let path =
                                 dir.join(format!("projector_{}_{}_{}.mp4", i, proj.name, ts));
@@ -3942,7 +4242,7 @@ impl EffectPlugin for KovvbojRootPlugin {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            let dir = std::path::PathBuf::from("recordings");
+                            let dir = state.workspace.recordings_dir();
                             std::fs::create_dir_all(&dir).ok();
                             let path = dir.join(format!("headless_{}_{}_{}.mp4", i, hl.name, ts));
                             if let Err(e) = sub.start_headless_recording(idx, &path, fps, codec) {
@@ -4061,6 +4361,37 @@ impl EffectPlugin for KovvbojRootPlugin {
                         let mixer_guard = state.mixer.lock().ok();
 
                         for lo in state.stage.lighting_outputs.iter_mut() {
+                            // Collect patch spans for overlap detection.
+                            for seg in lo.segments.iter().filter(|s| s.enabled) {
+                                let profile = profiles.iter().find(|p| p.id == seg.profile);
+                                let footprint = profile.map(|p| p.channels.len()).unwrap_or(3);
+                                let count = (seg.grid[0] as usize) * (seg.grid[1] as usize);
+                                overlap_spans.extend(rustjay_lighting::segment_spans(
+                                    lo.name.clone(),
+                                    seg.name.clone(),
+                                    seg.start_universe,
+                                    seg.start_channel,
+                                    footprint,
+                                    count,
+                                ));
+                            }
+
+                            let want = lo.enabled
+                                && matches!(lo.output_type, OutputType::Sacn | OutputType::ArtNet);
+                            if !want {
+                                // Off means off: no sampler, so no atlas pass and no
+                                // readback for it each frame. The sender and its
+                                // meter go with it; all three are rebuilt the frame
+                                // it is switched back on.
+                                if let Some(id) = lo.sampler_id.take() {
+                                    sub.remove_pixel_sampler(id);
+                                    if let Some(sender) = state.lighting_senders.remove(&id) {
+                                        sender.shutdown();
+                                    }
+                                    state.lighting_last_frames.remove(&id);
+                                }
+                                continue;
+                            }
                             let layout = output_atlas_layout(lo, &state.stage.surfaces);
                             let sampler_id = match lo.sampler_id {
                                 Some(id) => {
@@ -4079,40 +4410,49 @@ impl EffectPlugin for KovvbojRootPlugin {
 
                             // Per-segment source override: a surface sourced from a
                             // mixer channel makes its segment sample that channel's
-                            // texture instead of the master composite.
+                            // texture instead of the master composite. The view is
+                            // cached per channel and rebuilt only when the channel's
+                            // texture generation moves — its output ping-pongs with
+                            // FX-chain parity, see `sync_surface_source`. A fresh
+                            // `Arc` every frame compared unequal by pointer in
+                            // `set_tile_sources` and rebuilt the bind group each time.
                             let tile_sources: Vec<Option<std::sync::Arc<wgpu::TextureView>>> = lo
                                 .segments
                                 .iter()
                                 .map(|seg| {
-                                    resolve_segment_source(seg, &state.stage.surfaces, |_ch| {
-                                        #[cfg(feature = "mixer")]
-                                        {
-                                            mixer_guard
-                                                .as_ref()
-                                                .and_then(|m| m.channel_texture(_ch))
-                                                .map(|t| {
-                                                    std::sync::Arc::new(t.texture.create_view(
+                                    let ch = segment_channel(seg, &state.stage.surfaces)?;
+                                    #[cfg(feature = "mixer")]
+                                    {
+                                        let tex = mixer_guard.as_ref()?.channel_texture(ch)?;
+                                        let views = &mut state.lighting_channel_views;
+                                        if views.get(ch).is_none_or(|(g, _)| *g != tex.generation) {
+                                            views.insert(
+                                                ch.to_string(),
+                                                (
+                                                    tex.generation,
+                                                    std::sync::Arc::new(tex.texture.create_view(
                                                         &wgpu::TextureViewDescriptor::default(),
-                                                    ))
-                                                })
+                                                    )),
+                                                ),
+                                            );
                                         }
-                                        #[cfg(not(feature = "mixer"))]
-                                        {
-                                            None
-                                        }
-                                    })
+                                        views.get(ch).map(|(_, v)| v.clone())
+                                    }
+                                    #[cfg(not(feature = "mixer"))]
+                                    {
+                                        let _ = ch;
+                                        None
+                                    }
                                 })
                                 .collect();
                             sub.set_sampler_tile_sources(sampler_id, &tile_sources);
 
-                            let want = lo.enabled
-                                && matches!(lo.output_type, OutputType::Sacn | OutputType::ArtNet);
-
-                            let has_sender = state.lighting_senders.contains_key(&sampler_id);
-                            if want && !has_sender {
+                            if let std::collections::hash_map::Entry::Vacant(slot) =
+                                state.lighting_senders.entry(sampler_id)
+                            {
                                 match build_dmx_sender(&lo.output_type, &lo.transport) {
                                     Ok(sender) => {
-                                        state.lighting_senders.insert(sampler_id, sender);
+                                        slot.insert(sender);
                                         engine.notify(
                                             format!(
                                                 "{} output started: {}",
@@ -4129,38 +4469,16 @@ impl EffectPlugin for KovvbojRootPlugin {
                                         std::time::Duration::from_secs(4),
                                     ),
                                 }
-                            } else if !want && has_sender {
-                                if let Some(sender) = state.lighting_senders.remove(&sampler_id) {
-                                    sender.shutdown();
-                                }
-                                state.lighting_last_frames.remove(&sampler_id);
                             }
 
-                            if want {
-                                if let Some((px, layout)) = sub.pixel_sampler_atlas(sampler_id) {
-                                    let frame = build_dmx_frame(lo, &profiles, px, layout);
-                                    state.lighting_last_frames.insert(sampler_id, frame.clone());
-                                    if let Some(sender) = state.lighting_senders.get(&sampler_id) {
-                                        sender.submit(frame);
-                                    }
+                            if let Some((px, layout)) = sub.pixel_sampler_atlas(sampler_id) {
+                                let frame = build_dmx_frame(lo, &profiles, px, layout);
+                                state.lighting_last_frames.insert(sampler_id, frame.clone());
+                                if let Some(sender) = state.lighting_senders.get(&sampler_id) {
+                                    sender.submit(frame);
                                 }
-                                sink_labels.push(lo.output_type.label().to_string());
                             }
-
-                            // Collect patch spans for overlap detection.
-                            for seg in lo.segments.iter().filter(|s| s.enabled) {
-                                let profile = profiles.iter().find(|p| p.id == seg.profile);
-                                let footprint = profile.map(|p| p.channels.len()).unwrap_or(3);
-                                let count = (seg.grid[0] as usize) * (seg.grid[1] as usize);
-                                overlap_spans.extend(rustjay_lighting::segment_spans(
-                                    lo.name.clone(),
-                                    seg.name.clone(),
-                                    seg.start_universe,
-                                    seg.start_channel,
-                                    footprint,
-                                    count,
-                                ));
-                            }
+                            sink_labels.push(lo.output_type.label().to_string());
                         }
 
                         // Stop senders for outputs that no longer exist.
@@ -4313,17 +4631,8 @@ impl EffectPlugin for KovvbojRootPlugin {
             // FIXME: hardcodes default_workspace() because init() has no access to State.
             // Wire a workspace field onto the plugin when per-project paths are needed.
             let workspace = crate::persistence::default_workspace();
-            let scene = if workspace.exists() {
-                match workspace.load_scene() {
-                    Ok(scene) => Some(scene),
-                    Err(e) => {
-                        log::warn!("[Workspace] failed to load scene: {}", e);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            let (scene, notice) = load_scene_or_backup(&workspace);
+            self.notices.extend(notice);
 
             // Rebuild the saved routing graph when present; otherwise fall back
             // to the hard-coded default assembly. Topology must exist before the
@@ -4672,6 +4981,170 @@ fn source_entry_to_api(e: &crate::sources::SourceEntry) -> KovvbojSourceEntry {
 #[cfg(all(test, feature = "mixer"))]
 mod tests {
     use super::*;
+
+    /// The resources root is looked up in a fixed order, and a candidate only
+    /// counts when it actually holds the shaders.
+    #[test]
+    fn resources_resolve_env_then_bundle_then_exe_dir_then_dev() {
+        let root = std::env::temp_dir().join(format!("kv-res-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bundle = root.join("KOVVBOJ.app/Contents");
+        let exe = bundle.join("MacOS/kovvboj");
+        std::fs::create_dir_all(bundle.join("MacOS")).unwrap();
+        std::fs::create_dir_all(bundle.join("Resources/shaders")).unwrap();
+        let env_dir = root.join("env");
+        std::fs::create_dir_all(env_dir.join("shaders")).unwrap();
+        let flat = root.join("flat");
+        std::fs::create_dir_all(flat.join("shaders")).unwrap();
+        let dev = root.join("dev");
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap();
+
+        // The env override wins when it has shaders …
+        assert_eq!(
+            resolve_resources(Some(env_dir.clone()), Some(&exe), &dev),
+            canon(&env_dir)
+        );
+        // … and is ignored when it does not.
+        assert_eq!(
+            resolve_resources(Some(root.join("nowhere")), Some(&exe), &dev),
+            canon(&bundle.join("Resources"))
+        );
+        // A bundle: `Contents/Resources` beside the binary's directory.
+        assert_eq!(
+            resolve_resources(None, Some(&exe), &dev),
+            canon(&bundle.join("Resources"))
+        );
+        // A flat package (Linux tarball, Windows zip): next to the binary.
+        assert_eq!(
+            resolve_resources(None, Some(&flat.join("kovvboj")), &dev),
+            canon(&flat)
+        );
+        // Nothing packaged: the crate root, as `cargo run` has.
+        assert_eq!(resolve_resources(None, None, &dev), dev);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A layer whose file cannot be opened stays in the set: it stands on a
+    /// placeholder, keeps its descriptor, and the next save writes it back out
+    /// exactly as it was — including the path that will work again once the
+    /// drive is mounted. Dropping it and then auto-saving is how a set used to
+    /// lose layers for good.
+    #[test]
+    fn a_missing_layer_survives_load_and_save() {
+        let desc = crate::scene::LayerDesc {
+            uuid: "clip1".into(),
+            name: "Intro clip".into(),
+            source: crate::sources::SourceEntry {
+                id: "intro".into(),
+                name: "Intro clip".into(),
+                kind: crate::sources::SourceKind::Video,
+                path: Some("/Volumes/Gone/intro.mov".into()),
+                device_index: 0,
+                text: None,
+            },
+            opacity: 0.7,
+            blend_mode: rustjay_mixer::BlendMode::Add,
+            solo: false,
+            mute: false,
+            fx: Vec::new(),
+        };
+
+        // What `apply_topology` does when the build fails.
+        let mut missing = std::collections::HashSet::new();
+        let mut mixer = Mixer::new();
+        let ch = layer_or_placeholder(&desc, Err(anyhow::anyhow!("no such file")), &mut missing);
+        assert_eq!(ch.uuid, "clip1");
+        assert!(missing.contains("clip1"), "the layer is flagged, not dropped");
+        mixer.add_channel(ch).unwrap();
+        let mut sources = std::collections::HashMap::new();
+        sources.insert(desc.uuid.clone(), desc.source.clone());
+
+        // The 30-second auto-save.
+        let dir = std::env::temp_dir().join(format!("kv-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = crate::persistence::Workspace::new(&dir);
+        ws.save_scene(&Scene::from_mixer(&mixer, &sources)).unwrap();
+
+        let back = ws.load_scene().unwrap();
+        let layers = back.topology.expect("topology saved").layers;
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].uuid, "clip1");
+        assert_eq!(layers[0].name, "Intro clip");
+        assert_eq!(
+            layers[0].source.path.as_deref(),
+            Some(std::path::Path::new("/Volumes/Gone/intro.mov")),
+            "the original path is what gets saved, not a placeholder"
+        );
+        assert_eq!(layers[0].source.kind, crate::sources::SourceKind::Video);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scene this build cannot use is copied aside before the default set
+    /// opens over it, and the notice says so. One that loads is left alone.
+    #[test]
+    fn an_unusable_scene_is_backed_up_before_the_default_set_replaces_it() {
+        let dir = std::env::temp_dir().join(format!("kv-bak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = crate::persistence::Workspace::new(&dir);
+        let backups = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("scene.json.bak-"))
+                })
+                .collect()
+        };
+
+        // Nothing there: nothing to say.
+        let (scene, notice) = load_scene_or_backup(&ws);
+        assert!(scene.is_none() && notice.is_none());
+
+        // Corrupt: copied aside, byte for byte, and the original left in place.
+        std::fs::write(ws.scene_path(), "{ not json").unwrap();
+        let (scene, notice) = load_scene_or_backup(&ws);
+        assert!(scene.is_none());
+        let notice = notice.expect("a notice");
+        let kept = backups(&dir);
+        assert_eq!(kept.len(), 1, "one backup: {kept:?}");
+        assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "{ not json");
+        assert!(ws.exists(), "the original is copied, not moved");
+        assert!(notice.contains("could not be read"), "{notice}");
+        assert!(notice.contains(&kept[0].display().to_string()), "{notice}");
+        std::fs::remove_file(&kept[0]).unwrap();
+
+        // Pre-layer (version 0): parses, but cannot be replayed — copied aside.
+        let stale = Scene {
+            topology: Some(crate::scene::Topology {
+                version: 0,
+                ..Default::default()
+            }),
+            ..Scene::from_mixer(&Mixer::new(), &Default::default())
+        };
+        ws.save_scene(&stale).unwrap();
+        let (scene, notice) = load_scene_or_backup(&ws);
+        assert!(scene.is_some(), "the knobs still load");
+        assert!(notice.expect("a notice").contains("predates layers"));
+        assert_eq!(backups(&dir).len(), 1);
+        for b in backups(&dir) {
+            std::fs::remove_file(b).unwrap();
+        }
+
+        // Current, and emptied on purpose: reloads as is, no copy, no notice.
+        let empty = Scene::from_mixer(&Mixer::new(), &Default::default());
+        assert!(empty.topology.as_ref().unwrap().layers.is_empty());
+        ws.save_scene(&empty).unwrap();
+        let (scene, notice) = load_scene_or_backup(&ws);
+        assert!(scene.is_some());
+        assert!(notice.is_none(), "an intentionally empty set is not stale");
+        assert!(backups(&dir).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The shape the crossfader can drive: two images, then a float progress.
     #[test]
@@ -5595,6 +6068,96 @@ mod recall_tests {
         // No deck named, nothing to replace — both kinds simply add.
         assert!(!recall_replaces(true, None));
         assert!(!recall_replaces(false, None));
+    }
+
+    /// A deck holding a group comes back in the order it was saved.
+    ///
+    /// Save: the layers are captured bottom-first, and a plain file round trip
+    /// keeps them so. Recall: the layers are appended in that order and
+    /// membership is assigned in place. Putting each one next to its group's
+    /// other members instead moved the deck's top layer above the nested
+    /// group's — `[L1, N{L2, L3}, L4]` came back as `[L1, L4, L2, L3]`.
+    #[test]
+    fn a_recalled_deck_keeps_its_saved_order() {
+        use crate::sources::testing::StubSource;
+
+        let mut m = Mixer::new();
+        m.use_crossfader = false;
+        for (uuid, group) in [("L1", DECK_A), ("L2", "N"), ("L3", "N"), ("L4", DECK_A)] {
+            let mut ch = Channel::new(uuid, uuid, Box::new(StubSource));
+            ch.group = Some(group.to_string());
+            m.add_channel(ch).unwrap();
+        }
+        ensure_decks(&mut m);
+        m.groups
+            .push(rustjay_mixer::ChannelGroup::new("N", "Inner"));
+        assert!(m.set_group_parent("N", Some(DECK_A)));
+        let names = |layers: &[crate::scene::LayerDesc]| -> Vec<String> {
+            layers.iter().map(|l| l.name.clone()).collect()
+        };
+
+        // The scene file: what the auto-save writes and the next launch reads.
+        let topo = crate::scene::Topology::from_mixer(&m, &Default::default());
+        let json = serde_json::to_string(&topo).unwrap();
+        let back: crate::scene::Topology = serde_json::from_str(&json).unwrap();
+        assert_eq!(names(&back.layers), ["L1", "L2", "L3", "L4"]);
+        assert_eq!(
+            back.groups.iter().find(|g| g.uuid == "N").unwrap().members,
+            ["L2", "L3"]
+        );
+
+        // The saved deck: what 💾 on the deck heading writes.
+        let g = topo.groups.iter().find(|g| g.uuid == DECK_A).unwrap();
+        let nested = descendant_groups(&topo, DECK_A);
+        let members: Vec<&String> = g
+            .members
+            .iter()
+            .chain(nested.iter().flat_map(|n| n.members.iter()))
+            .collect();
+        let layers: Vec<crate::scene::LayerDesc> = topo
+            .layers
+            .iter()
+            .filter(|l| members.contains(&&l.uuid))
+            .cloned()
+            .collect();
+        assert_eq!(names(&layers), ["L1", "L2", "L3", "L4"], "captured bottom-first");
+        let saved = crate::scene::SavedGroup::capture(
+            "Deck".into(),
+            g,
+            layers,
+            nested,
+            &Default::default(),
+        );
+
+        // Recall onto an empty deck A.
+        let recalled = saved.instantiate_into(DECK_A);
+        let mut m2 = Mixer::new();
+        m2.use_crossfader = false;
+        ensure_decks(&mut m2);
+        let built: Vec<Channel> = recalled
+            .layers
+            .iter()
+            .map(|d| Channel::new(d.uuid.clone(), d.name.clone(), Box::new(StubSource)))
+            .collect();
+        let added = attach_recalled(&mut m2, built, &recalled, "Deck");
+        assert_eq!(added.len(), 4);
+        let on_deck_a: Vec<String> = (0..m2.channels.len())
+            .filter(|&i| m2.deck_of_channel(i) == Some(0))
+            .map(|i| m2.channels[i].name.clone())
+            .collect();
+        assert_eq!(
+            on_deck_a,
+            ["L1", "L2", "L3", "L4"],
+            "the stack order survives the recall"
+        );
+        let inner = m2.groups.iter().find(|g| g.name == "Inner").unwrap();
+        let inner_members: Vec<String> = m2
+            .group_members(&inner.uuid)
+            .into_iter()
+            .map(|i| m2.channels[i].name.clone())
+            .collect();
+        assert_eq!(inner_members, ["L2", "L3"]);
+        assert_eq!(inner.parent.as_deref(), Some(DECK_A));
     }
 
     #[test]

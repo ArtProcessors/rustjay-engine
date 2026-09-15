@@ -205,8 +205,14 @@ jobs:
           APP="dist/$DISPLAY_NAME.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" out
           cp "$TD/release/${{ matrix.app }}" "$APP/Contents/MacOS/"
-          ICNS="${{ matrix.dir || format('examples/{0}', matrix.app) }}/packaging/AppIcon.icns"
+          SRC="${{ matrix.dir || format('examples/{0}', matrix.app) }}"
+          ICNS="$SRC/packaging/AppIcon.icns"
           [ -f "$ICNS" ] && cp "$ICNS" "$APP/Contents/Resources/"
+          # Bundled shader/asset libraries: the app resolves them from
+          # Contents/Resources at runtime (kovvboj `resources_dir()`).
+          for res in shaders assets; do
+            if [ -d "$SRC/$res" ]; then cp -R "$SRC/$res" "$APP/Contents/Resources/"; fi
+          done
           sed -e "s/__NAME__/$DISPLAY_NAME/g" \
               -e "s/__BIN__/${{ matrix.app }}/g" \
               -e "s/__VERSION__/$VERSION/g" \
@@ -245,6 +251,11 @@ jobs:
           TD="target"
           mkdir -p out stage
           cp "$TD/release/${{ matrix.app }}" stage/
+          # Bundled shader/asset libraries, resolved next to the binary at runtime.
+          SRC="${{ matrix.dir || format('examples/{0}', matrix.app) }}"
+          for res in shaders assets; do
+            if [ -d "$SRC/$res" ]; then cp -R "$SRC/$res" stage/; fi
+          done
           if [ "${{ matrix.ndi }}" = "true" ]; then
             # ship the NDI runtime next to the binary ($ORIGIN rpath)
             cp -P "$NDI_SDK_DIR"/lib/x86_64-linux-gnu/libndi.so* stage/
@@ -262,6 +273,10 @@ jobs:
           $dist = "dist\$app"
           New-Item -ItemType Directory -Force $dist, out | Out-Null
           Copy-Item "$td\release\$app.exe" $dist
+          # Bundled shader/asset libraries, resolved next to the binary at runtime.
+          foreach ($res in 'shaders', 'assets') {
+            if (Test-Path "$pkgdir\$res") { Copy-Item -Recurse "$pkgdir\$res" $dist }
+          }
           if ('${{ matrix.ffmpeg }}' -eq 'true') {
             Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $dist
           }

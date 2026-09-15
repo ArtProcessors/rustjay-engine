@@ -227,6 +227,34 @@ impl Channel {
         self.last_output = LastOutput::Texture;
     }
 
+    /// The keying this channel composites with, from the live parameters.
+    ///
+    /// One place, because there are two composite passes — a grouped layer
+    /// blends into its group's accumulator, an ungrouped one straight into the
+    /// master — and only the master pass used to read these. Every layer on a
+    /// deck is grouped, so keying was a no-op for all of them.
+    fn key_params(&self, engine: &EngineState) -> KeyParams {
+        KeyParams {
+            mode: engine
+                .get_param_base(&self.key_mode_key)
+                .map(|v| v.round() as u32)
+                .unwrap_or(self.key_mode),
+            r: engine.get_param(&self.key_r_key).unwrap_or(self.key_r),
+            g: engine.get_param(&self.key_g_key).unwrap_or(self.key_g),
+            b: engine.get_param(&self.key_b_key).unwrap_or(self.key_b),
+            threshold: engine
+                .get_param(&self.key_threshold_key)
+                .unwrap_or(self.key_threshold),
+            smoothness: engine
+                .get_param(&self.key_smoothness_key)
+                .unwrap_or(self.key_smoothness),
+            luma_invert: engine
+                .get_param_base(&self.key_luma_invert_key)
+                .map(|v| v > 0.5)
+                .unwrap_or(self.luma_invert),
+        }
+    }
+
     /// Render the channel effect and run its post-chain, returning the texture
     /// that holds the final output for this frame.
     fn render<'a>(
@@ -1363,11 +1391,13 @@ impl EffectInstance for Mixer {
                 ParamCategory::Custom("Mixer".to_string()),
                 0.0, 1.0, ch.key_smoothness, 0.01,
             ));
-            out.push(ParameterDescriptor::float(
+            // A bool, so a UI draws it as the switch it is; the render reads
+            // it as `> 0.5` either way.
+            out.push(ParameterDescriptor::bool(
                 format!("{prefix}key_luma_invert"),
                 format!("{} Luma Invert", ch.name),
                 ParamCategory::Custom("Mixer".to_string()),
-                0.0, 1.0, if ch.luma_invert { 1.0 } else { 0.0 }, 1.0,
+                ch.luma_invert,
             ));
 
             for p in ch.effect.parameters() {
@@ -1520,14 +1550,18 @@ impl EffectInstance for Mixer {
             g.rendered = false;
 
             let items = self.group_items(&uuid);
-            // A deck renders even with nothing on it: the normal path clears its
-            // accumulator, so an empty deck is a black image the transition can
-            // fade to. Letting it fall through to `release_resources` left the
-            // transition without two inputs, and the crossfader did nothing at
-            // all. It costs an empty deck its four textures, which is the price
-            // of a fader that always works.
+            // A deck renders even with nothing on it, and even muted: the
+            // normal path clears its accumulator, so an empty or muted deck is
+            // a black image the transition can fade to. Letting it fall
+            // through to `release_resources` left the transition without two
+            // inputs, the crossfader did nothing at all, and the decks
+            // composited as ordinary groups — so muting deck A while parked on
+            // it showed deck B at full, fader or no fader. It costs such a
+            // deck its four textures, which is the price of a fader that
+            // always works. Its members' opacities are already zero (see
+            // `raw_opacities`), so the sources do not render either.
             let is_deck = self.deck_of(&uuid).is_some();
-            if !self.group_audible(&uuid) || (items.is_empty() && !is_deck) {
+            if !is_deck && (!self.group_audible(&uuid) || items.is_empty()) {
                 // Nothing to composite, or nothing that would be heard. Hand
                 // back the four full-resolution textures rather than hold them.
                 g.release_resources();
@@ -1542,7 +1576,7 @@ impl EffectInstance for Mixer {
             clear_texture(ctx.encoder, &ga.view);
             let mut written: Option<&Texture> = None;
             for (slot, item) in items.iter().enumerate() {
-                let (src, opacity, blend_mode) = match item {
+                let (src, opacity, blend_mode, key) = match item {
                     GroupItem::Channel(i) => {
                         let ch = &self.channels[*i];
                         let Some(src) = ch.output_texture() else {
@@ -1552,7 +1586,12 @@ impl EffectInstance for Mixer {
                             .get_param(&ch.blend_key)
                             .and_then(|v| BlendMode::from_index(v as u32))
                             .unwrap_or(ch.blend_mode);
-                        (src, eff.get(*i).copied().unwrap_or(0.0), blend)
+                        (
+                            src,
+                            eff.get(*i).copied().unwrap_or(0.0),
+                            blend,
+                            ch.key_params(engine),
+                        )
                     }
                     GroupItem::Group(child) => {
                         let Some(cg) = self.groups.iter().find(|x| &x.uuid == child) else {
@@ -1574,7 +1613,7 @@ impl EffectInstance for Mixer {
                             .get_param(&cg.blend_key)
                             .and_then(|v| BlendMode::from_index(v as u32))
                             .unwrap_or(cg.blend_mode);
-                        (src, opacity, blend)
+                        (src, opacity, blend, KeyParams::default())
                     }
                 };
                 if opacity < 0.001 {
@@ -1598,7 +1637,7 @@ impl EffectInstance for Mixer {
                     &write.view,
                     opacity,
                     blend_mode,
-                    KeyParams::default(),
+                    key,
                     ctx.vertex_buffer,
                 );
                 written = Some(write);
@@ -1795,21 +1834,7 @@ impl EffectInstance for Mixer {
                 .and_then(|v| BlendMode::from_index(v as u32))
                 .unwrap_or(ch.blend_mode);
 
-            let key = KeyParams {
-                mode: engine
-                    .get_param_base(&ch.key_mode_key)
-                    .map(|v| v.round() as u32)
-                    .unwrap_or(ch.key_mode),
-                r: engine.get_param(&ch.key_r_key).unwrap_or(ch.key_r),
-                g: engine.get_param(&ch.key_g_key).unwrap_or(ch.key_g),
-                b: engine.get_param(&ch.key_b_key).unwrap_or(ch.key_b),
-                threshold: engine.get_param(&ch.key_threshold_key).unwrap_or(ch.key_threshold),
-                smoothness: engine.get_param(&ch.key_smoothness_key).unwrap_or(ch.key_smoothness),
-                luma_invert: engine
-                    .get_param_base(&ch.key_luma_invert_key)
-                    .map(|v| v > 0.5)
-                    .unwrap_or(ch.luma_invert),
-            };
+            let key = ch.key_params(engine);
 
             let (read_acc, write_acc) = match written_acc {
                 None => (acc_a, acc_b),

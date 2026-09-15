@@ -40,10 +40,11 @@ impl Mode {
 /// Built-in tabs the View menu can open as windows, in menu order.
 ///
 /// `Settings` is deliberately absent — it lives under Edit. `Sync` is folded
-/// into Audio by the host and has no body of its own.
-const VIEW_TABS: [GuiTab; 10] = [
-    GuiTab::Input,
-    GuiTab::Output,
+/// into Audio by the host and has no body of its own. `Input` and `Output`
+/// are absent too: the Library's DEVICES rows and the Outputs window own
+/// those jobs, and the engine's versions opened a second capture session on
+/// the same camera and a second NDI/Syphon sender from the hidden main window.
+const VIEW_TABS: [GuiTab; 8] = [
     GuiTab::Color,
     GuiTab::Motion,
     GuiTab::Audio,
@@ -769,6 +770,11 @@ impl KovvbojShell {
     ) {
         use rustjay_gui::egui_theme::colors::*;
 
+        let recordings_dir = app_state
+            .downcast_ref::<crate::KovvbojAppState>()
+            .map(|s| s.workspace.recordings_dir())
+            .unwrap_or_else(|| std::path::PathBuf::from("recordings"));
+
         // Which optional built-ins have anything to show, so the View menu does
         // not offer empty panels. Mirrors the built-in host's own filter.
         let (has_color, has_motion, fps, bpm, clock, web, osc, recording) = {
@@ -1164,7 +1170,7 @@ impl KovvbojShell {
                                 rustjay_core::OutputCommand::StopRecording
                             } else {
                                 rustjay_core::OutputCommand::StartRecording {
-                                    path: crate::ui::next_recording_path(),
+                                    path: crate::ui::next_recording_path(&recordings_dir),
                                     codec: rustjay_core::RecorderCodec::H264,
                                     audio_device: None,
                                 }
@@ -1352,6 +1358,9 @@ impl KovvbojShell {
             egui::Window::new("Outputs")
                 .open(&mut open)
                 .default_width(520.0)
+                // A hint, not a bound — the rows are what keep the window
+                // from growing to the screen, see `OutputsTab`.
+                .max_width(640.0)
                 .vscroll(true)
                 .show(&ctx, |ui| tab(&mut self.outputs, ui, app_state, engine));
             self.show_outputs = open;
@@ -1384,13 +1393,33 @@ impl KovvbojShell {
         app_state: &mut dyn std::any::Any,
         deck: usize,
     ) {
+        #[cfg(feature = "mixer")]
+        let uuid = if deck == 1 { crate::DECK_B } else { crate::DECK_A };
+        #[cfg(feature = "mixer")]
+        let selected = app_state
+            .downcast_ref::<crate::KovvbojAppState>()
+            .is_some_and(|s| {
+                matches!(&s.selection, crate::Selection::Group { group } if group == uuid)
+            });
+        #[cfg(not(feature = "mixer"))]
+        let selected = false;
+        let mut select = false;
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(label)
-                    .strong()
-                    .monospace()
-                    .color(rustjay_gui::egui_theme::colors::ink_4()),
-            );
+            // The heading selects the deck: its level, blend and chain then
+            // go in the inspector, and ➕ in the library adds an effect to it.
+            if ui
+                .selectable_label(
+                    selected,
+                    egui::RichText::new(label)
+                        .strong()
+                        .monospace()
+                        .color(rustjay_gui::egui_theme::colors::ink_4()),
+                )
+                .on_hover_text("Select the deck — edit it in the inspector, add effects from the library")
+                .clicked()
+            {
+                select = true;
+            }
             #[cfg(feature = "mixer")]
             {
                 let typed = &mut self.deck_name[deck.min(1)];
@@ -1411,7 +1440,6 @@ impl KovvbojShell {
                     .clicked();
                 if let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>() {
                     if entered || clicked {
-                        let uuid = if deck == 1 { crate::DECK_B } else { crate::DECK_A };
                         state.pending_group_save = Some((uuid.to_string(), name.clone()));
                         self.deck_name[deck.min(1)].clear();
                     } else if named && state.saved_groups.iter().any(|g| g.name == name) {
@@ -1425,6 +1453,14 @@ impl KovvbojShell {
                 }
             }
         });
+        #[cfg(feature = "mixer")]
+        if select && let Some(state) = app_state.downcast_mut::<crate::KovvbojAppState>() {
+            state.selection = crate::Selection::Group {
+                group: uuid.to_string(),
+            };
+        }
+        #[cfg(not(feature = "mixer"))]
+        let _ = select;
         ui.separator();
     }
 

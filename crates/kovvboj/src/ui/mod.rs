@@ -9,17 +9,14 @@
 //!
 //! See VARDA_PORT.md §5 and `examples/delta-egui`.
 
-/// A timestamped path under `recordings/` for a one-click recording.
-///
-/// The Outputs window lets you choose a path and codec; the top-bar button is
-/// for starting one without a decision to make.
-pub fn next_recording_path() -> String {
+/// A timestamped path under the workspace's recordings folder for a one-click
+/// recording — the top-bar button starts one without a decision to make.
+pub fn next_recording_path(dir: &std::path::Path) -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let dir = std::path::PathBuf::from("recordings");
-    std::fs::create_dir_all(&dir).ok();
+    std::fs::create_dir_all(dir).ok();
     dir.join(format!("kovvboj_{ts}.mp4"))
         .to_string_lossy()
         .to_string()
@@ -245,52 +242,19 @@ impl StageTab {
 }
 
 /// Outputs tab — window/display/NDI/stream/record assignment.
-pub struct OutputsTab {
-    recording_path: String,
-    recording_codec: rustjay_core::RecorderCodec,
-    /// Async result from the native save dialog.
-    pending_save_path: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
-}
-
-impl Default for OutputsTab {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+///
+/// Recording is per output: a row whose type is Recording arms with ⏺, and
+/// `prepare` starts and stops the recorder every frame, whether or not this
+/// window is open. The engine's own recorder of the hidden main window used
+/// to have a section here too, with a second reconciler for the per-output
+/// recordings that ran only while the window was drawn and disagreed with
+/// `prepare` on codec and path; whichever ran first in a frame won.
+#[derive(Default)]
+pub struct OutputsTab;
 
 impl OutputsTab {
     pub fn new() -> Self {
-        Self {
-            recording_path: String::from("recording.mp4"),
-            recording_codec: rustjay_core::RecorderCodec::H264,
-            pending_save_path: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        }
-    }
-
-    #[cfg(feature = "projection")]
-    /// Generate an auto-incrementing recording path.
-    fn auto_record_path(&self, name: &str) -> std::path::PathBuf {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let ext = match self.recording_codec {
-            rustjay_core::RecorderCodec::ProRes422 => "mov",
-            _ => "mp4",
-        };
-        let dir = std::path::PathBuf::from("recordings");
-        std::fs::create_dir_all(&dir).ok();
-        dir.join(format!("{}_{}.{}", name, ts, ext))
-    }
-
-    #[cfg(feature = "projection")]
-    fn io_codec(&self) -> rustjay_io::RecorderCodec {
-        match self.recording_codec {
-            rustjay_core::RecorderCodec::H264 => rustjay_io::RecorderCodec::H264,
-            rustjay_core::RecorderCodec::H265 => rustjay_io::RecorderCodec::H265,
-            rustjay_core::RecorderCodec::AV1 => rustjay_io::RecorderCodec::AV1,
-            rustjay_core::RecorderCodec::ProRes422 => rustjay_io::RecorderCodec::ProRes422,
-        }
+        Self
     }
 }
 
@@ -302,6 +266,15 @@ impl OutputsTab {
 #[cfg(all(feature = "mixer", feature = "egui"))]
 fn deck_uuid(d: usize) -> &'static str {
     if d == 1 { crate::DECK_B } else { crate::DECK_A }
+}
+
+/// Whether a layer row has room for its thumbnail as well as a readable name.
+///
+/// `name_w` is what the row's controls leave for the select button; the thumb
+/// only goes in when at least six monospace characters (~48pt at the theme's
+/// 12.5px) would still fit beside it.
+pub fn row_shows_thumb(name_w: f32, thumb_w: f32) -> bool {
+    name_w >= thumb_w + 48.0
 }
 
 /// The library's add-target buttons: `[A][B]` when a set has decks, a plain
@@ -441,8 +414,10 @@ mod egui_impl {
         let mut idx = engine.get_param_base(key).unwrap_or(0.0).round() as usize;
         let prev = idx;
         let names: Vec<&str> = BlendMode::all().iter().map(|m| m.short_name()).collect();
+        // Four monospace characters and the arrow; 74 left a gap the layer
+        // row could not afford.
         egui::ComboBox::from_id_salt(key)
-            .width(74.0)
+            .width(62.0)
             .selected_text(*names.get(idx).unwrap_or(&"???"))
             .show_ui(ui, |ui| {
                 for (i, name) in names.iter().enumerate() {
@@ -1483,13 +1458,18 @@ mod egui_impl {
             ParamType::Enum { variants } => {
                 let mut idx = current as usize;
                 let sel = variants.get(idx).map(String::as_str).unwrap_or("?");
-                egui::ComboBox::from_id_salt(&desc.id)
-                    .selected_text(sel)
-                    .show_ui(ui, |ui| {
-                        for (i, name) in variants.iter().enumerate() {
-                            ui.selectable_value(&mut idx, i, name);
-                        }
-                    });
+                // Labelled like the other arms: a bare combo reading "None"
+                // says nothing about what it is none of.
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt(&desc.id)
+                        .selected_text(sel)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in variants.iter().enumerate() {
+                                ui.selectable_value(&mut idx, i, name);
+                            }
+                        });
+                    ui.label(short_param_name(desc, owner));
+                });
                 if idx as f32 != current {
                     engine.set_param_base(&desc.id, idx as f32);
                 }
@@ -1978,6 +1958,29 @@ mod egui_impl {
         if let Some((full, kind)) = layer_controls {
             param_slider(ui, engine, &format!("{full}opacity"), "Opacity", 0.0, 1.0);
             blend_combo(ui, engine, &format!("{full}blend"), "Blend");
+            // Keying: the row's K switches it, the settings are here. Only
+            // what the mode uses is shown — the colour for chroma, invert for
+            // luma — so "off" is one combo, not six dead sliders.
+            let mode = engine
+                .get_param_base(&format!("{full}key_mode"))
+                .unwrap_or(0.0)
+                .round() as u32;
+            let descriptors = engine.param_descriptors.clone();
+            for desc in descriptors.iter() {
+                let Some(rest) = desc.id.strip_prefix(full.as_str()) else {
+                    continue;
+                };
+                let shown = match rest {
+                    "key_mode" => true,
+                    "key_r" | "key_g" | "key_b" => mode == 1,
+                    "key_threshold" | "key_smoothness" => mode != 0,
+                    "key_luma_invert" => mode == 2,
+                    _ => false,
+                };
+                if shown {
+                    draw_param(ui, engine, desc, &heading);
+                }
+            }
             ui.label(
                 egui::RichText::new(format!("{kind:?}"))
                     .monospace()
@@ -2021,6 +2024,11 @@ mod egui_impl {
                     continue;
                 };
                 if rest.starts_with("fx") || DECK_CONTROL_KEYS.contains(&rest) {
+                    continue;
+                }
+                // Keying is a mix property, drawn with the layer; the engine's
+                // input select means nothing to a layer that is its own source.
+                if rest.starts_with("key_") || rest == "input_select" {
                     continue;
                 }
                 if is_pacing_param(rest) {
@@ -2146,42 +2154,7 @@ mod egui_impl {
                 {
                     acts.save = Some(uuid.clone());
                 }
-                // Through the parameter, not the field: the render reads
-                // `grp_<uuid>_opacity` from the engine now that groups declare
-                // their parameters, so writing the field alone moved nothing —
-                // and it is what makes the fader MIDI-mappable and modulatable,
-                // exactly as a layer's is.
-                let key = format!("grp_{uuid}_opacity");
-                let mut op = engine
-                    .get_param_base(&key)
-                    .unwrap_or(mixer.groups[gi].opacity);
-                // `slider_width`, not `add_sized`: a Slider always allocates the
-                // theme's 200pt and ignores the size it is handed. That pushed
-                // this row past a half-width column, egui widens a Ui to fit
-                // whatever overflows it, and every row after grew to match —
-                // which is what painted deck A's layers across deck B. M, S and
-                // a readable name still go to its left, so it only grows into
-                // what is spare after them.
-                ui.spacing_mut().slider_width =
-                    (ui.available_width() - 56.0 - 96.0).clamp(40.0, 80.0);
-                if ui
-                    .add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(false))
-                    .on_hover_text("Group opacity")
-                    .changed()
-                {
-                    engine.set_param_base(&key, op);
-                    mixer.groups[gi].opacity = op;
-                }
-                let mut mute = mixer.groups[gi].mute;
-                if ui.selectable_label(mute, "M").on_hover_text("Mute the group").clicked() {
-                    mute = !mute;
-                    mixer.groups[gi].mute = mute;
-                }
-                let mut solo = mixer.groups[gi].solo;
-                if ui.selectable_label(solo, "S").on_hover_text("Solo the group").clicked() {
-                    solo = !solo;
-                    mixer.groups[gi].solo = solo;
-                }
+                group_mix_controls(ui, mixer, gi, engine);
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     if ui
                         .add(
@@ -2201,8 +2174,98 @@ mod egui_impl {
                 });
             });
         });
+        group_strip(ui, mixer, gi, acts);
+    }
 
-        // The group's own chain: what every member passes through together.
+    /// A group's opacity, M and S, laid right-to-left; shared by a group's
+    /// header row and a deck's.
+    fn group_mix_controls(
+        ui: &mut egui::Ui,
+        mixer: &mut rustjay_mixer::Mixer,
+        gi: usize,
+        engine: &mut EngineState,
+    ) {
+        let uuid = mixer.groups[gi].uuid.clone();
+        // Through the parameter, not the field: the render reads
+        // `grp_<uuid>_opacity` from the engine now that groups declare
+        // their parameters, so writing the field alone moved nothing —
+        // and it is what makes the fader MIDI-mappable and modulatable,
+        // exactly as a layer's is.
+        let key = format!("grp_{uuid}_opacity");
+        let mut op = engine
+            .get_param_base(&key)
+            .unwrap_or(mixer.groups[gi].opacity);
+        // `slider_width`, not `add_sized`: a Slider always allocates the
+        // theme's 200pt and ignores the size it is handed. That pushed
+        // this row past a half-width column, egui widens a Ui to fit
+        // whatever overflows it, and every row after grew to match —
+        // which is what painted deck A's layers across deck B. M, S and
+        // a readable name still go to its left, so it only grows into
+        // what is spare after them.
+        ui.spacing_mut().slider_width = (ui.available_width() - 56.0 - 96.0).clamp(40.0, 80.0);
+        if ui
+            .add(
+                egui::Slider::new(&mut op, 0.0..=1.0)
+                    .show_value(false)
+                    .trailing_fill(true),
+            )
+            .on_hover_text("Group opacity")
+            .changed()
+        {
+            engine.set_param_base(&key, op);
+            mixer.groups[gi].opacity = op;
+        }
+        let mut mute = mixer.groups[gi].mute;
+        if ui.selectable_label(mute, "M").on_hover_text("Mute the group").clicked() {
+            mute = !mute;
+            mixer.groups[gi].mute = mute;
+        }
+        let mut solo = mixer.groups[gi].solo;
+        if ui.selectable_label(solo, "S").on_hover_text("Solo the group").clicked() {
+            solo = !solo;
+            mixer.groups[gi].solo = solo;
+        }
+    }
+
+    /// A deck's own row, at the top of its column: mute, solo and level, and
+    /// the chain everything on the deck passes through.
+    ///
+    /// The column heading already names the deck and the crossfader strip
+    /// carries its level against the other, so a full group header — with a
+    /// drag grip, a collapse arrow and an ✖ on furniture — is not drawn for
+    /// it. That left its chain with no strip at all: a deck's effects could
+    /// be reached from nowhere. This is only what the heading lacks.
+    fn deck_header(
+        ui: &mut egui::Ui,
+        mixer: &mut rustjay_mixer::Mixer,
+        gi: usize,
+        engine: &mut EngineState,
+        acts: &mut GroupActions,
+    ) {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                group_mix_controls(ui, mixer, gi, engine);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("deck fx")
+                            .size(10.0)
+                            .color(rustjay_gui::egui_theme::colors::ink_3()),
+                    )
+                    .on_hover_text("Effects here run over the whole deck, after its layers are mixed");
+                });
+            });
+        });
+        group_strip(ui, mixer, gi, acts);
+    }
+
+    /// A group's chain strip: what every member passes through together.
+    fn group_strip(
+        ui: &mut egui::Ui,
+        mixer: &mut rustjay_mixer::Mixer,
+        gi: usize,
+        acts: &mut GroupActions,
+    ) {
+        let uuid = mixer.groups[gi].uuid.clone();
         strip_scroll(ui, ("groupstrip", &uuid)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let out = fx_strip(
@@ -2267,6 +2330,7 @@ mod egui_impl {
             let mut undo_snapshot: Option<crate::scene::Topology> = None;
             let mut restack: Option<(String, String)> = None;
             let mut regroup: Option<(String, Option<String>)> = None;
+            let mut regroup_group: Option<(String, Option<String>)> = None;
             let mut drops: Vec<ChainDrop> = Vec::new();
             let mut group_acts = GroupActions::default();
 
@@ -2306,6 +2370,15 @@ mod egui_impl {
                     .map(|(i, c)| (c.uuid.clone(), off_deck(&mixer, i)))
                     .collect();
                 let mut said_off_deck = false;
+
+                // The deck's own row first: its level and gates, and its chain.
+                if let Some(d) = self.deck
+                    && mixer.decks.is_some()
+                    && let Some(gi) = mixer.groups.iter().position(|g| g.uuid == deck_uuid(d))
+                {
+                    deck_header(ui, &mut mixer, gi, engine, &mut group_acts);
+                    ui.separator();
+                }
 
                 for (uuid, is_off_deck) in order.iter() {
                     let Some(idx) = mixer.channels.iter().position(|c| c.uuid == *uuid) else {
@@ -2432,12 +2505,12 @@ mod egui_impl {
                                         // slider at minimum, M, S + gaps) needs about
                                         // this much room; the name gets what's left and
                                         // ellipsizes rather than shoving the controls
-                                        // off the panel on narrow widths.
-                                        let controls_w = 14.0
-                                            + 84.0
-                                            + 24.0
-                                            + 40.0
-                                            + 5.0 * ui.spacing().item_spacing.x;
+                                        // off the panel on narrow widths. The gaps are
+                                        // the 4pt the control layout sets below, not
+                                        // the theme's 8: at a half-window deck column
+                                        // those five gaps were a third of the name.
+                                        let controls_w =
+                                            14.0 + 62.0 + 24.0 + 40.0 + 20.0 + 6.0 * 4.0;
                                         let name_w = (ui.available_width() - controls_w).max(20.0);
                                         let name_rect = egui::Rect::from_min_size(
                                             ui.cursor().min,
@@ -2456,13 +2529,22 @@ mod egui_impl {
                                         let thumb_size =
                                             egui::vec2(thumb_h * crate::thumbs::ASPECT, thumb_h);
                                         let slot = ui.id().with("thumb_slot");
-                                        let thumb: egui::Atom<'_> = match thumb_ids.get(uuid) {
-                                            Some(id) => egui::Image::new((*id, thumb_size))
-                                                .fit_to_exact_size(thumb_size)
-                                                .corner_radius(2.0)
-                                                .into(),
-                                            None => egui::Atom::custom(slot, thumb_size),
-                                        };
+                                        // Only where a readable name is left beside
+                                        // it: in a half-width deck column the thumb
+                                        // ate the whole button and every layer read
+                                        // as "…". The strip's chip below still
+                                        // carries the name either way.
+                                        let mut atoms = egui::Atoms::default();
+                                        if row_shows_thumb(name_w, thumb_size.x) {
+                                            atoms.push_right(match thumb_ids.get(uuid) {
+                                                Some(id) => egui::Image::new((*id, thumb_size))
+                                                    .fit_to_exact_size(thumb_size)
+                                                    .corner_radius(2.0)
+                                                    .into(),
+                                                None => egui::Atom::custom(slot, thumb_size),
+                                            });
+                                        }
+                                        atoms.push_right(name.as_str());
                                         let resp = ui
                                             .scope_builder(
                                                 egui::UiBuilder::new().max_rect(name_rect).layout(
@@ -2478,7 +2560,7 @@ mod egui_impl {
                                                         egui::vec2(4.0, 1.0);
                                                     let out = egui::Button::selectable(
                                                         layer_selected || multi,
-                                                        (thumb, name.as_str()),
+                                                        atoms,
                                                     )
                                                     .truncate()
                                                     .atom_ui(ui);
@@ -2559,6 +2641,7 @@ mod egui_impl {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
+                                                ui.spacing_mut().item_spacing.x = 4.0;
                                                 if ui
                                                     .add(
                                                         egui::Button::new(
@@ -2582,9 +2665,9 @@ mod egui_impl {
                                                 let mut op = engine
                                                     .get_param_base(&opacity_key)
                                                     .unwrap_or(1.0);
-                                                // M and S are placed after the slider (to
-                                                // its left in this right-to-left row), so
-                                                // reserve their width and let the slider
+                                                // M, S and K are placed after the slider
+                                                // (to its left in this right-to-left row),
+                                                // so reserve their width and let the slider
                                                 // take the rest: on a narrow panel the
                                                 // slider squashes before the buttons creep
                                                 // over the layer name. This has to go
@@ -2592,14 +2675,20 @@ mod egui_impl {
                                                 // `Slider` always allocates that width
                                                 // and ignores `add_sized`.
                                                 let slider_w = (ui.available_width()
-                                                    - 2.0 * (20.0 + ui.spacing().item_spacing.x))
+                                                    - 3.0 * (20.0 + ui.spacing().item_spacing.x))
                                                     .clamp(24.0, 96.0);
                                                 ui.spacing_mut().slider_width = slider_w;
+                                                // Filled up to the value: the bare rail
+                                                // is the row's own colour, so at 1.0
+                                                // only the handle showed and the fader
+                                                // read as a checkbox.
                                                 if ui
                                                     .add(
                                                         egui::Slider::new(&mut op, 0.0..=1.0)
-                                                            .show_value(false),
+                                                            .show_value(false)
+                                                            .trailing_fill(true),
                                                     )
+                                                    .on_hover_text("Opacity")
                                                     .changed()
                                                 {
                                                     engine.set_param_base(&opacity_key, op);
@@ -2622,6 +2711,38 @@ mod egui_impl {
                                                     solo = !solo;
                                                     mixer.channels[idx].solo = solo;
                                                 }
+                                                // Keying is one switch on the row —
+                                                // on or off — and its settings live
+                                                // in the inspector, which the switch
+                                                // opens. "On" brings back the mode
+                                                // last used, chroma the first time.
+                                                let key_key = format!("ch_{uuid}_key_mode");
+                                                let mode = engine
+                                                    .get_param_base(&key_key)
+                                                    .unwrap_or(0.0)
+                                                    .round() as u32;
+                                                let remembered = ui.id().with(("keymode", uuid));
+                                                if ui
+                                                    .selectable_label(mode != 0, "K")
+                                                    .on_hover_text(if mode != 0 {
+                                                        "Keying on — click to switch it off. The settings are in the inspector."
+                                                    } else {
+                                                        "Key this layer, chroma or luma. The settings are in the inspector."
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    let next = if mode != 0 {
+                                                        ui.data_mut(|d| d.insert_temp(remembered, mode));
+                                                        0
+                                                    } else {
+                                                        ui.data(|d| d.get_temp::<u32>(remembered))
+                                                            .unwrap_or(1)
+                                                    };
+                                                    engine.set_param_base(&key_key, next as f32);
+                                                    new_selection = Some(crate::Selection::Layer {
+                                                        layer: uuid.clone(),
+                                                    });
+                                                }
                                             },
                                         );
                                     });
@@ -2629,23 +2750,35 @@ mod egui_impl {
                                     // ── Row 2: the signal strip ──────────────────────
                                     let mut strip = strip_scroll(ui, "strip").show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            let kind = state
-                                                .layer_sources
-                                                .get(uuid)
+                                            let entry = state.layer_sources.get(uuid);
+                                            let kind = entry
                                                 .map(|e| e.kind)
                                                 .unwrap_or(crate::sources::SourceKind::SolidColor);
+                                            // A layer standing on a placeholder says
+                                            // so where its source would be: the file
+                                            // is what is missing, not the layer.
+                                            let missing = state.missing_layers.contains(uuid);
                                             let label = format!(
                                                 "{} {}",
-                                                source_icon(kind),
+                                                if missing { "⚠" } else { source_icon(kind) },
                                                 mixer.channels[idx].name
                                             );
-                                            let (resp, _) = chip(
+                                            let (mut resp, _) = chip(
                                                 ui,
                                                 ui.id().with(("srcchip", uuid)),
                                                 &label,
                                                 source_selected,
                                                 None,
                                             );
+                                            if missing {
+                                                let what = entry
+                                                    .and_then(|e| e.path.as_ref())
+                                                    .map(|p| p.display().to_string())
+                                                    .unwrap_or_else(|| format!("{kind:?}"));
+                                                resp = resp.on_hover_text(format!(
+                                                    "Missing — could not be opened: {what}\nPick another source in the inspector to repair it."
+                                                ));
+                                            }
                                             if resp.clicked() {
                                                 new_selection = Some(crate::Selection::Source {
                                                     layer: uuid.clone(),
@@ -2721,13 +2854,49 @@ mod egui_impl {
                             // outside every group and you leave yours. Restack
                             // alone would move the layer and leave it orphaned
                             // inside a group's block, or stranded outside one.
-                            // A dragged group is not a layer joining a group.
-                            if !payload.0.starts_with("group:") {
-                                regroup = Some((payload.0.clone(), in_group_uuid.clone()));
+                            // A dragged group joins the row's group the same
+                            // way — that is how a group crosses decks.
+                            match payload.0.strip_prefix("group:") {
+                                Some(gid) => {
+                                    regroup_group = Some((gid.to_string(), in_group_uuid.clone()));
+                                }
+                                None => regroup = Some((payload.0.clone(), in_group_uuid.clone())),
                             }
                             restack = Some((payload.0.clone(), uuid.clone()));
                         }
                     });
+                }
+
+                // The column is a target in its own right, so a layer can be
+                // moved onto an empty deck — or to the top of one — without a
+                // row to land on. Shown only while a layer or group is in
+                // flight; a row under the pointer takes the drop first.
+                if let Some(d) = self.deck
+                    && egui::DragAndDrop::has_payload_of_type::<LayerDrag>(ui.ctx())
+                {
+                    let deck = deck_uuid(d);
+                    let (_, dropped) =
+                        ui.dnd_drop_zone::<LayerDrag, _>(egui::Frame::group(ui.style()), |ui| {
+                            ui.set_min_size(egui::vec2(ui.available_width(), 28.0));
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "move onto DECK {}",
+                                        if d == 1 { "B" } else { "A" }
+                                    ))
+                                    .size(10.0)
+                                    .color(rustjay_gui::egui_theme::colors::ink_3()),
+                                );
+                            });
+                        });
+                    if let Some(payload) = dropped {
+                        match payload.0.strip_prefix("group:") {
+                            Some(gid) => {
+                                regroup_group = Some((gid.to_string(), Some(deck.to_string())));
+                            }
+                            None => regroup = Some((payload.0.clone(), Some(deck.to_string()))),
+                        }
+                    }
                 }
 
                 for (gid, index, payload) in std::mem::take(&mut group_acts.drops) {
@@ -2884,6 +3053,29 @@ mod egui_impl {
                         });
                         mixer.set_channel_group(&layer, group);
                     }
+                }
+                // A group dropped into another group, or onto a deck, nests
+                // there. Its uuid does not change, so every `grp_<uuid>_`
+                // binding follows it. A deck is furniture and never moves.
+                if let Some((gid, parent)) = regroup_group.take()
+                    && !mixer.decks.as_ref().is_some_and(|d| d.contains(&gid))
+                    && mixer
+                        .groups
+                        .iter()
+                        .find(|g| g.uuid == gid)
+                        .is_some_and(|g| g.parent != parent)
+                {
+                    undo_snapshot.get_or_insert_with(|| {
+                        crate::scene::Topology::from_mixer(&mixer, &state.layer_sources)
+                    });
+                    if !mixer.set_group_parent(&gid, parent.as_deref()) {
+                        engine.notify(
+                            "A group cannot be dropped inside itself".to_string(),
+                            rustjay_core::NotificationLevel::Error,
+                            std::time::Duration::from_secs(4),
+                        );
+                    }
+                    state.params_dirty_request = true;
                 }
 
                 // A group dropped on a row moves as one block.
@@ -7144,14 +7336,11 @@ mod egui_impl {
             "Outputs"
         }
 
-        fn replaces(&self) -> Option<rustjay_engine::prelude::BuiltinTab> {
-            Some(rustjay_engine::prelude::BuiltinTab::Output)
-        }
         fn draw(
             &mut self,
             ui: &mut egui::Ui,
             app_state: &mut dyn std::any::Any,
-            engine: &mut EngineState,
+            _engine: &mut EngineState,
         ) {
             #[cfg_attr(not(feature = "projection"), allow(unused_variables))]
             let state = app_state
@@ -7174,10 +7363,15 @@ mod egui_impl {
                         live_projector_idx += 1;
                         idx
                     });
+                    // Two lines, and a name field of fixed width: inside an
+                    // auto-sizing window `available_width` is the screen's, so
+                    // an unbounded text field made every row wider than any
+                    // window, and Fullscreen and 🗑 were clipped even at 1200pt.
                     ui.push_id(i, |ui| {
+                        ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut proj.enabled, "");
-                            ui.text_edit_singleline(&mut proj.name);
+                            ui.add(egui::TextEdit::singleline(&mut proj.name).desired_width(140.0));
                             ui.label("size:");
                             ui.add(
                                 egui::DragValue::new(&mut proj.width)
@@ -7247,6 +7441,8 @@ mod egui_impl {
                                         }
                                     }
                                 });
+                        });
+                        ui.horizontal(|ui| {
                             ui.label("type:");
                             let prev_type = proj.output_type.clone();
                             egui::ComboBox::from_id_salt(format!("proj_type_{}", i))
@@ -7377,6 +7573,7 @@ mod egui_impl {
                             if ui.button("🗑").clicked() {
                                 remove_proj = Some(i);
                             }
+                        });
                         });
                     });
                 }
@@ -7553,9 +7750,10 @@ mod egui_impl {
                 let mut hl_dirty = false;
                 for (i, hl) in state.stage.headless_outputs.iter_mut().enumerate() {
                     ui.push_id(format!("hl_{}", i), |ui| {
+                        ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut hl.enabled, "");
-                            ui.text_edit_singleline(&mut hl.name);
+                            ui.add(egui::TextEdit::singleline(&mut hl.name).desired_width(140.0));
                             ui.label("size:");
                             ui.add(
                                 egui::DragValue::new(&mut hl.width)
@@ -7597,6 +7795,8 @@ mod egui_impl {
                                         }
                                     }
                                 });
+                        });
+                        ui.horizontal(|ui| {
                             ui.label("type:");
                             let prev_type = hl.output_type.clone();
                             egui::ComboBox::from_id_salt(format!("hl_type_{}", i))
@@ -7667,6 +7867,7 @@ mod egui_impl {
                             if ui.button("🗑").clicked() {
                                 remove_hl = Some(i);
                             }
+                        });
                         });
                     });
                 }
@@ -7757,84 +7958,6 @@ mod egui_impl {
                 if dirty {
                     state.stage.publish_edge_blend(config);
                 }
-
-                // ── Per-output recording sync ───────────────────────────────
-                #[cfg(feature = "projection")]
-                if let Some(handle) = state.projection_handle.as_ref() {
-                    let mut any_guard = handle.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(sub) =
-                        any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>()
-                    {
-                        let fps = engine.target_fps as f32;
-                        let codec = self.io_codec();
-
-                        // Sync projector recordings
-                        let mut enabled_idx = 0;
-                        for (i, proj) in state.stage.projectors.iter().enumerate() {
-                            if proj.enabled {
-                                match proj.output_type {
-                                    crate::stage::OutputType::Recording if proj.recording => {
-                                        if !sub.is_projector_recording(enabled_idx) {
-                                            let path = self.auto_record_path(&format!(
-                                                "projector_{}_{}",
-                                                i, proj.name
-                                            ));
-                                            if let Err(e) = sub.start_projector_recording(
-                                                enabled_idx,
-                                                &path,
-                                                fps,
-                                                codec,
-                                            ) {
-                                                log::error!(
-                                                    "[Outputs] Failed to start projector {i} recording: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        if sub.is_projector_recording(enabled_idx) {
-                                            sub.stop_projector_recording(enabled_idx);
-                                        }
-                                    }
-                                }
-                                enabled_idx += 1;
-                            }
-                        }
-
-                        // Sync headless recordings
-                        let mut enabled_idx = 0;
-                        for (i, hl) in state.stage.headless_outputs.iter().enumerate() {
-                            if hl.enabled && hl.pushed {
-                                match hl.output_type {
-                                    crate::stage::OutputType::Recording if hl.recording => {
-                                        if !sub.is_headless_recording(enabled_idx) {
-                                            let path = self.auto_record_path(&format!(
-                                                "headless_{}_{}",
-                                                i, hl.name
-                                            ));
-                                            if let Err(e) = sub.start_headless_recording(
-                                                enabled_idx,
-                                                &path,
-                                                fps,
-                                                codec,
-                                            ) {
-                                                log::error!(
-                                                    "[Outputs] Failed to start headless {i} recording: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        if sub.is_headless_recording(enabled_idx) {
-                                            sub.stop_headless_recording(enabled_idx);
-                                        }
-                                    }
-                                }
-                                enabled_idx += 1;
-                            }
-                        }
-                    }
-                }
             }
 
             #[cfg(not(feature = "projection"))]
@@ -7842,92 +7965,6 @@ mod egui_impl {
                 ui.label("Projection feature not enabled.");
                 ui.label("Enable the 'projection' feature for multi-output support.");
             }
-
-            ui.separator();
-            ui.label(egui::RichText::new("Recording").strong());
-
-            if let Ok(mut guard) = self.pending_save_path.lock()
-                && let Some(path) = guard.take()
-            {
-                self.recording_path = path.to_string_lossy().to_string();
-            }
-
-            ui.horizontal(|ui| {
-                ui.label("Codec:");
-                egui::ComboBox::from_id_salt("recorder_codec")
-                    .selected_text(format!("{:?}", self.recording_codec))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.recording_codec,
-                            rustjay_core::RecorderCodec::H264,
-                            "H.264",
-                        );
-                        ui.selectable_value(
-                            &mut self.recording_codec,
-                            rustjay_core::RecorderCodec::H265,
-                            "H.265",
-                        );
-                        ui.selectable_value(
-                            &mut self.recording_codec,
-                            rustjay_core::RecorderCodec::AV1,
-                            "AV1",
-                        );
-                        ui.selectable_value(
-                            &mut self.recording_codec,
-                            rustjay_core::RecorderCodec::ProRes422,
-                            "ProRes 422",
-                        );
-                    });
-            });
-            ui.horizontal(|ui| {
-                ui.label("Path:");
-                ui.text_edit_singleline(&mut self.recording_path)
-                    .on_hover_text("Output file path (relative or absolute)");
-                if ui.button("Browse…").clicked() {
-                    let pending = self.pending_save_path.clone();
-                    let ctx = ui.ctx().clone();
-                    let ext = match self.recording_codec {
-                        rustjay_core::RecorderCodec::H264
-                        | rustjay_core::RecorderCodec::H265
-                        | rustjay_core::RecorderCodec::AV1 => "mp4",
-                        rustjay_core::RecorderCodec::ProRes422 => "mov",
-                    };
-                    std::thread::spawn(move || {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Video", &[ext])
-                            .set_file_name(format!("recording.{}", ext))
-                            .save_file()
-                        {
-                            if let Ok(mut guard) = pending.lock() {
-                                *guard = Some(path);
-                            }
-                            ctx.request_repaint();
-                        }
-                    });
-                }
-            });
-            ui.horizontal(|ui| {
-                let is_recording = engine.recording_active;
-                if ui
-                    .add_enabled(!is_recording, egui::Button::new("⏺ Start"))
-                    .clicked()
-                {
-                    engine.output_command = rustjay_core::OutputCommand::StartRecording {
-                        path: self.recording_path.clone(),
-                        codec: self.recording_codec,
-                        audio_device: None,
-                    };
-                }
-                if ui
-                    .add_enabled(is_recording, egui::Button::new("⏹ Stop"))
-                    .clicked()
-                {
-                    engine.output_command = rustjay_core::OutputCommand::StopRecording;
-                }
-                if is_recording {
-                    ui.label(egui::RichText::new("● REC").color(egui::Color32::RED));
-                }
-            });
         }
     }
 

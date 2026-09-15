@@ -581,24 +581,6 @@ pub struct RecalledGroup {
     pub params: std::collections::HashMap<String, f32>,
 }
 
-#[cfg(feature = "mixer")]
-impl RecalledGroup {
-    /// Layers belonging to the top-level group itself: the ones no nested group
-    /// claims.
-    pub fn direct_members(&self) -> Vec<String> {
-        self.layers
-            .iter()
-            .filter(|l| {
-                !self
-                    .groups
-                    .iter()
-                    .any(|g| g.members.iter().any(|m| m == &l.uuid))
-            })
-            .map(|l| l.uuid.clone())
-            .collect()
-    }
-}
-
 /// Short identity, matching the form used for layers and FX slots elsewhere.
 #[cfg(feature = "mixer")]
 pub fn new_uuid() -> String {
@@ -619,10 +601,12 @@ fn default_true() -> bool {
     true
 }
 
-/// Crate root, used to relativize/resolve asset paths for portability.
+/// The resources root, used to relativize/resolve asset paths for portability:
+/// a bundled shader saves as `shaders/foo.fs` and resolves inside whichever
+/// bundle opens the scene. See [`crate::resources_dir`].
 #[cfg(feature = "mixer")]
 pub(crate) fn topology_base() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    crate::resources_dir()
 }
 
 /// Store `path` relative to `base` when it lives under it; otherwise keep it
@@ -1069,7 +1053,10 @@ mod tests {
         // Its member is the recalled L2, and the outer group keeps only L1.
         let l2 = r.layers[1].uuid.clone();
         assert_eq!(inner.members, vec![l2.clone()]);
-        assert_eq!(r.direct_members(), vec![r.layers[0].uuid.clone()]);
+        assert!(
+            !inner.members.contains(&r.layers[0].uuid),
+            "the outer group keeps L1 as its own"
+        );
 
         // Params followed both groups.
         assert_eq!(

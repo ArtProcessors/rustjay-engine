@@ -121,7 +121,9 @@ fn layer_controls_do_not_cover_the_name_on_narrow_panels() {
         app
     }
 
-    for w in [700.0f32, 400.0, 300.0] {
+    // 290 is a deck column at the persisted panel widths (library 200,
+    // inspector 400, 1200pt window) — where every name used to collapse to "…".
+    for w in [700.0f32, 400.0, 300.0, 290.0] {
         let harness = tab_harness_with_app(DeckTab::default(), [w, 500.0], app_with_layer());
         // The name appears on the row-1 button and the row-2 strip chip;
         // the row-1 one is drawn first.
@@ -129,12 +131,26 @@ fn layer_controls_do_not_cover_the_name_on_narrow_panels() {
             .get_all(egui_kittest::kittest::By::new().label_contains("A rather long"))
             .next()
             .expect("layer name");
+        assert!(
+            name.rect().width() >= 48.0,
+            "panel {w}: the name button keeps room for a readable name: {:?}",
+            name.rect()
+        );
         let solo = harness.get_by_label("S");
         let mute = harness.get_by_label("M");
+        let key = harness.get_by_label("K");
         assert!(
             solo.rect().min.x >= name.rect().max.x - 1.0,
             "panel {w}: S ({:?}) overlaps the layer name ({:?})",
             solo.rect(),
+            name.rect()
+        );
+        // K is the leftmost control, so it is the one that lands on the name
+        // when the slider does not reserve room for it.
+        assert!(
+            key.rect().min.x >= name.rect().max.x - 1.0,
+            "panel {w}: K ({:?}) overlaps the layer name ({:?})",
+            key.rect(),
             name.rect()
         );
         assert!(
@@ -345,14 +361,14 @@ fn deck_stream_paints_invalid_url_error() {
     harness.get_by_label("Unsupported stream URL scheme.");
 }
 
+/// Without projection there are no outputs to list, and the tab says so
+/// rather than drawing a recorder for the hidden main window.
 #[cfg(not(feature = "projection"))]
 #[test]
-fn default_outputs_recording_snapshot() {
-    let mut harness = tab_harness(OutputsTab::default(), [700.0, 400.0]);
-
-    harness.get_by_label("Recording");
-    harness.get_by_label("Browse…");
-    harness.snapshot("outputs_recording");
+fn outputs_without_projection_says_so() {
+    let harness = tab_harness(OutputsTab, [700.0, 400.0]);
+    harness.get_by_label("Projection feature not enabled.");
+    assert!(harness.query_by_label("Recording").is_none());
 }
 
 #[cfg(feature = "projection")]
@@ -404,15 +420,40 @@ fn stage_edge_blend_preview_snapshot() {
     harness.snapshot("stage_edge_blend_preview");
 }
 
+/// A projector row must fit a 640pt window with every control reachable.
+///
+/// Regression test: the name field had no width of its own, and inside an
+/// auto-sizing window `available_width` is the screen's, so the row grew to
+/// 1200pt and still clipped "Fullscreen" and 🗑 off the right edge.
 #[cfg(feature = "projection")]
 #[test]
-fn outputs_projector_panel_snapshot() {
-    let mut harness = tab_harness(OutputsTab::default(), [1200.0, 700.0]);
+fn outputs_projector_row_fits_a_640pt_window() {
+    const W: f32 = 640.0;
+    let mut app = KovvbojAppState::default();
+    app.stage.headless_outputs.push(kovvboj::stage::KovvbojHeadlessConfig {
+        name: "Stream".into(),
+        ..Default::default()
+    });
+    let harness = tab_harness_with_app(OutputsTab, [W, 700.0], app);
 
     harness.get_by_label("Projectors");
-    harness.get(By::new().role(Role::TextInput).value("Projector"));
-    harness.get_by_label("Fullscreen");
-    harness.snapshot("outputs_projector_panel");
+    let name = harness.get(By::new().role(Role::TextInput).value("Projector"));
+    assert!(
+        name.rect().width() <= 160.0,
+        "the name field has a fixed width, not the window's: {:?}",
+        name.rect()
+    );
+    let fullscreen = harness.get_by_label("Fullscreen");
+    assert!(
+        fullscreen.rect().max.x <= W,
+        "Fullscreen is inside the window: {:?}",
+        fullscreen.rect()
+    );
+    let bins: Vec<egui::Rect> = harness.get_all_by_label("🗑").map(|n| n.rect()).collect();
+    assert_eq!(bins.len(), 2, "one 🗑 per projector and headless row");
+    for r in bins {
+        assert!(r.max.x <= W && r.min.x >= 0.0, "🗑 is inside the window: {r:?}");
+    }
 }
 
 /// The launch splash and the About box are one drawing shown two ways, so the
