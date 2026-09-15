@@ -40,10 +40,11 @@ impl Mode {
 /// Built-in tabs the View menu can open as windows, in menu order.
 ///
 /// `Settings` is deliberately absent — it lives under Edit. `Sync` is folded
-/// into Audio by the host and has no body of its own.
-const VIEW_TABS: [GuiTab; 10] = [
-    GuiTab::Input,
-    GuiTab::Output,
+/// into Audio by the host and has no body of its own. `Input` and `Output`
+/// are absent too: the Library's DEVICES rows and the Outputs window own
+/// those jobs, and the engine's versions opened a second capture session on
+/// the same camera and a second NDI/Syphon sender from the hidden main window.
+const VIEW_TABS: [GuiTab; 8] = [
     GuiTab::Color,
     GuiTab::Motion,
     GuiTab::Audio,

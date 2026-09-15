@@ -7153,9 +7153,6 @@ mod egui_impl {
             "Outputs"
         }
 
-        fn replaces(&self) -> Option<rustjay_engine::prelude::BuiltinTab> {
-            Some(rustjay_engine::prelude::BuiltinTab::Output)
-        }
         fn draw(
             &mut self,
             ui: &mut egui::Ui,
