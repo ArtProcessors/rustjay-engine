@@ -51,8 +51,9 @@ pub enum InputCommand {
 }
 
 /// Target codec for disk recording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RecorderCodec {
+    #[default]
     H264,
     H265,
     AV1,
@@ -60,6 +61,17 @@ pub enum RecorderCodec {
 }
 
 impl RecorderCodec {
+    pub const ALL: [RecorderCodec; 4] = [Self::H264, Self::H265, Self::AV1, Self::ProRes422];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            RecorderCodec::H264 => "H.264",
+            RecorderCodec::H265 => "H.265",
+            RecorderCodec::AV1 => "AV1",
+            RecorderCodec::ProRes422 => "ProRes 422",
+        }
+    }
+
     /// Container extension this codec records into. ProRes only lives in `.mov`.
     pub fn extension(&self) -> &'static str {
         match self {

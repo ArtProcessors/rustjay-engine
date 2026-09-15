@@ -112,6 +112,10 @@ pub struct KovvbojShell {
     /// Persisted UI preferences (palette choice). Loaded on the first frame,
     /// because the shell is built before there is an egui context to theme.
     prefs: crate::persistence::UiPrefs,
+    /// Global recording settings, edited in Settings. Loaded with `prefs`.
+    recording: crate::persistence::RecordingPrefs,
+    /// Folder picked by the recording folder dialog thread.
+    pending_recording_folder: Arc<Mutex<Option<std::path::PathBuf>>>,
     /// One-shot: install the display font and apply the saved palette.
     initialised: bool,
 
@@ -207,6 +211,8 @@ impl KovvbojShell {
             splash_started_at: None,
             about_opened_at: None,
             prefs: crate::persistence::UiPrefs::default(),
+            recording: crate::persistence::RecordingPrefs::default(),
+            pending_recording_folder: Arc::new(Mutex::new(None)),
             initialised: false,
         }
     }
@@ -241,6 +247,7 @@ impl KovvbojShell {
         ctx.set_fonts(fonts);
 
         self.prefs = crate::persistence::default_workspace().load_ui();
+        self.recording = crate::persistence::default_workspace().load_recording();
         self.show_library = self.prefs.library_open;
         self.show_preview = self.prefs.inspector_open;
         self.show_outputs = self.prefs.outputs_open;
@@ -770,14 +777,19 @@ impl KovvbojShell {
     ) {
         use rustjay_gui::egui_theme::colors::*;
 
-        let recordings_dir = app_state
-            .downcast_ref::<crate::KovvbojAppState>()
-            .map(|s| s.workspace.recordings_dir())
-            .unwrap_or_else(|| std::path::PathBuf::from("recordings"));
-
         // Which optional built-ins have anything to show, so the View menu does
         // not offer empty panels. Mirrors the built-in host's own filter.
-        let (has_color, has_motion, fps, bpm, clock, web, osc, recording) = {
+        let (
+            has_color,
+            has_motion,
+            fps,
+            bpm,
+            clock,
+            web,
+            osc,
+            master_recording,
+            outputs_recording,
+        ) = {
             let state = engine.lock().unwrap_or_else(|e| e.into_inner());
             let perf = state
                 .performance
@@ -808,8 +820,15 @@ impl KovvbojShell {
                 state.web_enabled,
                 state.osc_enabled,
                 state.recording_active,
+                // Projector and headless recordings, as published by `prepare`.
+                state
+                    .output_sinks
+                    .lock()
+                    .map(|s| s.iter().any(|l| l == "REC"))
+                    .unwrap_or(false),
             )
         };
+        let recording = master_recording || outputs_recording;
 
         #[allow(deprecated)]
         egui::Panel::top("kovvboj_menubar")
@@ -1159,22 +1178,38 @@ impl KovvbojShell {
                                     .color(if recording { alert() } else { ink_3() }),
                             )
                             .on_hover_text(if recording {
-                                "Stop recording"
+                                "Stop all recordings"
                             } else {
                                 "Start recording"
                             });
-                        if rec.clicked()
-                            && let Ok(mut e) = engine.lock()
-                        {
-                            e.output_command = if recording {
-                                rustjay_core::OutputCommand::StopRecording
-                            } else {
-                                rustjay_core::OutputCommand::StartRecording {
-                                    path: crate::ui::next_recording_path(&recordings_dir),
-                                    codec: rustjay_core::RecorderCodec::H264,
-                                    audio_device: None,
+                        if rec.clicked() {
+                            if recording {
+                                // Stop everything the button is lit for, not
+                                // just the main output.
+                                if master_recording && let Ok(mut e) = engine.lock() {
+                                    e.output_command = rustjay_core::OutputCommand::StopRecording;
                                 }
-                            };
+                                #[cfg(feature = "projection")]
+                                if let Some(s) = app_state.downcast_mut::<crate::KovvbojAppState>()
+                                {
+                                    for p in &mut s.stage.projectors {
+                                        p.recording = false;
+                                    }
+                                    for h in &mut s.stage.headless_outputs {
+                                        h.recording = false;
+                                    }
+                                }
+                            } else if let Some(s) =
+                                app_state.downcast_ref::<crate::KovvbojAppState>()
+                                && let Ok(mut e) = engine.lock()
+                            {
+                                let (path, codec) = s.workspace.next_recording("kovvboj");
+                                e.output_command = rustjay_core::OutputCommand::StartRecording {
+                                    path: path.to_string_lossy().into_owned(),
+                                    codec,
+                                    audio_device: None,
+                                };
+                            }
                         }
                         status_pill(
                             ui,
@@ -1319,6 +1354,12 @@ impl KovvbojShell {
         if self.show_settings {
             let mut open = true;
             let mut chosen: Option<&'static str> = None;
+            let recording_before = self.recording.clone();
+            if let Ok(mut g) = self.pending_recording_folder.lock()
+                && let Some(dir) = g.take()
+            {
+                self.recording.folder = Some(dir);
+            }
             egui::Window::new("Settings")
                 .open(&mut open)
                 .default_width(460.0)
@@ -1343,11 +1384,57 @@ impl KovvbojShell {
                             }
                         });
                     ui.separator();
+                    ui.label(egui::RichText::new("Recording").strong());
+                    egui::ComboBox::from_label("Codec")
+                        .selected_text(self.recording.codec.label())
+                        .show_ui(ui, |ui| {
+                            for c in rustjay_core::RecorderCodec::ALL {
+                                ui.selectable_value(&mut self.recording.codec, c, c.label());
+                            }
+                        });
+                    let folder = match &self.recording.folder {
+                        Some(dir) => dir.display().to_string(),
+                        None => "recordings/ inside the open set".to_string(),
+                    };
+                    // Truncated on its own line: a long path in a horizontal row
+                    // would widen the whole window.
+                    ui.add(egui::Label::new(format!("Folder: {folder}")).truncate())
+                        .on_hover_text(&folder);
+                    ui.horizontal(|ui| {
+                        if ui.button("Choose folder…").clicked() {
+                            let pending = self.pending_recording_folder.clone();
+                            let ctx = ui.ctx().clone();
+                            std::thread::spawn(move || {
+                                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                    if let Ok(mut g) = pending.lock() {
+                                        *g = Some(dir);
+                                    }
+                                    ctx.request_repaint();
+                                }
+                            });
+                        }
+                        if self.recording.folder.is_some()
+                            && ui.button("Use the set's folder").clicked()
+                        {
+                            self.recording.folder = None;
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new("Applies to every set, from the next recording.")
+                            .weak(),
+                    );
+                    ui.separator();
                     host.draw_builtin_tab(ui, GuiTab::Settings);
                 });
             self.show_settings = open;
             if let Some(id) = chosen {
                 self.choose_palette(id);
+            }
+            if self.recording != recording_before
+                && let Err(e) =
+                    crate::persistence::default_workspace().save_recording(&self.recording)
+            {
+                log::warn!("[Shell] could not save recording settings: {e}");
             }
         }
 
