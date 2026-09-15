@@ -2190,15 +2190,17 @@ mod egui_impl {
         // a readable name still go to its left, so it only grows into
         // what is spare after them.
         ui.spacing_mut().slider_width = (ui.available_width() - 56.0 - 96.0).clamp(40.0, 80.0);
-        if ui
-            .add(
+        let map_mode = map_mode_active(engine);
+        let resp = ui
+            .add_enabled(
+                !map_mode,
                 egui::Slider::new(&mut op, 0.0..=1.0)
                     .show_value(false)
                     .trailing_fill(true),
             )
-            .on_hover_text("Group opacity")
-            .changed()
-        {
+            .on_hover_text("Group opacity");
+        param_map_overlay(ui, engine, resp.rect, &key);
+        if resp.changed() {
             engine.set_param_base(&key, op);
             mixer.groups[gi].opacity = op;
         }
@@ -2669,15 +2671,22 @@ mod egui_impl {
                                                 // is the row's own colour, so at 1.0
                                                 // only the handle showed and the fader
                                                 // read as a checkbox.
-                                                if ui
-                                                    .add(
+                                                let map_mode = map_mode_active(engine);
+                                                let resp = ui
+                                                    .add_enabled(
+                                                        !map_mode,
                                                         egui::Slider::new(&mut op, 0.0..=1.0)
                                                             .show_value(false)
                                                             .trailing_fill(true),
                                                     )
-                                                    .on_hover_text("Opacity")
-                                                    .changed()
-                                                {
+                                                    .on_hover_text("Opacity");
+                                                param_map_overlay(
+                                                    ui,
+                                                    engine,
+                                                    resp.rect,
+                                                    &opacity_key,
+                                                );
+                                                if resp.changed() {
                                                     engine.set_param_base(&opacity_key, op);
                                                 }
                                                 let mut mute = mixer.channels[idx].mute;

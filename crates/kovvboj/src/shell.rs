@@ -1628,13 +1628,17 @@ impl KovvbojShell {
                     ui.spacing_mut().slider_width = ui.available_width().max(40.0);
                     let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
                     let mut x = eng.get_param_base("crossfader").unwrap_or(0.0);
-                    if ui
-                        .add(egui::Slider::new(&mut x, 0.0..=1.0).show_value(false))
+                    let map_mode = rustjay_engine::prelude::map_mode_active(&eng);
+                    let resp = ui
+                        .add_enabled(
+                            !map_mode,
+                            egui::Slider::new(&mut x, 0.0..=1.0).show_value(false),
+                        )
                         .on_hover_text(
                             "Crossfade between the decks — this is the transition's progress",
-                        )
-                        .changed()
-                    {
+                        );
+                    rustjay_engine::prelude::param_map_overlay(ui, &mut eng, resp.rect, "crossfader");
+                    if resp.changed() {
                         eng.set_param_base("crossfader", x);
                     }
                 });

@@ -58,7 +58,12 @@ pub fn param_slider(
     max: f32,
 ) {
     let mut val = engine.get_param_base(id).unwrap_or(0.0);
-    let resp = ui.add(egui::Slider::new(&mut val, min..=max).text(label));
+    let map_mode = crate::map_mode_active(engine);
+    let resp = ui.add_enabled(!map_mode, egui::Slider::new(&mut val, min..=max).text(label));
+    if map_mode {
+        param_map_overlay(ui, engine, resp.rect, id);
+        return;
+    }
     if resp.changed() {
         engine.set_param_base(id, val);
     }
@@ -66,6 +71,30 @@ pub fn param_slider(
     if let Some(live) = engine.get_param(id) {
         crate::egui_widgets::modulation_ghost(ui, resp.rect, val, live, min, max);
     }
+}
+
+/// [`crate::apply_param_map_overlay`] for a control that only knows its param
+/// id: the name, MIDI path and range come from the param's descriptor. Draw the
+/// control disabled while [`crate::map_mode_active`], then call this with its
+/// rect. No-op outside map mode, or for an id nothing declares.
+pub fn param_map_overlay(
+    ui: &mut egui::Ui,
+    engine: &mut rustjay_core::EngineState,
+    rect: egui::Rect,
+    id: &str,
+) {
+    if !crate::map_mode_active(engine) {
+        return;
+    }
+    let Some(d) = engine.param_descriptors.iter().find(|d| d.id == id) else {
+        return;
+    };
+    let (name, path) = (
+        d.name.clone(),
+        format!("{}/{}", d.category.name().to_lowercase(), d.id),
+    );
+    let (min, max) = (d.min, d.max);
+    crate::apply_param_map_overlay(ui, engine, rect, id, &name, &path, min, max);
 }
 
 /// Draw an integer parameter slider that reads from and writes to engine state.
@@ -78,10 +107,11 @@ pub fn param_slider_int(
     max: i32,
 ) {
     let mut val = engine.get_param_base(id).unwrap_or(0.0).round() as i32;
-    if ui
-        .add(egui::Slider::new(&mut val, min..=max).text(label))
-        .changed()
-    {
+    let map_mode = crate::map_mode_active(engine);
+    let resp = ui.add_enabled(!map_mode, egui::Slider::new(&mut val, min..=max).text(label));
+    if map_mode {
+        param_map_overlay(ui, engine, resp.rect, id);
+    } else if resp.changed() {
         engine.set_param_base(id, val as f32);
     }
 }

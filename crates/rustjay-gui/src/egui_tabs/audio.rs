@@ -443,7 +443,7 @@ impl EguiControlGui {
                 ui.label(format!(
                     "  {} → {} ({:.0}%)",
                     route.band.short_name(),
-                    route.target.name(),
+                    route.target.label(&state.param_descriptors),
                     route.amount * 100.0
                 ));
                 if i >= 3 {
