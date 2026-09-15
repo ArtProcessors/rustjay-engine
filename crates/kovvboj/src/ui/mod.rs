@@ -242,52 +242,19 @@ impl StageTab {
 }
 
 /// Outputs tab — window/display/NDI/stream/record assignment.
-pub struct OutputsTab {
-    recording_path: String,
-    recording_codec: rustjay_core::RecorderCodec,
-    /// Async result from the native save dialog.
-    pending_save_path: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
-}
-
-impl Default for OutputsTab {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+///
+/// Recording is per output: a row whose type is Recording arms with ⏺, and
+/// `prepare` starts and stops the recorder every frame, whether or not this
+/// window is open. The engine's own recorder of the hidden main window used
+/// to have a section here too, with a second reconciler for the per-output
+/// recordings that ran only while the window was drawn and disagreed with
+/// `prepare` on codec and path; whichever ran first in a frame won.
+#[derive(Default)]
+pub struct OutputsTab;
 
 impl OutputsTab {
     pub fn new() -> Self {
-        Self {
-            recording_path: String::from("recording.mp4"),
-            recording_codec: rustjay_core::RecorderCodec::H264,
-            pending_save_path: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        }
-    }
-
-    #[cfg(feature = "projection")]
-    /// Generate an auto-incrementing recording path.
-    fn auto_record_path(&self, name: &str) -> std::path::PathBuf {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let ext = match self.recording_codec {
-            rustjay_core::RecorderCodec::ProRes422 => "mov",
-            _ => "mp4",
-        };
-        let dir = std::path::PathBuf::from("recordings");
-        std::fs::create_dir_all(&dir).ok();
-        dir.join(format!("{}_{}.{}", name, ts, ext))
-    }
-
-    #[cfg(feature = "projection")]
-    fn io_codec(&self) -> rustjay_io::RecorderCodec {
-        match self.recording_codec {
-            rustjay_core::RecorderCodec::H264 => rustjay_io::RecorderCodec::H264,
-            rustjay_core::RecorderCodec::H265 => rustjay_io::RecorderCodec::H265,
-            rustjay_core::RecorderCodec::AV1 => rustjay_io::RecorderCodec::AV1,
-            rustjay_core::RecorderCodec::ProRes422 => rustjay_io::RecorderCodec::ProRes422,
-        }
+        Self
     }
 }
 
@@ -7157,7 +7124,7 @@ mod egui_impl {
             &mut self,
             ui: &mut egui::Ui,
             app_state: &mut dyn std::any::Any,
-            engine: &mut EngineState,
+            _engine: &mut EngineState,
         ) {
             #[cfg_attr(not(feature = "projection"), allow(unused_variables))]
             let state = app_state
@@ -7775,84 +7742,6 @@ mod egui_impl {
                 if dirty {
                     state.stage.publish_edge_blend(config);
                 }
-
-                // ── Per-output recording sync ───────────────────────────────
-                #[cfg(feature = "projection")]
-                if let Some(handle) = state.projection_handle.as_ref() {
-                    let mut any_guard = handle.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(sub) =
-                        any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>()
-                    {
-                        let fps = engine.target_fps as f32;
-                        let codec = self.io_codec();
-
-                        // Sync projector recordings
-                        let mut enabled_idx = 0;
-                        for (i, proj) in state.stage.projectors.iter().enumerate() {
-                            if proj.enabled {
-                                match proj.output_type {
-                                    crate::stage::OutputType::Recording if proj.recording => {
-                                        if !sub.is_projector_recording(enabled_idx) {
-                                            let path = self.auto_record_path(&format!(
-                                                "projector_{}_{}",
-                                                i, proj.name
-                                            ));
-                                            if let Err(e) = sub.start_projector_recording(
-                                                enabled_idx,
-                                                &path,
-                                                fps,
-                                                codec,
-                                            ) {
-                                                log::error!(
-                                                    "[Outputs] Failed to start projector {i} recording: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        if sub.is_projector_recording(enabled_idx) {
-                                            sub.stop_projector_recording(enabled_idx);
-                                        }
-                                    }
-                                }
-                                enabled_idx += 1;
-                            }
-                        }
-
-                        // Sync headless recordings
-                        let mut enabled_idx = 0;
-                        for (i, hl) in state.stage.headless_outputs.iter().enumerate() {
-                            if hl.enabled && hl.pushed {
-                                match hl.output_type {
-                                    crate::stage::OutputType::Recording if hl.recording => {
-                                        if !sub.is_headless_recording(enabled_idx) {
-                                            let path = self.auto_record_path(&format!(
-                                                "headless_{}_{}",
-                                                i, hl.name
-                                            ));
-                                            if let Err(e) = sub.start_headless_recording(
-                                                enabled_idx,
-                                                &path,
-                                                fps,
-                                                codec,
-                                            ) {
-                                                log::error!(
-                                                    "[Outputs] Failed to start headless {i} recording: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        if sub.is_headless_recording(enabled_idx) {
-                                            sub.stop_headless_recording(enabled_idx);
-                                        }
-                                    }
-                                }
-                                enabled_idx += 1;
-                            }
-                        }
-                    }
-                }
             }
 
             #[cfg(not(feature = "projection"))]
@@ -7860,92 +7749,6 @@ mod egui_impl {
                 ui.label("Projection feature not enabled.");
                 ui.label("Enable the 'projection' feature for multi-output support.");
             }
-
-            ui.separator();
-            ui.label(egui::RichText::new("Recording").strong());
-
-            if let Ok(mut guard) = self.pending_save_path.lock()
-                && let Some(path) = guard.take()
-            {
-                self.recording_path = path.to_string_lossy().to_string();
-            }
-
-            ui.horizontal(|ui| {
-                ui.label("Codec:");
-                egui::ComboBox::from_id_salt("recorder_codec")
-                    .selected_text(format!("{:?}", self.recording_codec))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.recording_codec,
-                            rustjay_core::RecorderCodec::H264,
-                            "H.264",
-                        );
-                        ui.selectable_value(
-                            &mut self.recording_codec,
-                            rustjay_core::RecorderCodec::H265,
-                            "H.265",
-                        );
-                        ui.selectable_value(
-                            &mut self.recording_codec,
-                            rustjay_core::RecorderCodec::AV1,
-                            "AV1",
-                        );
-                        ui.selectable_value(
-                            &mut self.recording_codec,
-                            rustjay_core::RecorderCodec::ProRes422,
-                            "ProRes 422",
-                        );
-                    });
-            });
-            ui.horizontal(|ui| {
-                ui.label("Path:");
-                ui.text_edit_singleline(&mut self.recording_path)
-                    .on_hover_text("Output file path (relative or absolute)");
-                if ui.button("Browse…").clicked() {
-                    let pending = self.pending_save_path.clone();
-                    let ctx = ui.ctx().clone();
-                    let ext = match self.recording_codec {
-                        rustjay_core::RecorderCodec::H264
-                        | rustjay_core::RecorderCodec::H265
-                        | rustjay_core::RecorderCodec::AV1 => "mp4",
-                        rustjay_core::RecorderCodec::ProRes422 => "mov",
-                    };
-                    std::thread::spawn(move || {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Video", &[ext])
-                            .set_file_name(format!("recording.{}", ext))
-                            .save_file()
-                        {
-                            if let Ok(mut guard) = pending.lock() {
-                                *guard = Some(path);
-                            }
-                            ctx.request_repaint();
-                        }
-                    });
-                }
-            });
-            ui.horizontal(|ui| {
-                let is_recording = engine.recording_active;
-                if ui
-                    .add_enabled(!is_recording, egui::Button::new("⏺ Start"))
-                    .clicked()
-                {
-                    engine.output_command = rustjay_core::OutputCommand::StartRecording {
-                        path: self.recording_path.clone(),
-                        codec: self.recording_codec,
-                        audio_device: None,
-                    };
-                }
-                if ui
-                    .add_enabled(is_recording, egui::Button::new("⏹ Stop"))
-                    .clicked()
-                {
-                    engine.output_command = rustjay_core::OutputCommand::StopRecording;
-                }
-                if is_recording {
-                    ui.label(egui::RichText::new("● REC").color(egui::Color32::RED));
-                }
-            });
         }
     }
 

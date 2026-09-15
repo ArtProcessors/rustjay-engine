@@ -345,14 +345,14 @@ fn deck_stream_paints_invalid_url_error() {
     harness.get_by_label("Unsupported stream URL scheme.");
 }
 
+/// Without projection there are no outputs to list, and the tab says so
+/// rather than drawing a recorder for the hidden main window.
 #[cfg(not(feature = "projection"))]
 #[test]
-fn default_outputs_recording_snapshot() {
-    let mut harness = tab_harness(OutputsTab::default(), [700.0, 400.0]);
-
-    harness.get_by_label("Recording");
-    harness.get_by_label("Browse…");
-    harness.snapshot("outputs_recording");
+fn outputs_without_projection_says_so() {
+    let harness = tab_harness(OutputsTab::default(), [700.0, 400.0]);
+    harness.get_by_label("Projection feature not enabled.");
+    assert!(harness.query_by_label("Recording").is_none());
 }
 
 #[cfg(feature = "projection")]
