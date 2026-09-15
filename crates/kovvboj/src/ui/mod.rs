@@ -7180,10 +7180,15 @@ mod egui_impl {
                         live_projector_idx += 1;
                         idx
                     });
+                    // Two lines, and a name field of fixed width: inside an
+                    // auto-sizing window `available_width` is the screen's, so
+                    // an unbounded text field made every row wider than any
+                    // window, and Fullscreen and 🗑 were clipped even at 1200pt.
                     ui.push_id(i, |ui| {
+                        ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut proj.enabled, "");
-                            ui.text_edit_singleline(&mut proj.name);
+                            ui.add(egui::TextEdit::singleline(&mut proj.name).desired_width(140.0));
                             ui.label("size:");
                             ui.add(
                                 egui::DragValue::new(&mut proj.width)
@@ -7253,6 +7258,8 @@ mod egui_impl {
                                         }
                                     }
                                 });
+                        });
+                        ui.horizontal(|ui| {
                             ui.label("type:");
                             let prev_type = proj.output_type.clone();
                             egui::ComboBox::from_id_salt(format!("proj_type_{}", i))
@@ -7383,6 +7390,7 @@ mod egui_impl {
                             if ui.button("🗑").clicked() {
                                 remove_proj = Some(i);
                             }
+                        });
                         });
                     });
                 }
@@ -7559,9 +7567,10 @@ mod egui_impl {
                 let mut hl_dirty = false;
                 for (i, hl) in state.stage.headless_outputs.iter_mut().enumerate() {
                     ui.push_id(format!("hl_{}", i), |ui| {
+                        ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut hl.enabled, "");
-                            ui.text_edit_singleline(&mut hl.name);
+                            ui.add(egui::TextEdit::singleline(&mut hl.name).desired_width(140.0));
                             ui.label("size:");
                             ui.add(
                                 egui::DragValue::new(&mut hl.width)
@@ -7603,6 +7612,8 @@ mod egui_impl {
                                         }
                                     }
                                 });
+                        });
+                        ui.horizontal(|ui| {
                             ui.label("type:");
                             let prev_type = hl.output_type.clone();
                             egui::ComboBox::from_id_salt(format!("hl_type_{}", i))
@@ -7673,6 +7684,7 @@ mod egui_impl {
                             if ui.button("🗑").clicked() {
                                 remove_hl = Some(i);
                             }
+                        });
                         });
                     });
                 }

@@ -1358,6 +1358,9 @@ impl KovvbojShell {
             egui::Window::new("Outputs")
                 .open(&mut open)
                 .default_width(520.0)
+                // A hint, not a bound — the rows are what keep the window
+                // from growing to the screen, see `OutputsTab`.
+                .max_width(640.0)
                 .vscroll(true)
                 .show(&ctx, |ui| tab(&mut self.outputs, ui, app_state, engine));
             self.show_outputs = open;
