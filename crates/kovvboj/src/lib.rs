@@ -4447,10 +4447,12 @@ impl EffectPlugin for KovvbojRootPlugin {
                                 .collect();
                             sub.set_sampler_tile_sources(sampler_id, &tile_sources);
 
-                            if !state.lighting_senders.contains_key(&sampler_id) {
+                            if let std::collections::hash_map::Entry::Vacant(slot) =
+                                state.lighting_senders.entry(sampler_id)
+                            {
                                 match build_dmx_sender(&lo.output_type, &lo.transport) {
                                     Ok(sender) => {
-                                        state.lighting_senders.insert(sampler_id, sender);
+                                        slot.insert(sender);
                                         engine.notify(
                                             format!(
                                                 "{} output started: {}",
