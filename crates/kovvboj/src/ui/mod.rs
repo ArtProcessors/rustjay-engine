@@ -268,6 +268,15 @@ fn deck_uuid(d: usize) -> &'static str {
     if d == 1 { crate::DECK_B } else { crate::DECK_A }
 }
 
+/// Whether a layer row has room for its thumbnail as well as a readable name.
+///
+/// `name_w` is what the row's controls leave for the select button; the thumb
+/// only goes in when at least six monospace characters (~48pt at the theme's
+/// 12.5px) would still fit beside it.
+pub fn row_shows_thumb(name_w: f32, thumb_w: f32) -> bool {
+    name_w >= thumb_w + 48.0
+}
+
 /// The library's add-target buttons: `[A][B]` when a set has decks, a plain
 /// `➕` when it does not.
 ///
@@ -405,8 +414,10 @@ mod egui_impl {
         let mut idx = engine.get_param_base(key).unwrap_or(0.0).round() as usize;
         let prev = idx;
         let names: Vec<&str> = BlendMode::all().iter().map(|m| m.short_name()).collect();
+        // Four monospace characters and the arrow; 74 left a gap the layer
+        // row could not afford.
         egui::ComboBox::from_id_salt(key)
-            .width(74.0)
+            .width(62.0)
             .selected_text(*names.get(idx).unwrap_or(&"???"))
             .show_ui(ui, |ui| {
                 for (i, name) in names.iter().enumerate() {
@@ -2129,7 +2140,11 @@ mod egui_impl {
                 ui.spacing_mut().slider_width =
                     (ui.available_width() - 56.0 - 96.0).clamp(40.0, 80.0);
                 if ui
-                    .add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(false))
+                    .add(
+                        egui::Slider::new(&mut op, 0.0..=1.0)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    )
                     .on_hover_text("Group opacity")
                     .changed()
                 {
@@ -2396,12 +2411,11 @@ mod egui_impl {
                                         // slider at minimum, M, S + gaps) needs about
                                         // this much room; the name gets what's left and
                                         // ellipsizes rather than shoving the controls
-                                        // off the panel on narrow widths.
-                                        let controls_w = 14.0
-                                            + 84.0
-                                            + 24.0
-                                            + 40.0
-                                            + 5.0 * ui.spacing().item_spacing.x;
+                                        // off the panel on narrow widths. The gaps are
+                                        // the 4pt the control layout sets below, not
+                                        // the theme's 8: at a half-window deck column
+                                        // those five gaps were a third of the name.
+                                        let controls_w = 14.0 + 62.0 + 24.0 + 40.0 + 5.0 * 4.0;
                                         let name_w = (ui.available_width() - controls_w).max(20.0);
                                         let name_rect = egui::Rect::from_min_size(
                                             ui.cursor().min,
@@ -2420,13 +2434,22 @@ mod egui_impl {
                                         let thumb_size =
                                             egui::vec2(thumb_h * crate::thumbs::ASPECT, thumb_h);
                                         let slot = ui.id().with("thumb_slot");
-                                        let thumb: egui::Atom<'_> = match thumb_ids.get(uuid) {
-                                            Some(id) => egui::Image::new((*id, thumb_size))
-                                                .fit_to_exact_size(thumb_size)
-                                                .corner_radius(2.0)
-                                                .into(),
-                                            None => egui::Atom::custom(slot, thumb_size),
-                                        };
+                                        // Only where a readable name is left beside
+                                        // it: in a half-width deck column the thumb
+                                        // ate the whole button and every layer read
+                                        // as "…". The strip's chip below still
+                                        // carries the name either way.
+                                        let mut atoms = egui::Atoms::default();
+                                        if row_shows_thumb(name_w, thumb_size.x) {
+                                            atoms.push_right(match thumb_ids.get(uuid) {
+                                                Some(id) => egui::Image::new((*id, thumb_size))
+                                                    .fit_to_exact_size(thumb_size)
+                                                    .corner_radius(2.0)
+                                                    .into(),
+                                                None => egui::Atom::custom(slot, thumb_size),
+                                            });
+                                        }
+                                        atoms.push_right(name.as_str());
                                         let resp = ui
                                             .scope_builder(
                                                 egui::UiBuilder::new().max_rect(name_rect).layout(
@@ -2442,7 +2465,7 @@ mod egui_impl {
                                                         egui::vec2(4.0, 1.0);
                                                     let out = egui::Button::selectable(
                                                         layer_selected || multi,
-                                                        (thumb, name.as_str()),
+                                                        atoms,
                                                     )
                                                     .truncate()
                                                     .atom_ui(ui);
@@ -2523,6 +2546,7 @@ mod egui_impl {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
+                                                ui.spacing_mut().item_spacing.x = 4.0;
                                                 if ui
                                                     .add(
                                                         egui::Button::new(
@@ -2559,11 +2583,17 @@ mod egui_impl {
                                                     - 2.0 * (20.0 + ui.spacing().item_spacing.x))
                                                     .clamp(24.0, 96.0);
                                                 ui.spacing_mut().slider_width = slider_w;
+                                                // Filled up to the value: the bare rail
+                                                // is the row's own colour, so at 1.0
+                                                // only the handle showed and the fader
+                                                // read as a checkbox.
                                                 if ui
                                                     .add(
                                                         egui::Slider::new(&mut op, 0.0..=1.0)
-                                                            .show_value(false),
+                                                            .show_value(false)
+                                                            .trailing_fill(true),
                                                     )
+                                                    .on_hover_text("Opacity")
                                                     .changed()
                                                 {
                                                     engine.set_param_base(&opacity_key, op);

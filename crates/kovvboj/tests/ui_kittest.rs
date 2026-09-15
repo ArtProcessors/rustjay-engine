@@ -121,7 +121,9 @@ fn layer_controls_do_not_cover_the_name_on_narrow_panels() {
         app
     }
 
-    for w in [700.0f32, 400.0, 300.0] {
+    // 290 is a deck column at the persisted panel widths (library 200,
+    // inspector 400, 1200pt window) — where every name used to collapse to "…".
+    for w in [700.0f32, 400.0, 300.0, 290.0] {
         let harness = tab_harness_with_app(DeckTab::default(), [w, 500.0], app_with_layer());
         // The name appears on the row-1 button and the row-2 strip chip;
         // the row-1 one is drawn first.
@@ -129,6 +131,11 @@ fn layer_controls_do_not_cover_the_name_on_narrow_panels() {
             .get_all(egui_kittest::kittest::By::new().label_contains("A rather long"))
             .next()
             .expect("layer name");
+        assert!(
+            name.rect().width() >= 48.0,
+            "panel {w}: the name button keeps room for a readable name: {:?}",
+            name.rect()
+        );
         let solo = harness.get_by_label("S");
         let mute = harness.get_by_label("M");
         assert!(
