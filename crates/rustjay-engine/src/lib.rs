@@ -297,8 +297,8 @@ pub mod prelude {
     };
     #[cfg(feature = "egui")]
     pub use rustjay_gui::{
-        apply_param_map_overlay, key_color_picker, map_mode_active, param_slider,
-        param_slider_int, AnyEguiShell, AnyEguiTab, EguiControlGui,
+        apply_param_map_overlay, key_color_picker, map_mode_active, param_map_overlay,
+        param_slider, param_slider_int, AnyEguiShell, AnyEguiTab, EguiControlGui,
     };
     pub use rustjay_gui::{AnyGuiTab, BuiltinTab};
     pub use rustjay_render::{InputTexture, PreviousFrameTexture, Texture, WgpuEngine};

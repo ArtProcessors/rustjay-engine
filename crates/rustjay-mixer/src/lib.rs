@@ -1401,13 +1401,14 @@ impl EffectInstance for Mixer {
             ));
 
             for p in ch.effect.parameters() {
-                out.push(prefix_descriptor(&prefix, &p));
+                out.push(prefix_descriptor(&prefix, &ch.name, &p));
             }
 
             for slot in ch.chain.iter() {
                 let chain_prefix = format!("{prefix}fx{}_", slot.uuid);
+                let owner = format!("{} · {}", ch.name, slot.effect.label());
                 for p in slot.effect.parameters() {
-                    out.push(prefix_descriptor(&chain_prefix, &p));
+                    out.push(prefix_descriptor(&chain_prefix, &owner, &p));
                 }
             }
         }
@@ -1438,8 +1439,9 @@ impl EffectInstance for Mixer {
             ));
             for slot in g.chain.iter() {
                 let chain_prefix = format!("{prefix}fx{}_", slot.uuid);
+                let owner = format!("{} · {}", g.name, slot.effect.label());
                 for p in slot.effect.parameters() {
-                    out.push(prefix_descriptor(&chain_prefix, &p));
+                    out.push(prefix_descriptor(&chain_prefix, &owner, &p));
                 }
             }
         }
@@ -1449,14 +1451,15 @@ impl EffectInstance for Mixer {
         // that one from the crossfader every frame.
         if let Some(slot) = self.transition.as_ref() {
             for p in slot.effect.parameters() {
-                out.push(prefix_descriptor(TRANSITION_PREFIX, &p));
+                out.push(prefix_descriptor(TRANSITION_PREFIX, "Transition", &p));
             }
         }
 
         for slot in self.master.iter() {
             let prefix = format!("master_fx{}_", slot.uuid);
+            let owner = format!("Master · {}", slot.effect.label());
             for p in slot.effect.parameters() {
-                out.push(prefix_descriptor(&prefix, &p));
+                out.push(prefix_descriptor(&prefix, &owner, &p));
             }
         }
 
@@ -1884,10 +1887,12 @@ impl EffectInstance for Mixer {
     }
 }
 
-fn prefix_descriptor(prefix: &str, desc: &ParameterDescriptor) -> ParameterDescriptor {
+/// `owner` names the node for a flat listing — "Speed [Layer 1 · Blur]" — in
+/// the bracket a UI with the node already in view strips off.
+fn prefix_descriptor(prefix: &str, owner: &str, desc: &ParameterDescriptor) -> ParameterDescriptor {
     ParameterDescriptor {
         id: format!("{prefix}{}", desc.id),
-        name: format!("{} [{}]", desc.name, prefix.trim_end_matches('_')),
+        name: format!("{} [{owner}]", desc.name),
         category: desc.category.clone(),
         param_type: desc.param_type.clone(),
         min: desc.min,

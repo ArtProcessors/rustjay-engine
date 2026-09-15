@@ -149,6 +149,19 @@ impl ModulationTarget {
         }
     }
 
+    /// [`Self::name`], but a custom target shows its descriptor's name rather
+    /// than its id — "Layer 1 Opacity", not "ch_60e03839_opacity".
+    pub fn label(&self, descriptors: &[ParameterDescriptor]) -> String {
+        match self {
+            ModulationTarget::Custom(id) => descriptors
+                .iter()
+                .find(|d| d.id == *id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| id.clone()),
+            _ => self.name(),
+        }
+    }
+
     /// All static modulation targets (excludes `Unknown`).
     /// For backward compatibility.
     pub fn all() -> &'static [ModulationTarget] {
@@ -699,6 +712,23 @@ impl AudioRoutingState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_custom_target_reads_as_its_descriptor_name() {
+        let descs = [ParameterDescriptor::float(
+            "ch_60e03839_opacity",
+            "Layer 1 Opacity",
+            crate::params::ParamCategory::Custom("Mixer".into()),
+            0.0,
+            1.0,
+            1.0,
+            0.01,
+        )];
+        let known = ModulationTarget::Custom("ch_60e03839_opacity".into());
+        assert_eq!(known.label(&descs), "Layer 1 Opacity");
+        let gone = ModulationTarget::Custom("ch_deadbeef_opacity".into());
+        assert_eq!(gone.label(&descs), "ch_deadbeef_opacity");
+    }
 
     #[test]
     fn a_matrix_holds_more_than_the_old_eight_routes() {

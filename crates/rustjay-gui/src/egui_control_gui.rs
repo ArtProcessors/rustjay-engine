@@ -1182,11 +1182,13 @@ impl EguiControlGui {
         }
 
         let mut is_open = self.show_routing_window;
-        let target_list = {
+        let (target_list, target_names) = {
             let state = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
-            ModulationTarget::all_for(&state.param_descriptors)
+            let list = ModulationTarget::all_for(&state.param_descriptors);
+            let names: Vec<String> =
+                list.iter().map(|t| t.label(&state.param_descriptors)).collect();
+            (list, names)
         };
-        let target_names: Vec<String> = target_list.iter().map(|t| t.name()).collect();
 
         let rows: Vec<RouteRow> = {
             let state = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1220,7 +1222,7 @@ impl EguiControlGui {
                     let target = target_list
                         .iter()
                         .find(|t| t.param_id() == Some(param_id.as_str()))
-                        .map(|t| t.name())
+                        .map(|t| t.label(&state.param_descriptors))
                         .unwrap_or_else(|| param_id.clone());
                     rows.push(RouteRow {
                         uuid: entry.uuid.clone(),
