@@ -1458,13 +1458,18 @@ mod egui_impl {
             ParamType::Enum { variants } => {
                 let mut idx = current as usize;
                 let sel = variants.get(idx).map(String::as_str).unwrap_or("?");
-                egui::ComboBox::from_id_salt(&desc.id)
-                    .selected_text(sel)
-                    .show_ui(ui, |ui| {
-                        for (i, name) in variants.iter().enumerate() {
-                            ui.selectable_value(&mut idx, i, name);
-                        }
-                    });
+                // Labelled like the other arms: a bare combo reading "None"
+                // says nothing about what it is none of.
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt(&desc.id)
+                        .selected_text(sel)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in variants.iter().enumerate() {
+                                ui.selectable_value(&mut idx, i, name);
+                            }
+                        });
+                    ui.label(short_param_name(desc, owner));
+                });
                 if idx as f32 != current {
                     engine.set_param_base(&desc.id, idx as f32);
                 }
@@ -1953,6 +1958,29 @@ mod egui_impl {
         if let Some((full, kind)) = layer_controls {
             param_slider(ui, engine, &format!("{full}opacity"), "Opacity", 0.0, 1.0);
             blend_combo(ui, engine, &format!("{full}blend"), "Blend");
+            // Keying: the row's K switches it, the settings are here. Only
+            // what the mode uses is shown — the colour for chroma, invert for
+            // luma — so "off" is one combo, not six dead sliders.
+            let mode = engine
+                .get_param_base(&format!("{full}key_mode"))
+                .unwrap_or(0.0)
+                .round() as u32;
+            let descriptors = engine.param_descriptors.clone();
+            for desc in descriptors.iter() {
+                let Some(rest) = desc.id.strip_prefix(full.as_str()) else {
+                    continue;
+                };
+                let shown = match rest {
+                    "key_mode" => true,
+                    "key_r" | "key_g" | "key_b" => mode == 1,
+                    "key_threshold" | "key_smoothness" => mode != 0,
+                    "key_luma_invert" => mode == 2,
+                    _ => false,
+                };
+                if shown {
+                    draw_param(ui, engine, desc, &heading);
+                }
+            }
             ui.label(
                 egui::RichText::new(format!("{kind:?}"))
                     .monospace()
@@ -1996,6 +2024,11 @@ mod egui_impl {
                     continue;
                 };
                 if rest.starts_with("fx") || DECK_CONTROL_KEYS.contains(&rest) {
+                    continue;
+                }
+                // Keying is a mix property, drawn with the layer; the engine's
+                // input select means nothing to a layer that is its own source.
+                if rest.starts_with("key_") || rest == "input_select" {
                     continue;
                 }
                 if is_pacing_param(rest) {
@@ -2415,7 +2448,8 @@ mod egui_impl {
                                         // the 4pt the control layout sets below, not
                                         // the theme's 8: at a half-window deck column
                                         // those five gaps were a third of the name.
-                                        let controls_w = 14.0 + 62.0 + 24.0 + 40.0 + 5.0 * 4.0;
+                                        let controls_w =
+                                            14.0 + 62.0 + 24.0 + 40.0 + 20.0 + 6.0 * 4.0;
                                         let name_w = (ui.available_width() - controls_w).max(20.0);
                                         let name_rect = egui::Rect::from_min_size(
                                             ui.cursor().min,
@@ -2677,6 +2711,38 @@ mod egui_impl {
                                             }
                                             if let Some(fx) = out.select {
                                                 new_selection = Some(crate::Selection::LayerFx {
+                                                // Keying is one switch on the row —
+                                                // on or off — and its settings live
+                                                // in the inspector, which the switch
+                                                // opens. "On" brings back the mode
+                                                // last used, chroma the first time.
+                                                let key_key = format!("ch_{uuid}_key_mode");
+                                                let mode = engine
+                                                    .get_param_base(&key_key)
+                                                    .unwrap_or(0.0)
+                                                    .round() as u32;
+                                                let remembered = ui.id().with(("keymode", uuid));
+                                                if ui
+                                                    .selectable_label(mode != 0, "K")
+                                                    .on_hover_text(if mode != 0 {
+                                                        "Keying on — click to switch it off. The settings are in the inspector."
+                                                    } else {
+                                                        "Key this layer, chroma or luma. The settings are in the inspector."
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    let next = if mode != 0 {
+                                                        ui.data_mut(|d| d.insert_temp(remembered, mode));
+                                                        0
+                                                    } else {
+                                                        ui.data(|d| d.get_temp::<u32>(remembered))
+                                                            .unwrap_or(1)
+                                                    };
+                                                    engine.set_param_base(&key_key, next as f32);
+                                                    new_selection = Some(crate::Selection::Layer {
+                                                        layer: uuid.clone(),
+                                                    });
+                                                }
                                                     layer: uuid.clone(),
                                                     fx,
                                                 });
