@@ -1075,8 +1075,24 @@ impl KovvbojAppState {
         crate::persistence::push_recent(&self.workspace.dir);
         #[cfg(feature = "mixer")]
         {
-            self.pending_scene = self.workspace.load_scene().ok();
-            self.pending_new_graph = self.pending_scene.is_none();
+            let (mut scene, notice) = load_scene_or_backup(&self.workspace);
+            self.pending_notices
+                .extend(notice.map(|n| (n, rustjay_core::NotificationLevel::Warning)));
+            // A graph this build cannot replay is replaced by the default set,
+            // as at startup. Keeping the previous set's live graph would save
+            // *that* into this workspace on the next auto-save. The knobs and
+            // modulation still apply; the topology is dropped so `prepare`
+            // does not warn about it a second time.
+            self.pending_new_graph = !scene
+                .as_ref()
+                .and_then(|s| s.topology.as_ref())
+                .is_some_and(usable_topology);
+            if let Some(s) = scene.as_mut()
+                && self.pending_new_graph
+            {
+                s.topology = None;
+            }
+            self.pending_scene = scene;
             self.layer_sources.clear();
             self.undo_stack.clear();
             self.redo_stack.clear();
@@ -1541,12 +1557,15 @@ fn reload_matching_slots(
 /// honestly: a channel's post-FX ran once over the composite of its decks, and
 /// once those decks are sibling layers there is nowhere for that effect to go
 /// that renders the same picture.
+///
+/// An empty layer list is usable: a set the user cleared to nothing comes back
+/// empty, not as the default set.
 #[cfg(feature = "mixer")]
 fn usable_topology(topo: &crate::scene::Topology) -> bool {
-    topo.version >= crate::scene::TOPOLOGY_VERSION && !topo.layers.is_empty()
+    topo.version >= crate::scene::TOPOLOGY_VERSION
 }
 
-/// Tell the user why their saved graph did not load, and leave the file alone.
+/// Tell the user why their saved graph did not load.
 #[cfg(feature = "mixer")]
 fn warn_stale_topology(topo: &crate::scene::Topology, engine: &EngineState) {
     if topo.version >= crate::scene::TOPOLOGY_VERSION {
@@ -1558,10 +1577,47 @@ fn warn_stale_topology(topo: &crate::scene::Topology, engine: &EngineState) {
         crate::scene::TOPOLOGY_VERSION
     );
     engine.notify(
-        "This scene predates layers and was not loaded. Your file is untouched.".to_string(),
+        "This scene predates layers and cannot be loaded by this build.".to_string(),
         rustjay_core::NotificationLevel::Warning,
         std::time::Duration::from_secs(8),
     );
+}
+
+/// Read the workspace scene, keeping a copy of one this build cannot use.
+///
+/// The scene, if it parsed at all; and a notice when the default set is about
+/// to open in its place — the file did not parse, or its topology is one this
+/// build cannot replay — because the auto-save then overwrites it within
+/// thirty seconds. A timestamped copy is kept beside it first, and the notice
+/// says where. A scene that will be reloaded as is gets neither.
+#[cfg(feature = "mixer")]
+fn load_scene_or_backup(ws: &crate::persistence::Workspace) -> (Option<Scene>, Option<String>) {
+    if !ws.exists() {
+        return (None, None);
+    }
+    let (scene, why) = match ws.load_scene() {
+        Ok(scene) => {
+            if scene.topology.as_ref().is_some_and(usable_topology) {
+                return (Some(scene), None);
+            }
+            (Some(scene), "predates layers and cannot be loaded by this build".to_string())
+        }
+        Err(e) => {
+            log::warn!("[Workspace] failed to load scene: {e}");
+            (None, format!("could not be read: {e}"))
+        }
+    };
+    let kept = match ws.backup_scene() {
+        Ok(bak) => format!("a copy was kept at {}", bak.display()),
+        Err(e) => format!("and could NOT be backed up ({e}) — the auto-save will replace it"),
+    };
+    (
+        scene,
+        Some(format!(
+            "{} {why}. The default set opens instead; {kept}.",
+            ws.scene_path().display()
+        )),
+    )
 }
 
 /// Build an [`EffectSlot`](rustjay_mixer::EffectSlot) from a saved [`FxDesc`],
@@ -4529,17 +4585,8 @@ impl EffectPlugin for KovvbojRootPlugin {
             // FIXME: hardcodes default_workspace() because init() has no access to State.
             // Wire a workspace field onto the plugin when per-project paths are needed.
             let workspace = crate::persistence::default_workspace();
-            let scene = if workspace.exists() {
-                match workspace.load_scene() {
-                    Ok(scene) => Some(scene),
-                    Err(e) => {
-                        log::warn!("[Workspace] failed to load scene: {}", e);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            let (scene, notice) = load_scene_or_backup(&workspace);
+            self.notices.extend(notice);
 
             // Rebuild the saved routing graph when present; otherwise fall back
             // to the hard-coded default assembly. Topology must exist before the
@@ -4983,6 +5030,73 @@ mod tests {
             "the original path is what gets saved, not a placeholder"
         );
         assert_eq!(layers[0].source.kind, crate::sources::SourceKind::Video);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scene this build cannot use is copied aside before the default set
+    /// opens over it, and the notice says so. One that loads is left alone.
+    #[test]
+    fn an_unusable_scene_is_backed_up_before_the_default_set_replaces_it() {
+        let dir = std::env::temp_dir().join(format!("kv-bak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = crate::persistence::Workspace::new(&dir);
+        let backups = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("scene.json.bak-"))
+                })
+                .collect()
+        };
+
+        // Nothing there: nothing to say.
+        let (scene, notice) = load_scene_or_backup(&ws);
+        assert!(scene.is_none() && notice.is_none());
+
+        // Corrupt: copied aside, byte for byte, and the original left in place.
+        std::fs::write(ws.scene_path(), "{ not json").unwrap();
+        let (scene, notice) = load_scene_or_backup(&ws);
+        assert!(scene.is_none());
+        let notice = notice.expect("a notice");
+        let kept = backups(&dir);
+        assert_eq!(kept.len(), 1, "one backup: {kept:?}");
+        assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "{ not json");
+        assert!(ws.exists(), "the original is copied, not moved");
+        assert!(notice.contains("could not be read"), "{notice}");
+        assert!(notice.contains(&kept[0].display().to_string()), "{notice}");
+        std::fs::remove_file(&kept[0]).unwrap();
+
+        // Pre-layer (version 0): parses, but cannot be replayed — copied aside.
+        let stale = Scene {
+            topology: Some(crate::scene::Topology {
+                version: 0,
+                ..Default::default()
+            }),
+            ..Scene::from_mixer(&Mixer::new(), &Default::default())
+        };
+        ws.save_scene(&stale).unwrap();
+        let (scene, notice) = load_scene_or_backup(&ws);
+        assert!(scene.is_some(), "the knobs still load");
+        assert!(notice.expect("a notice").contains("predates layers"));
+        assert_eq!(backups(&dir).len(), 1);
+        for b in backups(&dir) {
+            std::fs::remove_file(b).unwrap();
+        }
+
+        // Current, and emptied on purpose: reloads as is, no copy, no notice.
+        let empty = Scene::from_mixer(&Mixer::new(), &Default::default());
+        assert!(empty.topology.as_ref().unwrap().layers.is_empty());
+        ws.save_scene(&empty).unwrap();
+        let (scene, notice) = load_scene_or_backup(&ws);
+        assert!(scene.is_some());
+        assert!(notice.is_none(), "an intentionally empty set is not stale");
+        assert!(backups(&dir).is_empty());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

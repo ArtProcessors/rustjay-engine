@@ -368,6 +368,21 @@ impl Workspace {
         Ok(scene)
     }
 
+    /// Copy `scene.json` to `scene.json.bak-<unix time>` and return that path.
+    ///
+    /// For a scene this build is about to replace: the auto-save would
+    /// otherwise overwrite the only copy of it thirty seconds after launch.
+    pub fn backup_scene(&self) -> std::io::Result<PathBuf> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let bak = self.dir.join(format!("scene.json.bak-{ts}"));
+        std::fs::copy(self.scene_path(), &bak)?;
+        log::warn!("[Workspace] kept a copy of the scene at {}", bak.display());
+        Ok(bak)
+    }
+
     #[cfg(feature = "projection")]
     pub fn save_stage(&self, stage: &crate::stage::KovvbojStage) -> anyhow::Result<()> {
         self.ensure_dir()?;
