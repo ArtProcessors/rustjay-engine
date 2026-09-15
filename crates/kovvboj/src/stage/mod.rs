@@ -1211,6 +1211,21 @@ impl rustjay_projection::ProjectionStage for KovvbojWarpStage {
         "kovvboj-warp"
     }
 
+    /// An identity corner-pin or mesh changes nothing, so the pass is skipped
+    /// and the engine feeds the previous stage's output straight through —
+    /// a full-resolution draw saved per projector per frame, which is every
+    /// projector that has not been warped. The source stage stays active, so
+    /// something still copies the input to the surface. A version bump while
+    /// inactive is picked up by the next `render`, which compares versions.
+    fn is_active(&self) -> bool {
+        !self
+            .sync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mode
+            .is_identity()
+    }
+
     fn render(
         &mut self,
         ctx: &mut rustjay_core::RenderCtx<'_>,
