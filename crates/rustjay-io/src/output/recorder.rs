@@ -32,6 +32,17 @@ pub enum RecorderCodec {
     ProRes422,
 }
 
+impl From<rustjay_core::RecorderCodec> for RecorderCodec {
+    fn from(c: rustjay_core::RecorderCodec) -> Self {
+        match c {
+            rustjay_core::RecorderCodec::H264 => Self::H264,
+            rustjay_core::RecorderCodec::H265 => Self::H265,
+            rustjay_core::RecorderCodec::AV1 => Self::AV1,
+            rustjay_core::RecorderCodec::ProRes422 => Self::ProRes422,
+        }
+    }
+}
+
 impl RecorderCodec {
     /// File extension for this codec.
     pub fn extension(&self) -> &'static str {

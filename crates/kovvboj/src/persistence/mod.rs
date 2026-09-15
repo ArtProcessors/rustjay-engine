@@ -50,10 +50,44 @@ impl Workspace {
         self.dir.join("ui.json")
     }
 
-    /// Where recordings land: inside the set, so they are found again with it
-    /// and never in whatever directory the app happened to be launched from.
-    pub fn recordings_dir(&self) -> PathBuf {
-        self.dir.join("recordings")
+    /// Recording settings. Global, like favourites: the codec and folder belong
+    /// to the rig, not to the show.
+    pub fn recording_prefs_path(&self) -> PathBuf {
+        self.global_root().join("recording.json")
+    }
+
+    /// A missing or unreadable file means the defaults.
+    pub fn load_recording(&self) -> RecordingPrefs {
+        std::fs::read_to_string(self.recording_prefs_path())
+            .ok()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_recording(&self, prefs: &RecordingPrefs) -> anyhow::Result<()> {
+        let path = self.recording_prefs_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(prefs)?)?;
+        Ok(())
+    }
+
+    /// A fresh timestamped file for a recording starting now, and the codec to
+    /// record it with. Reads the settings from disk, so a change in Settings
+    /// applies to the next recording without being plumbed anywhere.
+    pub fn next_recording(&self, stem: &str) -> (PathBuf, rustjay_core::RecorderCodec) {
+        let prefs = self.load_recording();
+        // Inside the set by default, so recordings are found again with it and
+        // never in whatever directory the app happened to be launched from.
+        let dir = prefs.folder.unwrap_or_else(|| self.dir.join("recordings"));
+        std::fs::create_dir_all(&dir).ok();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let file = format!("{stem}_{ts}.{}", prefs.codec.extension());
+        (dir.join(file), prefs.codec)
     }
 
     /// Load UI preferences, falling back to defaults when absent or unreadable —
@@ -432,6 +466,15 @@ impl Workspace {
 /// not, so workspaces saved before the KOVVBOJ rename keep loading. Saving from
 /// a legacy workspace keeps writing to `.varda/` — it is never migrated behind
 /// the user's back.
+/// Recording settings, shared by every set. See [`Workspace::next_recording`].
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct RecordingPrefs {
+    pub codec: rustjay_core::RecorderCodec,
+    /// Where recordings go. `None` keeps them in the open set's `recordings/`.
+    pub folder: Option<PathBuf>,
+}
+
 /// UI preferences that outlive a session but are not part of the scene.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct UiPrefs {

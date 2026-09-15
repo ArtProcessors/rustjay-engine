@@ -4079,7 +4079,6 @@ impl EffectPlugin for KovvbojRootPlugin {
                 let mut any_guard = handle.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(sub) = any_guard.downcast_mut::<rustjay_engine::ProjectionSubsystem>() {
                     let fps = engine.target_fps as f32;
-                    let codec = rustjay_io::RecorderCodec::H264;
 
                     // Level-triggered: each frame, reconcile every enabled
                     // projector's active sinks against its selected output_type
@@ -4101,15 +4100,12 @@ impl EffectPlugin for KovvbojRootPlugin {
                         let want_rec =
                             matches!(proj.output_type, OutputType::Recording) && proj.recording;
                         if want_rec && !sub.is_projector_recording(idx) {
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let dir = state.workspace.recordings_dir();
-                            std::fs::create_dir_all(&dir).ok();
-                            let path =
-                                dir.join(format!("projector_{}_{}_{}.mp4", i, proj.name, ts));
-                            if let Err(e) = sub.start_projector_recording(idx, &path, fps, codec) {
+                            let (path, codec) = state
+                                .workspace
+                                .next_recording(&format!("projector_{i}_{}", proj.name));
+                            if let Err(e) =
+                                sub.start_projector_recording(idx, &path, fps, codec.into())
+                            {
                                 log::error!(
                                     "[Kovvboj] Failed to start projector {i} recording: {e}"
                                 );
@@ -4238,14 +4234,12 @@ impl EffectPlugin for KovvbojRootPlugin {
                         let want_rec =
                             matches!(hl.output_type, OutputType::Recording) && hl.recording;
                         if want_rec && !sub.is_headless_recording(idx) {
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let dir = state.workspace.recordings_dir();
-                            std::fs::create_dir_all(&dir).ok();
-                            let path = dir.join(format!("headless_{}_{}_{}.mp4", i, hl.name, ts));
-                            if let Err(e) = sub.start_headless_recording(idx, &path, fps, codec) {
+                            let (path, codec) = state
+                                .workspace
+                                .next_recording(&format!("headless_{i}_{}", hl.name));
+                            if let Err(e) =
+                                sub.start_headless_recording(idx, &path, fps, codec.into())
+                            {
                                 log::error!(
                                     "[Kovvboj] Failed to start headless {i} recording: {e}"
                                 );
