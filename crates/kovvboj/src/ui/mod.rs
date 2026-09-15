@@ -2330,6 +2330,7 @@ mod egui_impl {
             let mut undo_snapshot: Option<crate::scene::Topology> = None;
             let mut restack: Option<(String, String)> = None;
             let mut regroup: Option<(String, Option<String>)> = None;
+            let mut regroup_group: Option<(String, Option<String>)> = None;
             let mut drops: Vec<ChainDrop> = Vec::new();
             let mut group_acts = GroupActions::default();
 
@@ -2370,7 +2371,6 @@ mod egui_impl {
                     .collect();
                 let mut said_off_deck = false;
 
-                for (uuid, is_off_deck) in order.iter() {
                 // The deck's own row first: its level and gates, and its chain.
                 if let Some(d) = self.deck
                     && mixer.decks.is_some()
@@ -2380,6 +2380,7 @@ mod egui_impl {
                     ui.separator();
                 }
 
+                for (uuid, is_off_deck) in order.iter() {
                     let Some(idx) = mixer.channels.iter().position(|c| c.uuid == *uuid) else {
                         continue;
                     };
@@ -2710,6 +2711,38 @@ mod egui_impl {
                                                     solo = !solo;
                                                     mixer.channels[idx].solo = solo;
                                                 }
+                                                // Keying is one switch on the row —
+                                                // on or off — and its settings live
+                                                // in the inspector, which the switch
+                                                // opens. "On" brings back the mode
+                                                // last used, chroma the first time.
+                                                let key_key = format!("ch_{uuid}_key_mode");
+                                                let mode = engine
+                                                    .get_param_base(&key_key)
+                                                    .unwrap_or(0.0)
+                                                    .round() as u32;
+                                                let remembered = ui.id().with(("keymode", uuid));
+                                                if ui
+                                                    .selectable_label(mode != 0, "K")
+                                                    .on_hover_text(if mode != 0 {
+                                                        "Keying on — click to switch it off. The settings are in the inspector."
+                                                    } else {
+                                                        "Key this layer, chroma or luma. The settings are in the inspector."
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    let next = if mode != 0 {
+                                                        ui.data_mut(|d| d.insert_temp(remembered, mode));
+                                                        0
+                                                    } else {
+                                                        ui.data(|d| d.get_temp::<u32>(remembered))
+                                                            .unwrap_or(1)
+                                                    };
+                                                    engine.set_param_base(&key_key, next as f32);
+                                                    new_selection = Some(crate::Selection::Layer {
+                                                        layer: uuid.clone(),
+                                                    });
+                                                }
                                             },
                                         );
                                     });
@@ -2771,38 +2804,6 @@ mod egui_impl {
                                             }
                                             if let Some(fx) = out.select {
                                                 new_selection = Some(crate::Selection::LayerFx {
-                                                // Keying is one switch on the row —
-                                                // on or off — and its settings live
-                                                // in the inspector, which the switch
-                                                // opens. "On" brings back the mode
-                                                // last used, chroma the first time.
-                                                let key_key = format!("ch_{uuid}_key_mode");
-                                                let mode = engine
-                                                    .get_param_base(&key_key)
-                                                    .unwrap_or(0.0)
-                                                    .round() as u32;
-                                                let remembered = ui.id().with(("keymode", uuid));
-                                                if ui
-                                                    .selectable_label(mode != 0, "K")
-                                                    .on_hover_text(if mode != 0 {
-                                                        "Keying on — click to switch it off. The settings are in the inspector."
-                                                    } else {
-                                                        "Key this layer, chroma or luma. The settings are in the inspector."
-                                                    })
-                                                    .clicked()
-                                                {
-                                                    let next = if mode != 0 {
-                                                        ui.data_mut(|d| d.insert_temp(remembered, mode));
-                                                        0
-                                                    } else {
-                                                        ui.data(|d| d.get_temp::<u32>(remembered))
-                                                            .unwrap_or(1)
-                                                    };
-                                                    engine.set_param_base(&key_key, next as f32);
-                                                    new_selection = Some(crate::Selection::Layer {
-                                                        layer: uuid.clone(),
-                                                    });
-                                                }
                                                     layer: uuid.clone(),
                                                     fx,
                                                 });
@@ -2853,13 +2854,49 @@ mod egui_impl {
                             // outside every group and you leave yours. Restack
                             // alone would move the layer and leave it orphaned
                             // inside a group's block, or stranded outside one.
-                            // A dragged group is not a layer joining a group.
-                            if !payload.0.starts_with("group:") {
-                                regroup = Some((payload.0.clone(), in_group_uuid.clone()));
+                            // A dragged group joins the row's group the same
+                            // way — that is how a group crosses decks.
+                            match payload.0.strip_prefix("group:") {
+                                Some(gid) => {
+                                    regroup_group = Some((gid.to_string(), in_group_uuid.clone()));
+                                }
+                                None => regroup = Some((payload.0.clone(), in_group_uuid.clone())),
                             }
                             restack = Some((payload.0.clone(), uuid.clone()));
                         }
                     });
+                }
+
+                // The column is a target in its own right, so a layer can be
+                // moved onto an empty deck — or to the top of one — without a
+                // row to land on. Shown only while a layer or group is in
+                // flight; a row under the pointer takes the drop first.
+                if let Some(d) = self.deck
+                    && egui::DragAndDrop::has_payload_of_type::<LayerDrag>(ui.ctx())
+                {
+                    let deck = deck_uuid(d);
+                    let (_, dropped) =
+                        ui.dnd_drop_zone::<LayerDrag, _>(egui::Frame::group(ui.style()), |ui| {
+                            ui.set_min_size(egui::vec2(ui.available_width(), 28.0));
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "move onto DECK {}",
+                                        if d == 1 { "B" } else { "A" }
+                                    ))
+                                    .size(10.0)
+                                    .color(rustjay_gui::egui_theme::colors::ink_3()),
+                                );
+                            });
+                        });
+                    if let Some(payload) = dropped {
+                        match payload.0.strip_prefix("group:") {
+                            Some(gid) => {
+                                regroup_group = Some((gid.to_string(), Some(deck.to_string())));
+                            }
+                            None => regroup = Some((payload.0.clone(), Some(deck.to_string()))),
+                        }
+                    }
                 }
 
                 for (gid, index, payload) in std::mem::take(&mut group_acts.drops) {
@@ -3016,6 +3053,29 @@ mod egui_impl {
                         });
                         mixer.set_channel_group(&layer, group);
                     }
+                }
+                // A group dropped into another group, or onto a deck, nests
+                // there. Its uuid does not change, so every `grp_<uuid>_`
+                // binding follows it. A deck is furniture and never moves.
+                if let Some((gid, parent)) = regroup_group.take()
+                    && !mixer.decks.as_ref().is_some_and(|d| d.contains(&gid))
+                    && mixer
+                        .groups
+                        .iter()
+                        .find(|g| g.uuid == gid)
+                        .is_some_and(|g| g.parent != parent)
+                {
+                    undo_snapshot.get_or_insert_with(|| {
+                        crate::scene::Topology::from_mixer(&mixer, &state.layer_sources)
+                    });
+                    if !mixer.set_group_parent(&gid, parent.as_deref()) {
+                        engine.notify(
+                            "A group cannot be dropped inside itself".to_string(),
+                            rustjay_core::NotificationLevel::Error,
+                            std::time::Duration::from_secs(4),
+                        );
+                    }
+                    state.params_dirty_request = true;
                 }
 
                 // A group dropped on a row moves as one block.
