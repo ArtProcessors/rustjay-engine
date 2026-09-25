@@ -32,7 +32,7 @@ on:
       app:
         description: "App to build (all = full matrix)"
         type: choice
-        options: [all, kovvboj, vp404, videowall]
+        options: [all, vp404, videowall]
         default: all
       release_tag:
         description: "Existing apps-v* tag to attach the packages to (empty = artifacts-only dry run)"
@@ -62,17 +62,14 @@ jobs:
           cat > matrix.json <<'JSON'
           {
             "os": ["macos-latest", "ubuntu-latest", "windows-latest"],
-            "app": ["kovvboj", "vp404", "videowall"],
+            "app": ["vp404", "videowall"],
             "include": [
-              {"app": "kovvboj", "display": "KOVVBOJ", "ffmpeg": true, "ndi": true, "dir": "crates/kovvboj"},
               {"app": "vp404", "display": "VP-404", "ndi": true},
               {"app": "videowall", "display": "VideoWall", "ndi": true}
             ],
             "exclude": []
           }
           JSON
-          # Notes carried over from the old inline matrix:
-          #  - kovvboj: --all-features enables its ffmpeg feature
           if [ "$APP" != "all" ]; then
             jq -c --arg app "$APP" \
               '.app = [$app]
@@ -208,7 +205,7 @@ jobs:
           ICNS="$SRC/packaging/AppIcon.icns"
           [ -f "$ICNS" ] && cp "$ICNS" "$APP/Contents/Resources/"
           # Bundled shader/asset libraries: the app resolves them from
-          # Contents/Resources at runtime (kovvboj `resources_dir()`).
+          # Contents/Resources at runtime.
           for res in shaders assets; do
             if [ -d "$SRC/$res" ]; then cp -R "$SRC/$res" "$APP/Contents/Resources/"; fi
           done
