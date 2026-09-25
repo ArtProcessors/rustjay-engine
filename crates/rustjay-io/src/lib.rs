@@ -33,5 +33,36 @@ pub use input::{SyphonInputReceiver, SyphonDiscovery};
 pub use input::{SpoutDiscovery, SpoutInputReceiver};
 pub use output::recorder::{list_audio_devices, Recorder, RecorderCodec};
 pub use output::OutputManager;
+
+/// An FFmpeg command-line tool (`"ffmpeg"`, `"ffprobe"`) to run: the copy
+/// shipped next to the running executable when there is one, so a packaged app
+/// records and converts with nothing installed; otherwise the bare name, found
+/// on `PATH`.
+pub fn ffmpeg_tool(name: &str) -> std::path::PathBuf {
+    let exe = std::env::current_exe().ok();
+    tool_beside(exe.as_deref().and_then(std::path::Path::parent), name)
+}
+
+fn tool_beside(dir: Option<&std::path::Path>, name: &str) -> std::path::PathBuf {
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    dir.map(|d| d.join(&file))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| file.into())
+}
+
+#[cfg(test)]
+mod ffmpeg_tool_tests {
+    #[test]
+    fn a_bundled_copy_wins_over_path() {
+        let dir = std::env::temp_dir().join(format!("rustjay-ffmpeg-tool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = format!("ffmpeg{}", std::env::consts::EXE_SUFFIX);
+        // Nothing beside the executable: fall back to the bare name on PATH.
+        assert_eq!(super::tool_beside(Some(&dir), "ffmpeg"), std::path::PathBuf::from(&file));
+        std::fs::write(dir.join(&file), b"").unwrap();
+        assert_eq!(super::tool_beside(Some(&dir), "ffmpeg"), dir.join(&file));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
 #[cfg(target_os = "linux")]
 pub use v4l2_devices::{V4l2DeviceInfo, list_output_devices};
