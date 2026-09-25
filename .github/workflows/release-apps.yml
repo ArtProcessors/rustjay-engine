@@ -32,7 +32,7 @@ on:
       app:
         description: "App to build (all = full matrix)"
         type: choice
-        options: [all, kovvboj, vp404, shaderglass, videowall]
+        options: [all, kovvboj, vp404, videowall]
         default: all
       release_tag:
         description: "Existing apps-v* tag to attach the packages to (empty = artifacts-only dry run)"
@@ -62,11 +62,10 @@ jobs:
           cat > matrix.json <<'JSON'
           {
             "os": ["macos-latest", "ubuntu-latest", "windows-latest"],
-            "app": ["kovvboj", "vp404", "shaderglass", "videowall"],
+            "app": ["kovvboj", "vp404", "videowall"],
             "include": [
               {"app": "kovvboj", "display": "KOVVBOJ", "ffmpeg": true, "ndi": true, "dir": "crates/kovvboj"},
               {"app": "vp404", "display": "VP-404", "ndi": true},
-              {"app": "shaderglass", "display": "ShaderGlass", "ndi": true},
               {"app": "videowall", "display": "VideoWall", "ndi": true}
             ],
             "exclude": []

@@ -5935,26 +5935,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shaderglass"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "egui",
- "env_logger",
- "log",
- "objc",
- "rfd",
- "rustjay-core",
- "rustjay-engine",
- "rustjay-isf",
- "rustjay-render",
- "serde",
- "serde_json",
- "syphon-core",
- "wgpu",
-]
-
-[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

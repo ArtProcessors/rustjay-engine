@@ -1,4 +1,4 @@
-//! The bundled CRT-Glass filter (used by the shaderglass example) must parse
+//! The bundled CRT-Glass filter must parse
 //! and transpile to WGSL offline — otherwise it only fails at GPU init.
 
 use std::path::PathBuf;

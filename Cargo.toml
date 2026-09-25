@@ -29,7 +29,6 @@ members = [
     "examples/mixer",
     "examples/projection",
     "examples/decklink",
-    "examples/shaderglass",
     "examples/videowall",
     "examples/vp404",
 ]

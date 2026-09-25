@@ -1,6 +1,6 @@
 //! A bank of pads + the shared handle the egui grid tab talks to.
 //!
-//! Same split as `examples/shaderglass`: the render thread owns the live `Bank`
+//! The render thread owns the live `Bank`
 //! (pads decode on the GPU); the UI tab holds a [`BankHandle`] clone and
 //! communicates by posting [`PadCmd`]s (drained in `prepare`) and reading a
 //! published [`PadInfo`] roster. Sample loading needs a `wgpu::Device`, which is
