@@ -50,6 +50,9 @@ fn tool_beside(dir: Option<&std::path::Path>, name: &str) -> std::path::PathBuf 
         .unwrap_or_else(|| file.into())
 }
 
+#[cfg(target_os = "linux")]
+pub use v4l2_devices::{V4l2DeviceInfo, list_output_devices};
+
 #[cfg(test)]
 mod ffmpeg_tool_tests {
     #[test]
@@ -64,5 +67,3 @@ mod ffmpeg_tool_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
-#[cfg(target_os = "linux")]
-pub use v4l2_devices::{V4l2DeviceInfo, list_output_devices};
