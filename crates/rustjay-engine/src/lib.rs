@@ -334,7 +334,7 @@ mod window_icon_tests {
     fn png_icon_reaches_window_attributes() {
         super::set_window_icon(b"not a png"); // warns, leaves the icon unset
         assert!(super::window_attributes().window_icon.is_none());
-        super::set_window_icon(include_bytes!("../../kovvboj/packaging/icon-256.png"));
+        super::set_window_icon(include_bytes!("../../../examples/vp404/packaging/icon-256.png"));
         assert!(super::window_attributes().window_icon.is_some());
     }
 }

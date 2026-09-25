@@ -3,7 +3,7 @@
 # ///
 """Regenerate an app's icon set in <app dir>/packaging/.
 
-    uv run .github/packaging/app_icon.py kovvboj|vp404
+    uv run .github/packaging/app_icon.py vp404
 
 Writes icon.svg (source), AppIcon.icns (macOS bundle), icon.ico (Windows
 shortcut) and icon-256.png (runtime window icon, see rustjay_engine::set_window_icon).
@@ -11,7 +11,7 @@ Needs `resvg` (brew install resvg) and macOS `iconutil`.
 
 House style: Workbench glyphs outlined to paths on a macOS squircle, magenta
 #FA32C1 art, red #F74031 halation + wide magenta bloom, scanlines, vignette.
-New app = one entry in APPS.
+New app = one entry in APPS. KOVVBOJ keeps its own copy in kovvbojAV/kovvboj.
 """
 import subprocess
 import sys
@@ -25,7 +25,7 @@ from fontTools.ttLib import TTFont
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[2]
-FONT = TTFont(ROOT / "crates/kovvboj/assets/fonts/Workbench.ttf")
+FONT = TTFont(ROOT / ".github/packaging/fonts/Workbench.ttf")
 GLYPHS = FONT.getGlyphSet()
 CMAP = FONT.getBestCmap()
 
@@ -89,7 +89,6 @@ def vp404():
 
 
 APPS = {
-    "kovvboj": ("crates/kovvboj", lambda: icon(text("KVJ", 512, 512, 618))),
     "vp404": ("examples/vp404", vp404),
 }
 

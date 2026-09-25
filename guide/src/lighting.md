@@ -67,7 +67,7 @@ engine app to sample.
 kovvboj's **LED Map tab** wraps the whole flow — calibration with background
 subtraction (capture an unlit reference, subtract it so only the flashed LED
 registers) plus live sACN playback of the rendered master output. See the
-[kovvboj chapter](examples/kovvboj.md).
+[KOVVBOJ chapter](examples/kovvboj.md).
 
 ## Design notes
 

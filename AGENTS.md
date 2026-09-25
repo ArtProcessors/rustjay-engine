@@ -35,10 +35,17 @@ Source: https://github.com/DietrichGebert/ponytail
 
 ### CuePool
 
-CuePool now lives in its own repository: <https://github.com/BlueJayLouche/cuePool>.
+CuePool now lives in its own repository: <https://github.com/kovvbojAV/cuePool>.
 The only tie left is `rustjay-lighting`, which CuePool consumes from crates.io — a
 local change to `crates/rustjay-lighting` does not reach CuePool until it is
 published and CuePool bumps the version.
+
+### KOVVBOJ
+
+KOVVBOJ moved to its own repository on 2026-09-25: <https://github.com/kovvbojAV/kovvboj> (issue #281).
+It consumes the engine crates by git `rev`, and re-applies this workspace's
+`[patch.crates-io]` vendored crates from the same rev. An engine change reaches
+KOVVBOJ only when that repo bumps its `rev`, so land engine changes here first.
 
 ### Issue tracker
 
