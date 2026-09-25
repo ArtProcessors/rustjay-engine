@@ -58,7 +58,6 @@ rustjay-engine/
 │   ├── waaaves             # Multi-pass feedback pipeline
 │   ├── sputnik             # Indexed mesh + vertex-shader displacement (Rutt-Etra style)
 │   ├── isf-example         # Runtime ISF shader loader with auto-generated UI
-│   ├── shaderglass         # Source → ISF-shader overlay with egui control window
 │   ├── mixer               # 2-channel mixer demonstrating rustjay-mixer
 │   ├── projection          # Projection mapping demonstrating rustjay-projection
 │   ├── videowall           # HDMI-matrix mapper — N outputs, source→cell grids, AprilTag calibration
@@ -127,7 +126,6 @@ cargo run -p flux          # Optical-flow warp
 cargo run -p waaaves       # Multi-pass feedback pipeline
 cargo run -p sputnik       # Mesh displacement (Rutt-Etra style)
 cargo run -p isf-example   # Load any .fs ISF shader at runtime
-cargo run -p shaderglass   # Source → ISF-shader overlay
 cargo run -p mixer         # 2-channel compositor
 cargo run -p projection    # Projection mapping
 cargo run -p videowall     # HDMI-matrix / video-wall mapper
