@@ -484,19 +484,23 @@ fn build_glsl(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    body = undef_redefinitions(&body);
 
     // Names our prelude provides (builtins, header inputs, per-image aux fields).
     let provided: Vec<String> = BUILTINS
         .iter()
         .map(|s| s.to_string())
-        .chain(isf.inputs.iter().flat_map(|i| {
-            [
-                i.name.clone(),
-                format!("_{}_imgRect", i.name),
-                format!("_{}_imgSize", i.name),
-                format!("_{}_flip", i.name),
-            ]
-        }))
+        .chain(isf.inputs.iter().map(|i| i.name.clone()))
+        .chain(
+            isf.inputs
+                .iter()
+                .map(|i| i.name.clone())
+                .chain(isf.passes.iter().filter_map(|p| p.target.clone()))
+                .chain(isf.imported.keys().cloned())
+                .flat_map(|n| {
+                    [format!("_{n}_imgRect"), format!("_{n}_imgSize"), format!("_{n}_flip")]
+                }),
+        )
         .collect();
     let provided: Vec<String> = provided
         .into_iter()
@@ -603,7 +607,7 @@ fn build_glsl(
     //    Body redeclarations of prelude-provided names are dropped; unknown uniforms
     //    are re-homed into IsfInputs.
     let mut extra_members: Vec<MemberDecl> = Vec::new();
-    body = dedup_uniforms(&body, &provided, &mut extra_members);
+    body = dedup_uniforms(&body, &provided, &mut extra_members, &mut texture_names);
     extra_members.extend(baked_members);
 
     // 6. explicit locations for user-declared global in/out (incl. `varying`).
@@ -671,21 +675,8 @@ fn build_glsl(
             }
             InputType::Point2d(_) => Some(FieldTy::Vec2),
             InputType::Color(_) => Some(FieldTy::Vec4),
-            InputType::Image | InputType::Audio(_) | InputType::AudioFft(_) => {
-                // ISF per-image aux uniforms: _<name>_imgRect / _imgSize / _flip
-                for (suffix, fty) in [
-                    ("_imgRect", FieldTy::Vec4),
-                    ("_imgSize", FieldTy::Vec2),
-                    ("_flip", FieldTy::Bool),
-                ] {
-                    members.push(MemberDecl {
-                        name: format!("_{}{suffix}", input.name),
-                        glsl_decl: glsl_ty(fty).to_string(),
-                        fty,
-                    });
-                }
-                None
-            }
+            // Their _imgRect/_imgSize/_flip aux values are macros on the texture, below.
+            InputType::Image | InputType::Audio(_) | InputType::AudioFft(_) => None,
         };
         if let Some(fty) = member {
             members.push(MemberDecl {
@@ -736,6 +727,14 @@ fn build_glsl(
             p.push_str(&format!(
                 "layout(set = 0, binding = {}) uniform texture2D {};\n",
                 t.binding, t.name
+            ));
+            // ISF per-image aux values for every texture (inputs, passes, IMPORTED),
+            // read off the bound texture itself — nothing uploads them as uniforms.
+            p.push_str(&format!(
+                "#define _{0}_imgSize vec2(textureSize(sampler2D({0}, img_sampler), 0))\n\
+                 #define _{0}_imgRect vec4(0.0, 0.0, _{0}_imgSize)\n\
+                 #define _{0}_flip false\n",
+                t.name
             ));
         }
     }
@@ -1237,6 +1236,7 @@ fn dedup_uniforms(
     body: &str,
     provided: &[&str],
     extra_members: &mut Vec<MemberDecl>,
+    textures: &mut Vec<String>,
 ) -> String {
     let mut out = String::with_capacity(body.len());
     let mut depth = 0i32;
@@ -1253,7 +1253,18 @@ fn dedup_uniforms(
                     let opaque = ["sampler", "texture", "image", "subpass"]
                         .iter()
                         .any(|p| ty.starts_with(p));
-                    if !opaque && !decl.contains('(') {
+                    // glslsandbox-style bare `uniform sampler2D tex0;` (e.g. a
+                    // backbuffer): Vulkan GLSL needs a binding, so re-home it as a
+                    // texture the host binds (the black placeholder until it does).
+                    if ty == "sampler2D" && !decl.contains('(') {
+                        for d in decl[ty.len()..].split(',') {
+                            let name = d.trim().to_string();
+                            if !name.is_empty() && !textures.contains(&name) {
+                                textures.push(name);
+                            }
+                        }
+                        drop_line = true;
+                    } else if !opaque && !decl.contains('(') {
                         for d in decl[ty.len()..].split(',') {
                             let d = d.trim();
                             let name: String =
@@ -1296,6 +1307,29 @@ fn dedup_uniforms(
             out.push('\n');
         }
         depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+    }
+    out
+}
+
+/// GL drivers accept a `#define` redefined with a new value (the later one wins,
+/// with a warning); glslang rejects it. Converted Shadertoys paste each buffer's
+/// defines into one file, so `#undef` before every redefinition.
+fn undef_redefinitions(body: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("#define") {
+            let name: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() && !seen.insert(name.clone()) {
+                out.push_str(&format!("#undef {name}\n"));
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
     }
     out
 }
