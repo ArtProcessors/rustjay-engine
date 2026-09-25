@@ -15,6 +15,9 @@ fn main() -> anyhow::Result<()> {
         .parse_default_env()
         .init();
 
+    // Title-bar/taskbar icon on Windows + X11; the macOS bundle uses AppIcon.icns.
+    rustjay_engine::set_window_icon(include_bytes!("../packaging/icon-256.png"));
+
     log::info!("Starting KOVVBOJ v{}", env!("CARGO_PKG_VERSION"));
 
     #[cfg(all(feature = "egui", feature = "mixer", feature = "projection"))]
@@ -57,12 +60,11 @@ fn main() -> anyhow::Result<()> {
             plugin,
             Box::new(kovvboj::shell::KovvbojShell::new()),
             move |sub| {
-            use winit::window::WindowAttributes;
             for (i, proj) in stage.projectors.iter().enumerate() {
                 if !proj.enabled {
                     continue;
                 }
-                let attrs = WindowAttributes::default()
+                let attrs = rustjay_engine::window_attributes()
                     .with_title(format!("KOVVBOJ Projector {} - {}", i + 1, proj.name))
                     .with_inner_size(winit::dpi::LogicalSize::new(proj.width, proj.height));
                 if let Some(monitor_idx) = proj.fullscreen_monitor {
