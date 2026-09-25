@@ -149,7 +149,7 @@ impl Recorder {
             path
         };
 
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = Command::new(crate::ffmpeg_tool("ffmpeg"));
         cmd.arg("-y") // overwrite
             .arg("-hide_banner")
             .arg("-loglevel")
@@ -357,7 +357,7 @@ impl Recorder {
 
 /// Length of a media file in seconds, or 0 if ffprobe can't say.
 fn duration(path: &Path) -> f64 {
-    Command::new("ffprobe")
+    Command::new(crate::ffmpeg_tool("ffprobe"))
         .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
         .arg(path)
         .output()
@@ -380,7 +380,7 @@ fn mux(video: &Path, audio: &Path, out: &Path) -> anyhow::Result<()> {
     // Capture opens before the first frame arrives, so the audio runs long at
     // the head — both were stopped together, so the excess is exactly the lead.
     let lead = duration(audio) - duration(video);
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(crate::ffmpeg_tool("ffmpeg"));
     cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
     if lead > 0.02 {
         log::info!("[Recorder] trimming {:.2}s of audio lead-in", lead);
@@ -465,7 +465,7 @@ impl AudioCapture {
             (config.sample_rate(), config.channels(), config.sample_format());
 
         let path = sidecar(near, "audio", "m4a");
-        let mut child = Command::new("ffmpeg")
+        let mut child = Command::new(crate::ffmpeg_tool("ffmpeg"))
             .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "f32le", "-ar"])
             .arg(rate.to_string())
             .arg("-ac")

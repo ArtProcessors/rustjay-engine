@@ -27,7 +27,8 @@ pub fn pix_fmt_has_alpha(pix_fmt: &str) -> bool {
 
 /// Convert any video to HAP using ffmpeg for *decode* and hap-qt for *encode*.
 ///
-/// Both `ffmpeg` and `ffprobe` must be on PATH; a missing one is the error.
+/// Needs `ffmpeg` and `ffprobe`, beside the executable or on PATH (see
+/// [`crate::ffmpeg_tool`]); a missing one is the error.
 ///
 /// ffmpeg decodes to raw RGBA via stdout; we feed that into `HapFrameEncoder`
 /// plus `QtHapWriter`. The codec comes from the source's pixel format, via
@@ -44,7 +45,7 @@ pub fn ffmpeg_to_hap(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Re
     // --- probe: width, height, fps, pixel format via ffprobe ---------------
     // key=value output, not positional CSV: ffprobe emits fields in its own
     // order, not the order they were requested, so positions are not stable.
-    let probe = Command::new("ffprobe")
+    let probe = Command::new(crate::ffmpeg_tool("ffprobe"))
         .args([
             "-v", "error",
             "-select_streams", "v:0",
@@ -81,7 +82,7 @@ pub fn ffmpeg_to_hap(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Re
     );
 
     // --- decode: ffmpeg → raw RGBA on stdout ------------------------------
-    let mut child = Command::new("ffmpeg")
+    let mut child = Command::new(crate::ffmpeg_tool("ffmpeg"))
         .args([
             "-y", "-i", src.to_str().unwrap_or_default(),
             "-f", "rawvideo", "-pix_fmt", "rgba", "-an", "-",
